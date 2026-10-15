@@ -1,0 +1,83 @@
+<!doctype html>
+<html>
+<head>
+<title>Home</title>
+<style>
+  body { font-family: "Segoe UI", Arial, sans-serif; background: #f5f6f8; color: #1d2433; margin: 0 }
+  .hero { background: #1d2433; color: white; padding: 36px 0 28px }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 0 24px }
+  .hero h1 { font-size: 44px; margin: 0 0 6px; letter-spacing: 0 }
+  .hero p { color: #b7c0d6; font-size: 18px; margin: 0 }
+  .bolt { color: #ffcf33 }
+  h2 { font-size: 22px; margin: 28px 0 10px; color: #1d2433 }
+  .card { background: white; border: 1px solid #dde1ea; padding: 16px 20px; margin: 12px 0 }
+  .card h3 { margin: 0 0 6px; font-size: 17px }
+  .grid td { vertical-align: top; padding: 0 12px 0 0; width: 33% }
+  code, kbd { background: #eef0f5; padding: 1px 4px; font-size: 13px }
+  .muted { color: #6b7488 }
+  .pill { display: inline-block; background: #e6f0ff; color: #1a56db; padding: 2px 10px; margin: 2px 4px 2px 0; font-size: 13px }
+  a { color: #1a56db }
+  table.keys td { padding: 3px 14px 3px 0 }
+  footer { margin: 32px 0; font-size: 13px }
+</style>
+</head>
+<body>
+<div class="hero"><div class="wrap">
+  <h1><span class="bolt">&#9889;</span> bolt</h1>
+  <p>A tiny from-scratch browser engine built for raw speed.</p>
+</div></div>
+
+<div class="wrap">
+  <h2>Try it</h2>
+  <div class="card">
+    Type a URL or a local file path into the address bar (<kbd>Ctrl+L</kbd>), or try:
+    <p>
+      <a href="about:stress">about:stress</a> &mdash; a 1,500-section synthetic page (~40k nodes) &nbsp;
+      <a href="https://example.com">example.com</a> &nbsp;
+      <a href="https://news.ycombinator.com">Hacker News</a> &nbsp;
+      <a href="https://lite.duckduckgo.com/lite/">DuckDuckGo Lite</a> &nbsp;
+      <a href="https://text.npr.org">text.npr.org</a>
+    </p>
+  </div>
+
+  <h2>Pipeline</h2>
+  <table class="grid"><tr>
+    <td><div class="card"><h3>Parse</h3><span class="muted">Single-pass byte tokenizer with SWAR <code>memchr</code>, arena DOM, interned atoms.</span></div></td>
+    <td><div class="card"><h3>Style</h3><span class="muted">Bucketed rules, ancestor bloom filter, one linear pass over the arena.</span></div></td>
+    <td><div class="card"><h3>Layout &amp; Paint</h3><span class="muted">Block/inline/table layout, cached advances, banded multi-threaded raster.</span></div></td>
+  </tr></table>
+
+  <h2>Supported</h2>
+  <div class="card">
+    <span class="pill">HTML5-ish tree building</span><span class="pill">entities</span><span class="pill">CSS selectors &amp; combinators</span>
+    <span class="pill">:nth-child / :not / :is</span><span class="pill">@media</span><span class="pill">cascade &amp; !important</span>
+    <span class="pill">inheritance</span><span class="pill">em / rem / % / vw</span><span class="pill">block layout</span>
+    <span class="pill">margin collapsing</span><span class="pill">inline layout</span><span class="pill">inline-block</span>
+    <span class="pill">tables (auto layout, colspan)</span><span class="pill">lists</span><span class="pill">borders &amp; backgrounds</span>
+    <span class="pill">custom properties &amp; var()</span><span class="pill">calc()</span>
+    <span class="pill">quirks mode</span><span class="pill">links &amp; history</span><span class="pill">http(s) via curl</span>
+  </div>
+
+  <h2>Keys</h2>
+  <div class="card">
+    <table class="keys">
+      <tr><td><kbd>Ctrl+L</kbd> / click bar</td><td>edit address</td></tr>
+      <tr><td><kbd>Wheel</kbd> <kbd>&uarr;</kbd> <kbd>&darr;</kbd> <kbd>PgUp</kbd> <kbd>PgDn</kbd> <kbd>Space</kbd></td><td>scroll</td></tr>
+      <tr><td><kbd>Home</kbd> / <kbd>End</kbd></td><td>top / bottom</td></tr>
+      <tr><td><kbd>Backspace</kbd> / <kbd>Alt+&larr;</kbd></td><td>back</td></tr>
+      <tr><td><kbd>F5</kbd></td><td>reload</td></tr>
+      <tr><td><kbd>F12</kbd></td><td>print pipeline timings to the console</td></tr>
+    </table>
+  </div>
+
+  <h2>Not (yet) supported</h2>
+  <ol>
+    <li>JavaScript and image decoding (images show as placeholders or alt text)</li>
+    <li>Floats, flexbox and grid (laid out as normal blocks); positioned elements are hidden</li>
+    <li><code>min()</code> / <code>max()</code> / <code>clamp()</code>, transforms, shadows, rounded corners, web fonts</li>
+  </ol>
+
+  <footer class="muted">bolt is a learning-sized engine: ~6.5k lines of Rust, two dependencies (window + glyph rasterizer).</footer>
+</div>
+</body>
+</html>
