@@ -40,6 +40,8 @@ pub enum Value {
     Areas(u32),
     /// An identifier (interned), e.g. a grid area name.
     Name(u32),
+    /// font-family list: index into the family table.
+    Family(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -685,17 +687,135 @@ fn font_size(t: &str) -> Option<Value> {
     })
 }
 
-fn font_family(v: &str) -> Value {
-    let first = v.split(',').next().unwrap_or("").trim().trim_matches(|c| c == '"' || c == '\'');
-    let f = first.to_ascii_lowercase();
-    let kw = if f.contains("mono") || f.contains("courier") || f.contains("consol") || f.contains("menlo") || f == "code" {
+/// Generic family a name falls back to.
+fn generic_of(f: &str) -> Kw {
+    if f.contains("mono") || f.contains("courier") || f.contains("consol") || f.contains("menlo") || f == "code" {
         Kw::Monospace
     } else if f == "serif" || f.contains("times") || f.contains("georgia") || f.contains("garamond") || f.contains("palatino") || f.contains("book") || f.contains("cambria") {
         Kw::Serif
     } else {
         Kw::SansSerif
-    };
-    Value::Kw(kw)
+    }
+}
+
+thread_local! {
+    static FAMILIES: RefCell<(Vec<(Rc<[Box<str>]>, Kw)>, FxHashMap<String, u32>)> = RefCell::new(Default::default());
+    static FONT_FACES: RefCell<Vec<FontFace>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The family names (lowercase) and generic fallback of a font-family value.
+pub fn families(i: u32) -> (Rc<[Box<str>]>, Kw) {
+    FAMILIES.with(|t| t.borrow().0[i as usize].clone())
+}
+
+fn font_family(v: &str) -> Value {
+    let key = v.trim().to_ascii_lowercase();
+    if let Some(&i) = FAMILIES.with(|t| t.borrow().1.get(&key).copied()).as_ref() {
+        return Value::Family(i);
+    }
+    let names: Vec<Box<str>> = key
+        .split(',')
+        .map(|n| n.trim().trim_matches(|c| c == '"' || c == '\'').trim().into())
+        .filter(|n: &Box<str>| !n.is_empty())
+        .collect();
+    let generic = names
+        .iter()
+        .find_map(|n| match &**n {
+            "monospace" | "ui-monospace" => Some(Kw::Monospace),
+            "serif" | "ui-serif" => Some(Kw::Serif),
+            "sans-serif" | "system-ui" | "ui-sans-serif" | "-apple-system" => Some(Kw::SansSerif),
+            _ => None,
+        })
+        .unwrap_or_else(|| generic_of(names.first().map_or("", |n| n)));
+    FAMILIES.with(|t| {
+        let mut t = t.borrow_mut();
+        let i = t.0.len() as u32;
+        t.0.push((names.into(), generic));
+        t.1.insert(key, i);
+        Value::Family(i)
+    })
+}
+
+/// An @font-face rule.
+#[derive(Clone, Debug)]
+pub struct FontFace {
+    pub family: Box<str>,
+    pub url: String,
+    pub weight: (u16, u16),
+    pub italic: bool,
+}
+
+/// All @font-face rules parsed so far (on this thread).
+pub fn font_faces() -> Vec<FontFace> {
+    FONT_FACES.with(|f| f.borrow().clone())
+}
+
+fn parse_font_face(body: &str) {
+    let mut family = None;
+    let mut url = None;
+    let (mut weight, mut italic) = ((400u16, 400u16), false);
+    let b = body.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let end = find_top(b, i, b";").unwrap_or(b.len());
+        let decl = &body[i..end];
+        i = end + 1;
+        let Some((name, value)) = decl.split_once(':') else { continue };
+        let value = value.trim();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "font-family" => family = Some(value.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase()),
+            "src" => {
+                // Prefer formats we can load: woff, then truetype/opentype.
+                let mut best: Option<(u8, String)> = None;
+                for part in split_top(value, b',') {
+                    let part = part.trim();
+                    let lower = part.to_ascii_lowercase();
+                    let Some(us) = lower.find("url(") else { continue };
+                    let Some(ue) = find_top(part.as_bytes(), us + 4, b")") else { continue };
+                    let raw = part[us + 4..ue].trim().trim_matches(|c| c == '"' || c == '\'');
+                    let fmt = lower[ue..].to_string();
+                    let path = raw.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+                    let rank = if fmt.contains("woff2") || path.ends_with(".woff2") {
+                        0
+                    } else if fmt.contains("woff") || path.ends_with(".woff") {
+                        3
+                    } else if fmt.contains("truetype") || fmt.contains("opentype") || path.ends_with(".ttf") || path.ends_with(".otf") {
+                        2
+                    } else if fmt.contains("svg") || path.ends_with(".svg") || path.ends_with(".eot") {
+                        0
+                    } else {
+                        1
+                    };
+                    if rank > 0 && best.as_ref().is_none_or(|b| rank > b.0) {
+                        let abs = BASE.with(|base| crate::net::resolve(&base.borrow(), raw));
+                        best = Some((rank, abs));
+                    }
+                }
+                url = best.map(|b| b.1);
+            }
+            "font-weight" => {
+                let w = |t: &str| match t {
+                    "normal" => Some(400),
+                    "bold" => Some(700),
+                    n => n.parse::<f32>().ok().map(|v| v as u16),
+                };
+                let toks: Vec<&str> = value.split_whitespace().collect();
+                if let Some(a) = toks.first().and_then(|t| w(t)) {
+                    weight = (a, toks.get(1).and_then(|t| w(t)).unwrap_or(a));
+                }
+            }
+            "font-style" => italic = value.to_ascii_lowercase().starts_with("italic") || value.to_ascii_lowercase().starts_with("oblique"),
+            _ => {}
+        }
+    }
+    if let (Some(family), Some(url)) = (family, url) {
+        FONT_FACES.with(|f| {
+            let mut f = f.borrow_mut();
+            if !f.iter().any(|x| x.url == url && *x.family == *family) {
+                f.push(FontFace { family: family.into(), url, weight, italic });
+            }
+        });
+    }
 }
 
 fn push4(out: &mut Vec<Decl>, props: [Prop; 4], vals: &[Value], important: bool) {
@@ -2258,6 +2378,7 @@ fn parse_rules(s: &str, sheet: &mut Stylesheet, media: &Media) {
             let inner = &s[pos + 1..end.min(n)];
             match name.as_str() {
                 "media" if eval_media(prelude, media) => parse_rules(inner, sheet, media),
+                "font-face" => parse_font_face(inner),
                 "supports" if !prelude.contains("not") => parse_rules(inner, sheet, media),
                 "layer" | "container" | "scope" | "document" | "-moz-document" => {
                     parse_rules(inner, sheet, media)

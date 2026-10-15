@@ -353,7 +353,7 @@ impl Builder<'_> {
         }
 
         if let Some(m) = &b.marker {
-            let face = self.f.pick(st.family, st.bold, st.italic);
+            let face = self.f.pick_style(st);
             let fs = st.font_size;
             let (asc, _, _) = self.f.metrics(face);
             let w = self.f.measure(face, fs, m);
@@ -394,7 +394,7 @@ impl Builder<'_> {
                     if ts.hidden {
                         continue;
                     }
-                    let face = self.f.pick(ts.family, ts.bold, ts.italic);
+                    let face = self.f.pick_style(ts);
                     let fs = ts.font_size;
                     let (a, d, _) = self.f.metrics(face);
                     let (x, y) = (cx + f.x, cy + f.y);

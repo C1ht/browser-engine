@@ -7,7 +7,7 @@
 //!   by the paint threads.
 
 use crate::fx::FxHashMap;
-use crate::style::Family;
+use crate::style::{Family, Style};
 use fontdue::{Font, FontSettings};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::OnceLock;
@@ -16,6 +16,8 @@ const FALLBACK_SANS: u8 = 12;
 const FALLBACK_SYMBOL: u8 = 13;
 const FALLBACK_CJK: u8 = 14;
 const NFACES: usize = 15;
+/// Slots for downloaded web fonts.
+const NWEB: usize = 48;
 
 /// Candidate files per face. Windows names first, then common Linux/macOS ones.
 const FILES: [&[&str]; NFACES] = [
@@ -59,8 +61,19 @@ pub struct Adv {
     pub face: u8,
 }
 
+/// A registered web font face.
+struct WebFace {
+    family: Box<str>,
+    url: String,
+    weight: (u16, u16),
+    italic: bool,
+    /// Face slot, or None if it failed to load.
+    face: Option<u8>,
+}
+
 pub struct Fonts {
     faces: Vec<OnceLock<Option<FontData>>>,
+    web: std::sync::RwLock<Vec<WebFace>>,
     /// Lazily allocated 256-entry blocks of packed (face+1, advance) per face.
     tables: Vec<OnceLock<Box<[AtomicU64]>>>,
 }
@@ -69,9 +82,65 @@ static FONTS: OnceLock<Fonts> = OnceLock::new();
 
 pub fn fonts() -> &'static Fonts {
     FONTS.get_or_init(|| Fonts {
-        faces: (0..NFACES).map(|_| OnceLock::new()).collect(),
-        tables: (0..NFACES * 256).map(|_| OnceLock::new()).collect(),
+        faces: (0..NFACES + NWEB).map(|_| OnceLock::new()).collect(),
+        web: std::sync::RwLock::new(Vec::new()),
+        tables: (0..(NFACES + NWEB) * 256).map(|_| OnceLock::new()).collect(),
     })
+}
+
+fn font_data(bytes: Vec<u8>) -> Option<FontData> {
+    let settings = FontSettings { scale: 40.0, ..FontSettings::default() };
+    let font = Font::from_bytes(bytes, settings).ok()?;
+    let lm = font.horizontal_line_metrics(1000.0)?;
+    Some(FontData { ascent: lm.ascent / 1000.0, descent: -lm.descent / 1000.0, line: lm.new_line_size / 1000.0, font })
+}
+
+/// TTF/OTF bytes as-is; WOFF 1.0 unpacked back into an sfnt. (WOFF2 needs
+/// Brotli and isn't supported.)
+fn sfnt_bytes(b: &[u8]) -> Option<Vec<u8>> {
+    if b.len() < 44 {
+        return None;
+    }
+    match &b[..4] {
+        b"\x00\x01\x00\x00" | b"OTTO" | b"true" => return Some(b.to_vec()),
+        b"wOFF" => {}
+        _ => return None,
+    }
+    let be16 = |i: usize| -> Option<usize> { Some(u16::from_be_bytes(b.get(i..i + 2)?.try_into().ok()?) as usize) };
+    let be32 = |i: usize| -> Option<usize> { Some(u32::from_be_bytes(b.get(i..i + 4)?.try_into().ok()?) as usize) };
+    let n = be16(12)?;
+    let mut tables = Vec::with_capacity(n);
+    for t in 0..n {
+        let e = 44 + t * 20;
+        let (tag, off, clen, olen, sum) = (b.get(e..e + 4)?, be32(e + 4)?, be32(e + 8)?, be32(e + 12)?, be32(e + 16)?);
+        let raw = b.get(off..off + clen)?;
+        let data = if clen < olen { crate::image::zlib(raw)? } else { raw.to_vec() };
+        tables.push((tag, sum as u32, data));
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&b[4..8]); // flavor
+    let mut pow = 1;
+    let mut log = 0u16;
+    while pow * 2 <= n {
+        pow *= 2;
+        log += 1;
+    }
+    for v in [n as u16, (pow * 16) as u16, log, (n * 16 - pow * 16) as u16] {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    let mut offset = 12 + 16 * n;
+    for (tag, sum, data) in &tables {
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&sum.to_be_bytes());
+        out.extend_from_slice(&(offset as u32).to_be_bytes());
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        offset += data.len().div_ceil(4) * 4;
+    }
+    for (_, _, data) in &tables {
+        out.extend_from_slice(data);
+        out.resize(out.len().div_ceil(4) * 4, 0);
+    }
+    Some(out)
 }
 
 fn load(face: usize) -> Option<FontData> {
@@ -100,7 +169,65 @@ fn load(face: usize) -> Option<FontData> {
 impl Fonts {
     #[inline]
     pub fn face(&self, f: u8) -> Option<&FontData> {
-        self.faces[f as usize].get_or_init(|| load(f as usize)).as_ref()
+        let slot = self.faces.get(f as usize)?;
+        if f as usize >= NFACES {
+            return slot.get()?.as_ref();
+        }
+        slot.get_or_init(|| load(f as usize)).as_ref()
+    }
+
+    /// Is a web font from `url` already registered (loaded or failed)?
+    pub fn has_web(&self, url: &str, family: &str) -> bool {
+        self.web.read().unwrap().iter().any(|w| w.url == url && *w.family == *family)
+    }
+
+    /// Register a downloaded web font (TTF/OTF/WOFF bytes, or None on failure).
+    pub fn add_web(&self, family: &str, url: &str, weight: (u16, u16), italic: bool, bytes: Option<Vec<u8>>) {
+        let mut web = self.web.write().unwrap();
+        if web.iter().any(|w| w.url == url && *w.family == *family) {
+            return;
+        }
+        let used = web.iter().filter(|w| w.face.is_some()).count();
+        let data = if used < NWEB { bytes.and_then(|b| sfnt_bytes(&b)).and_then(|b| font_data(b)) } else { None };
+        let face = data.map(|d| {
+            // Reuse the slot of an identical URL loaded for another family.
+            let slot = (NFACES + used) as u8;
+            let _ = self.faces[slot as usize].set(Some(d));
+            slot
+        });
+        web.push(WebFace { family: family.into(), url: url.to_owned(), weight, italic, face });
+    }
+
+    /// Best web font face for a family list, if any family is a loaded web font.
+    fn web_pick(&self, names: &[Box<str>], bold: bool, italic: bool) -> Option<u8> {
+        let web = self.web.read().ok()?;
+        if web.is_empty() {
+            return None;
+        }
+        let want = if bold { 700 } else { 400 };
+        for n in names {
+            let best = web
+                .iter()
+                .filter(|w| w.face.is_some() && *w.family == **n)
+                .min_by_key(|w| {
+                    let d = if want < w.weight.0 { w.weight.0 - want } else { want.saturating_sub(w.weight.1) };
+                    (w.italic != italic) as u32 * 1000 + d as u32
+                });
+            if let Some(w) = best {
+                return w.face;
+            }
+        }
+        None
+    }
+
+    /// Face for a computed style (web fonts first, then system families).
+    pub fn pick_style(&self, st: &Style) -> u8 {
+        if let Some(names) = &st.families {
+            if let Some(f) = self.web_pick(names, st.bold, st.italic) {
+                return f;
+            }
+        }
+        self.pick(st.family, st.bold, st.italic)
     }
 
     /// Start loading the common faces in the background.

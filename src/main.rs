@@ -151,6 +151,7 @@ fn bench(a: &Args) {
     let (html, sheets, url) = (l.html.clone(), l.sheets.clone(), l.url.clone());
     // Load images once so layout and paint include them.
     let mut page = Page::new(l, w as f32, h as f32);
+    page.load_fonts_blocking(w as f32, h as f32);
     page.load_images_blocking(w as f32, h as f32);
     let (res, base) = (page.res, page.base);
     let _ = url;
@@ -199,6 +200,7 @@ fn screenshot(a: &Args, out: &str) {
     let w = a.width;
     let vh = if a.height == 0 { 768.0 } else { a.height as f32 };
     let mut page = Page::new(l, w as f32, vh);
+    page.load_fonts_blocking(w as f32, vh);
     page.load_images_blocking(w as f32, vh);
     let h = if a.height == 0 { (page.tree.height.ceil() as usize).clamp(1, 16000) } else { a.height };
     let mut buf = vec![0u32; w * h];
@@ -338,7 +340,8 @@ impl Browser {
     /// Fetch the page's images on a background thread.
     fn request_images(&self, page: &mut Page) {
         let urls = page.wanted_images();
-        if urls.is_empty() {
+        let fonts = page.wanted_fonts();
+        if urls.is_empty() && fonts.is_empty() {
             return;
         }
         for u in &urls {
@@ -346,6 +349,11 @@ impl Browser {
         }
         let (tx, generation) = (self.img_tx.clone(), self.generation);
         std::thread::spawn(move || {
+            if !fonts.is_empty() {
+                // Fonts change text metrics: an empty URL asks for a relayout.
+                engine::fetch_fonts(&fonts);
+                let _ = tx.send((generation, String::new(), None));
+            }
             engine::fetch_images(&urls, &|u, img| {
                 let _ = tx.send((generation, u, img));
             });
@@ -360,7 +368,9 @@ impl Browser {
                 continue;
             }
             if let Some(p) = &mut self.page {
-                p.res.images.insert(u, img);
+                if !u.is_empty() {
+                    p.res.images.insert(u, img);
+                }
                 changed = true;
             }
         }

@@ -828,7 +828,7 @@ impl<'a> Engine<'a> {
     }
 
     fn face_of(&self, st: &Style) -> u8 {
-        self.f.pick(st.family, st.bold, st.italic)
+        self.f.pick_style(st)
     }
 
     /// Resolve a CSS length value (used for grid tracks).

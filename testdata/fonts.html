@@ -1,0 +1,16 @@
+<!doctype html><html><head><title>Web fonts</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lobster&family=Roboto+Slab:wght@400;700">
+<style>
+@font-face { font-family: "Comic Test"; src: url(comic.woff2) format("woff2"), url(comic.woff) format("woff"); }
+body { margin: 24px; font-family: Arial, sans-serif; font-size: 18px }
+.lobster { font-family: 'Lobster', cursive; font-size: 44px; color: #c2255c }
+.slab { font-family: 'Roboto Slab', serif; font-size: 22px }
+.comic { font-family: "Comic Test", sans-serif; font-size: 26px; color: #1971c2 }
+.missing { font-family: "Not A Real Font", Georgia, serif; font-size: 22px }
+</style></head><body>
+<p class="lobster">Lobster from Google Fonts (TTF)</p>
+<p class="slab">Roboto Slab regular, <b>Roboto Slab bold 700</b></p>
+<p class="comic">Comic Sans from a local WOFF 1.0 file</p>
+<p class="missing">Unknown family falls back to the generic serif</p>
+<p>System Arial for comparison.</p>
+</body></html>

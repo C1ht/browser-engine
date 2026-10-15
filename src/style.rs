@@ -291,6 +291,8 @@ pub struct Style {
     pub bold: bool,
     pub italic: bool,
     pub family: Family,
+    /// font-family names (lowercase), for matching web fonts.
+    pub families: Option<Rc<[Box<str>]>>,
     pub align: Align,
     /// text-align: -webkit-center (from <center> / align=center) also centers child blocks.
     pub center_blocks: bool,
@@ -367,6 +369,7 @@ pub const INITIAL: Style = Style {
     bold: false,
     italic: false,
     family: Family::Sans,
+    families: None,
     align: Align::Left,
     center_blocks: false,
     line_height: LineHeight::Normal,
@@ -410,6 +413,7 @@ impl Style {
             bold: p.bold,
             italic: p.italic,
             family: p.family,
+            families: p.families.clone(),
             align: p.align,
             center_blocks: p.center_blocks,
             line_height: p.line_height,
@@ -495,7 +499,10 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         FontSize => d.font_size = s.font_size,
         FontWeight => d.bold = s.bold,
         FontStyle => d.italic = s.italic,
-        FontFamily => d.family = s.family,
+        FontFamily => {
+            d.family = s.family;
+            d.families = s.families.clone()
+        }
         TextAlign => {
             d.align = s.align;
             d.center_blocks = s.center_blocks
@@ -874,11 +881,19 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
         FontWeight => s.bold = kw == Some(Kw::Bold),
         FontStyle => s.italic = kw == Some(Kw::Italic),
         FontFamily => {
-            s.family = match kw {
+            let (names, generic) = match v {
+                Value::Family(i) => {
+                    let (n, g) = css::families(i);
+                    (Some(n), Some(g))
+                }
+                _ => (None, kw),
+            };
+            s.family = match generic {
                 Some(Kw::Monospace) => Family::Mono,
                 Some(Kw::Serif) => Family::Serif,
                 _ => Family::Sans,
-            }
+            };
+            s.families = names;
         }
         TextAlign => {
             s.align = match kw {

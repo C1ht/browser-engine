@@ -11,6 +11,7 @@ use crate::paint::{self, DisplayList};
 use crate::style::{self, Display, Style};
 use crate::{html, net};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -121,6 +122,21 @@ fn img_url(doc: &Document, n: NodeId, base: &str) -> Option<String> {
     Some(if pick.starts_with("data:") { pick } else { net::resolve(base, &pick) })
 }
 
+/// Download and register web fonts in parallel.
+pub fn fetch_fonts(faces: &[css::FontFace]) {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..faces.len().min(6) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(f) = faces.get(i) else { break };
+                let bytes = net::fetch(&f.url).ok().map(|(_, b)| b);
+                crate::fonts::fonts().add_web(&f.family, &f.url, f.weight, f.italic, bytes);
+            });
+        }
+    });
+}
+
 /// Fetch and decode images in parallel; `done` is called as each finishes.
 pub fn fetch_images(urls: &[String], done: &(dyn Fn(String, Option<Arc<Image>>) + Sync)) {
     let next = AtomicUsize::new(0);
@@ -218,6 +234,37 @@ impl Page {
             }
         }
         out
+    }
+
+    /// @font-face fonts used by the page's styles that aren't loaded yet.
+    pub fn wanted_fonts(&self) -> Vec<css::FontFace> {
+        let faces = css::font_faces();
+        if faces.is_empty() {
+            return Vec::new();
+        }
+        let mut used: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut last: Option<*const [Box<str>]> = None;
+        for st in &self.styles {
+            if let Some(f) = &st.families {
+                if last != Some(Rc::as_ptr(f)) {
+                    last = Some(Rc::as_ptr(f));
+                    used.extend(f.iter().map(|n| &**n));
+                }
+            }
+        }
+        let fonts = crate::fonts::fonts();
+        faces.into_iter().filter(|f| used.contains(&*f.family) && !fonts.has_web(&f.url, &f.family)).collect()
+    }
+
+    /// Fetch and register web fonts now; returns true if any were added.
+    pub fn load_fonts_blocking(&mut self, vw: f32, vh: f32) -> bool {
+        let faces = self.wanted_fonts();
+        if faces.is_empty() {
+            return false;
+        }
+        fetch_fonts(&faces);
+        self.relayout(vw, vh);
+        true
     }
 
     /// Fetch every wanted image now (used for screenshots and benchmarks).
