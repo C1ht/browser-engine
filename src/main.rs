@@ -366,13 +366,13 @@ impl Browser {
             self.glyphs.ensure(f, a.face, c, size);
         }
         let (w, h) = (self.w, self.h);
-        let mut s_ = paint::Surface { buf: &mut self.buf, w, h, ox: 0.0, oy: 0.0 };
+        let mut s_ = paint::Surface::new(&mut self.buf, w, h, 0.0, 0.0);
         s_.text(s, x, y, face, size, color, f, &self.glyphs);
     }
 
     fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, c: u32) {
         let (bw, bh) = (self.w, self.h);
-        paint::Surface { buf: &mut self.buf, w: bw, h: bh, ox: 0.0, oy: 0.0 }.rect(x, y, w, h, c);
+        paint::Surface::new(&mut self.buf, bw, bh, 0.0, 0.0).rect(x, y, w, h, c);
     }
 
     fn draw_chrome(&mut self, loading: bool) {
@@ -546,8 +546,7 @@ impl Browser {
             let mut hover = None;
             if let (Some((mx, my)), Some(p)) = (mouse, &self.page) {
                 if my as usize >= BAR {
-                    let py = my - BAR as f32 + self.scroll.round();
-                    if let Some(l) = p.dl.link_at(mx, py) {
+                    if let Some(l) = p.dl.link_at(mx, my - BAR as f32, self.scroll.round()) {
                         hover = p.link_href(l);
                     }
                 }

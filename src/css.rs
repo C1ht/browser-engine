@@ -2,6 +2,9 @@
 //! values parsed up front) so the cascade never touches strings again.
 
 use crate::atom::{intern, intern_lower, Atom};
+use crate::fx::FxHashMap;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 pub const CURRENT_COLOR: u32 = 0x00C0_FFEE; // sentinel, resolved during cascade
 
@@ -24,6 +27,13 @@ pub enum Value {
     /// Index into the sheet's raw (name, value) strings: custom properties
     /// and declarations that contain var() and are resolved during cascade.
     Raw(u32),
+    /// min() / max() / clamp(): index into the expression table.
+    Expr(u32),
+    Shadow(Shadow),
+    /// Grid track list: index into the track table.
+    Tracks(u32),
+    /// `span N` in grid placement.
+    Span(i16),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -82,6 +92,29 @@ pub enum Kw {
     Underline,
     LineThrough,
     UnderlineLineThrough,
+    Flex,
+    InlineFlex,
+    Grid,
+    InlineGrid,
+    FlowRoot,
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    Sticky,
+    Both,
+    Scroll,
+    Row,
+    RowReverse,
+    Column,
+    ColumnReverse,
+    Wrap,
+    Start,
+    End,
+    SpaceBetween,
+    SpaceAround,
+    SpaceEvenly,
+    Stretch,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -132,6 +165,41 @@ pub enum Prop {
     BorderRightStyle,
     BorderBottomStyle,
     BorderLeftStyle,
+    InsetTop,
+    InsetRight,
+    InsetBottom,
+    InsetLeft,
+    ZIndex,
+    Float,
+    Clear,
+    Overflow,
+    RadiusTL,
+    RadiusTR,
+    RadiusBR,
+    RadiusBL,
+    BoxShadow,
+    Opacity,
+    FlexDirection,
+    FlexWrap,
+    JustifyContent,
+    AlignItems,
+    AlignSelf,
+    AlignContent,
+    JustifyItems,
+    JustifySelf,
+    FlexGrow,
+    FlexShrink,
+    FlexBasis,
+    Order,
+    RowGap,
+    ColumnGap,
+    GridTemplateColumns,
+    GridTemplateRows,
+    GridAutoRows,
+    GridColumnStart,
+    GridColumnEnd,
+    GridRowStart,
+    GridRowEnd,
     Custom,
     Unresolved,
 }
@@ -142,6 +210,8 @@ pub const PADDING: [Prop; 4] = [PaddingTop, PaddingRight, PaddingBottom, Padding
 pub const BWIDTH: [Prop; 4] = [BorderTopWidth, BorderRightWidth, BorderBottomWidth, BorderLeftWidth];
 pub const BCOLOR: [Prop; 4] = [BorderTopColor, BorderRightColor, BorderBottomColor, BorderLeftColor];
 pub const BSTYLE: [Prop; 4] = [BorderTopStyle, BorderRightStyle, BorderBottomStyle, BorderLeftStyle];
+pub const INSET: [Prop; 4] = [InsetTop, InsetRight, InsetBottom, InsetLeft];
+pub const RADIUS: [Prop; 4] = [RadiusTL, RadiusTR, RadiusBR, RadiusBL];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Decl {
@@ -359,6 +429,9 @@ pub fn parse_len(t: &str) -> Option<Value> {
     }
     if t.len() > 5 && t[..5].eq_ignore_ascii_case("calc(") && t.ends_with(')') {
         return parse_calc(&t[5..t.len() - 1]);
+    }
+    if t.len() > 4 && (t[..4].eq_ignore_ascii_case("min(") || t[..4].eq_ignore_ascii_case("max(") || t.len() > 6 && t[..6].eq_ignore_ascii_case("clamp(")) {
+        return store_expr(t);
     }
     let mut i = 0;
     if b[0] == b'-' || b[0] == b'+' {
@@ -655,6 +728,9 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
         return;
     }
 
+    if parse_more(name, v, important, out) {
+        return;
+    }
     let kw = |k: Kw| Some(Value::Kw(k));
     let val: Option<Value> = match name {
         "display" => match v {
@@ -948,6 +1024,33 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "padding-block-end" => PaddingBottom,
         "padding-inline-start" => PaddingLeft,
         "padding-inline-end" => PaddingRight,
+        "top" => InsetTop,
+        "right" => InsetRight,
+        "bottom" => InsetBottom,
+        "left" => InsetLeft,
+        "z-index" => ZIndex,
+        "float" => Float,
+        "clear" => Clear,
+        "overflow" | "overflow-x" | "overflow-y" => Overflow,
+        "box-shadow" => BoxShadow,
+        "opacity" => Opacity,
+        "flex-direction" => FlexDirection,
+        "flex-wrap" => FlexWrap,
+        "justify-content" => JustifyContent,
+        "align-items" => AlignItems,
+        "align-self" => AlignSelf,
+        "align-content" => AlignContent,
+        "justify-items" => JustifyItems,
+        "justify-self" => JustifySelf,
+        "flex-grow" => FlexGrow,
+        "flex-shrink" => FlexShrink,
+        "flex-basis" => FlexBasis,
+        "order" => Order,
+        "row-gap" => RowGap,
+        "column-gap" => ColumnGap,
+        "grid-template-columns" => GridTemplateColumns,
+        "grid-template-rows" => GridTemplateRows,
+        "grid-auto-rows" => GridAutoRows,
         _ => return None,
     })
 }
@@ -1142,6 +1245,536 @@ fn parse_calc(s: &str) -> Option<Value> {
         Some(n) => Value::Num(n),
         None => Value::Calc(v.c),
     })
+}
+
+// ------------------------------------------------------- layout extensions
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Shadow {
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: u32,
+    pub inset: bool,
+}
+
+/// One side of a grid track size.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Breadth {
+    Len(Value),
+    Fr(f32),
+    Auto,
+    MinContent,
+    MaxContent,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Track {
+    pub min: Breadth,
+    pub max: Breadth,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TrackList {
+    pub tracks: Vec<Track>,
+    /// repeat(auto-fill | auto-fit, ...): (insert position, repeated tracks)
+    pub auto_repeat: Option<(usize, Vec<Track>)>,
+}
+
+#[derive(Clone, Debug)]
+pub enum Expr {
+    /// Coefficients of [%, px, em, rem, vw, vh].
+    Lin([f32; 6]),
+    Min(Vec<Expr>),
+    Max(Vec<Expr>),
+}
+
+/// Parsed values that don't fit in a `Value` live in these tables, keyed by
+/// their source text so re-parsing a sheet (on resize) doesn't grow them.
+#[derive(Default)]
+struct Tables {
+    tracks: Vec<Rc<TrackList>>,
+    track_keys: FxHashMap<String, u32>,
+    exprs: Vec<Rc<Expr>>,
+    expr_keys: FxHashMap<String, u32>,
+}
+
+thread_local! {
+    static TABLES: RefCell<Tables> = RefCell::new(Tables::default());
+}
+
+pub fn track_list(i: u32) -> Rc<TrackList> {
+    TABLES.with(|t| t.borrow().tracks[i as usize].clone())
+}
+
+pub fn expr(i: u32) -> Rc<Expr> {
+    TABLES.with(|t| t.borrow().exprs[i as usize].clone())
+}
+
+fn store_expr(src: &str) -> Option<Value> {
+    let key = src.to_ascii_lowercase();
+    if let Some(i) = TABLES.with(|t| t.borrow().expr_keys.get(&key).copied()) {
+        return Some(Value::Expr(i));
+    }
+    let e = parse_minmax(&key)?;
+    TABLES.with(|t| {
+        let mut t = t.borrow_mut();
+        let i = t.exprs.len() as u32;
+        t.exprs.push(Rc::new(e));
+        t.expr_keys.insert(key, i);
+        Some(Value::Expr(i))
+    })
+}
+
+fn parse_minmax(t: &str) -> Option<Expr> {
+    let t = t.trim();
+    let (kind, inner) = if let Some(r) = t.strip_prefix("min(") {
+        (0, r)
+    } else if let Some(r) = t.strip_prefix("max(") {
+        (1, r)
+    } else if let Some(r) = t.strip_prefix("clamp(") {
+        (2, r)
+    } else {
+        // Arguments are math expressions even without calc().
+        let v = if t.starts_with("calc(") && t.ends_with(')') { parse_calc(&t[5..t.len() - 1])? } else { parse_len(t).or_else(|| parse_calc(t))? };
+        let mut c = [0.0f32; 6];
+        match v {
+            Value::Calc(x) => c = x,
+            Value::Pct(p) => c[0] = p,
+            Value::Px(p) => c[1] = p,
+            Value::Em(p) => c[2] = p,
+            Value::Rem(p) => c[3] = p,
+            Value::Vw(p) => c[4] = p,
+            Value::Vh(p) => c[5] = p,
+            Value::Num(n) if n == 0.0 => {}
+            _ => return None,
+        }
+        return Some(Expr::Lin(c));
+    };
+    let inner = inner.strip_suffix(')')?;
+    let args: Vec<Expr> = split_top(inner, b',').into_iter().map(parse_minmax).collect::<Option<_>>()?;
+    Some(match kind {
+        0 => Expr::Min(args),
+        1 => Expr::Max(args),
+        _ => {
+            let [lo, v, hi]: [Expr; 3] = args.try_into().ok()?;
+            Expr::Max(vec![lo, Expr::Min(vec![v, hi])])
+        }
+    })
+}
+
+fn breadth(t: &str) -> Option<Breadth> {
+    Some(match t {
+        "auto" => Breadth::Auto,
+        "min-content" => Breadth::MinContent,
+        "max-content" => Breadth::MaxContent,
+        _ => {
+            if let Some(n) = t.strip_suffix("fr") {
+                Breadth::Fr(n.parse().ok()?)
+            } else {
+                Breadth::Len(length(t)?)
+            }
+        }
+    })
+}
+
+fn parse_track(t: &str) -> Option<Track> {
+    if let Some(inner) = t.strip_prefix("minmax(").and_then(|r| r.strip_suffix(')')) {
+        let parts = split_top(inner, b',');
+        if parts.len() != 2 {
+            return None;
+        }
+        let min = breadth(parts[0].trim())?;
+        let min = if let Breadth::Fr(_) = min { Breadth::Auto } else { min };
+        return Some(Track { min, max: breadth(parts[1].trim())? });
+    }
+    if let Some(inner) = t.strip_prefix("fit-content(").and_then(|r| r.strip_suffix(')')) {
+        return Some(Track { min: Breadth::Auto, max: Breadth::Len(length(inner.trim())?) });
+    }
+    let b = breadth(t)?;
+    Some(match b {
+        Breadth::Fr(_) => Track { min: Breadth::Auto, max: b },
+        _ => Track { min: b, max: b },
+    })
+}
+
+fn parse_tracks(v: &str, out: &mut TrackList, allow_auto: bool) -> Option<()> {
+    // Drop [line-name] groups.
+    let mut clean = String::with_capacity(v.len());
+    let mut depth = 0;
+    for ch in v.chars() {
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            _ if depth == 0 => clean.push(ch),
+            _ => {}
+        }
+    }
+    for tok in tokens_ws(&clean) {
+        if let Some(inner) = tok.strip_prefix("repeat(").and_then(|r| r.strip_suffix(')')) {
+            let c = find_top(inner.as_bytes(), 0, b",")?;
+            let count = inner[..c].trim();
+            let mut rep = TrackList::default();
+            parse_tracks(&inner[c + 1..], &mut rep, false)?;
+            if count == "auto-fill" || count == "auto-fit" {
+                if !allow_auto || out.auto_repeat.is_some() {
+                    return None;
+                }
+                out.auto_repeat = Some((out.tracks.len(), rep.tracks));
+            } else {
+                let n: usize = count.parse().ok()?;
+                for _ in 0..n.min(1000) {
+                    out.tracks.extend_from_slice(&rep.tracks);
+                }
+            }
+        } else {
+            out.tracks.push(parse_track(tok)?);
+        }
+    }
+    Some(())
+}
+
+/// Whitespace split that keeps parenthesised groups (with commas) together.
+fn tokens_ws(v: &str) -> Vec<&str> {
+    let b = v.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        while i < b.len() && is_ws(b[i]) {
+            i += 1;
+        }
+        let s = i;
+        let mut depth = 0;
+        while i < b.len() && (depth > 0 || !is_ws(b[i])) {
+            match b[i] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        if i > s {
+            out.push(&v[s..i]);
+        }
+    }
+    out
+}
+
+fn store_tracks(v: &str) -> Option<Value> {
+    if v == "none" {
+        return Some(Value::Kw(Kw::None));
+    }
+    if let Some(i) = TABLES.with(|t| t.borrow().track_keys.get(v).copied()) {
+        return Some(Value::Tracks(i));
+    }
+    let mut tl = TrackList::default();
+    parse_tracks(v, &mut tl, true)?;
+    TABLES.with(|t| {
+        let mut t = t.borrow_mut();
+        let i = t.tracks.len() as u32;
+        t.tracks.push(Rc::new(tl));
+        t.track_keys.insert(v.to_owned(), i);
+        Some(Value::Tracks(i))
+    })
+}
+
+fn grid_line(t: &str) -> Value {
+    let toks: Vec<&str> = t.split_whitespace().collect();
+    match toks.as_slice() {
+        ["span", n] => n.parse::<i16>().map_or(Value::Auto, |n| Value::Span(n.max(1))),
+        [n] => n.parse::<i16>().map_or(Value::Auto, |n| Value::Num(n as f32)),
+        _ => Value::Auto,
+    }
+}
+
+fn shadow(v: &str) -> Option<Value> {
+    if v == "none" {
+        return Some(Value::Kw(Kw::None));
+    }
+    let first = split_top(v, b',').into_iter().next()?;
+    let mut lens = Vec::new();
+    let mut color = CURRENT_COLOR;
+    let mut inset = false;
+    for t in tokens_ws(first) {
+        if t == "inset" {
+            inset = true;
+        } else if let Some(l) = length(t) {
+            lens.push(match l {
+                Value::Px(p) => p,
+                Value::Em(e) | Value::Rem(e) => e * 16.0,
+                _ => 0.0,
+            });
+        } else if let Some(Value::Color(c)) = color_value(t) {
+            color = c;
+        }
+    }
+    if lens.len() < 2 {
+        return None;
+    }
+    Some(Value::Shadow(Shadow {
+        x: lens[0],
+        y: lens[1],
+        blur: lens.get(2).copied().unwrap_or(0.0).max(0.0),
+        spread: lens.get(3).copied().unwrap_or(0.0),
+        color,
+        inset,
+    }))
+}
+
+fn align_kw(t: &str) -> Option<Value> {
+    Some(match t {
+        "auto" => Value::Auto,
+        "normal" | "stretch" => Value::Kw(Kw::Stretch),
+        "flex-start" | "start" | "self-start" | "left" => Value::Kw(Kw::Start),
+        "flex-end" | "end" | "self-end" | "right" => Value::Kw(Kw::End),
+        "center" => Value::Kw(Kw::Center),
+        "baseline" | "first" | "last" => Value::Kw(Kw::Baseline),
+        "space-between" => Value::Kw(Kw::SpaceBetween),
+        "space-around" => Value::Kw(Kw::SpaceAround),
+        "space-evenly" => Value::Kw(Kw::SpaceEvenly),
+        _ => return None,
+    })
+}
+
+/// Properties added for positioning, floats, effects, flexbox and grid.
+/// Returns false if `name` isn't one of them.
+fn parse_more(name: &str, v: &str, important: bool, out: &mut Vec<Decl>) -> bool {
+    macro_rules! push {
+        ($p:expr, $v:expr) => {
+            out.push(Decl { prop: $p, value: $v, important })
+        };
+    }
+    let kw = Value::Kw;
+    match name {
+        "display" => {
+            let k = match v {
+                "flex" | "-webkit-flex" | "-ms-flexbox" | "-webkit-box" | "block flex" => Kw::Flex,
+                "inline-flex" | "-webkit-inline-flex" | "-ms-inline-flexbox" | "-webkit-inline-box" | "inline flex" => Kw::InlineFlex,
+                "grid" | "-ms-grid" | "block grid" => Kw::Grid,
+                "inline-grid" | "-ms-inline-grid" | "inline grid" => Kw::InlineGrid,
+                "flow-root" | "block flow-root" => Kw::FlowRoot,
+                _ => return false,
+            };
+            push!(Display, kw(k));
+        }
+        "position" => {
+            let k = match v {
+                "static" => Kw::Static,
+                "relative" => Kw::Relative,
+                "absolute" => Kw::Absolute,
+                "fixed" => Kw::Fixed,
+                "sticky" | "-webkit-sticky" => Kw::Sticky,
+                _ => return true,
+            };
+            push!(Position, kw(k));
+        }
+        "top" | "right" | "bottom" | "left" => {
+            if let Some(l) = length(v) {
+                push!(simple_prop(name).unwrap(), l);
+            }
+        }
+        "inset" => {
+            let vals: Option<Vec<Value>> = tokens_ws(v).into_iter().map(length).collect();
+            if let Some(vals) = vals {
+                push4(out, INSET, &vals, important);
+            }
+        }
+        "z-index" => {
+            if v == "auto" {
+                push!(ZIndex, Value::Auto);
+            } else if let Ok(n) = v.parse::<i32>() {
+                push!(ZIndex, Value::Num(n as f32));
+            }
+        }
+        "float" => {
+            let k = match v {
+                "left" | "inline-start" => Kw::Left,
+                "right" | "inline-end" => Kw::Right,
+                "none" => Kw::None,
+                _ => return true,
+            };
+            push!(Float, kw(k));
+        }
+        "clear" => {
+            let k = match v {
+                "left" | "inline-start" => Kw::Left,
+                "right" | "inline-end" => Kw::Right,
+                "both" => Kw::Both,
+                "none" => Kw::None,
+                _ => return true,
+            };
+            push!(Clear, kw(k));
+        }
+        "overflow" | "overflow-x" | "overflow-y" => {
+            let k = match v.split_whitespace().next().unwrap_or("") {
+                "hidden" | "clip" => Kw::Hidden,
+                "auto" | "scroll" | "overlay" => Kw::Scroll,
+                "visible" => Kw::Visible,
+                _ => return true,
+            };
+            push!(Overflow, kw(k));
+        }
+        "border-radius" | "-moz-border-radius" => {
+            let first = v.split('/').next().unwrap_or("");
+            let vals: Option<Vec<Value>> = tokens_ws(first).into_iter().map(length).collect();
+            if let Some(vals) = vals {
+                push4(out, RADIUS, &vals, important);
+            }
+        }
+        "border-top-left-radius" | "border-top-right-radius" | "border-bottom-right-radius" | "border-bottom-left-radius"
+        | "border-start-start-radius" | "border-start-end-radius" | "border-end-end-radius" | "border-end-start-radius" => {
+            let i = match name {
+                "border-top-left-radius" | "border-start-start-radius" => 0,
+                "border-top-right-radius" | "border-start-end-radius" => 1,
+                "border-bottom-right-radius" | "border-end-end-radius" => 2,
+                _ => 3,
+            };
+            if let Some(l) = tokens_ws(v).first().and_then(|t| length(t)) {
+                push!(RADIUS[i], l);
+            }
+        }
+        "box-shadow" => {
+            if let Some(s) = shadow(v) {
+                push!(BoxShadow, s);
+            }
+        }
+        "opacity" => {
+            let n = if let Some(p) = v.strip_suffix('%') { p.parse::<f32>().ok().map(|p| p / 100.0) } else { v.parse::<f32>().ok() };
+            if let Some(n) = n {
+                push!(Opacity, Value::Num(n.clamp(0.0, 1.0)));
+            }
+        }
+        "flex-direction" | "flex-wrap" | "flex-flow" => {
+            for t in v.split_whitespace() {
+                match t {
+                    "row" => push!(FlexDirection, kw(Kw::Row)),
+                    "row-reverse" => push!(FlexDirection, kw(Kw::RowReverse)),
+                    "column" => push!(FlexDirection, kw(Kw::Column)),
+                    "column-reverse" => push!(FlexDirection, kw(Kw::ColumnReverse)),
+                    "wrap" | "wrap-reverse" => push!(FlexWrap, kw(Kw::Wrap)),
+                    "nowrap" => push!(FlexWrap, kw(Kw::Nowrap)),
+                    _ => {}
+                }
+            }
+        }
+        "flex" => {
+            let (g, s, b) = match v {
+                "none" => (0.0, 0.0, Value::Auto),
+                "auto" => (1.0, 1.0, Value::Auto),
+                _ => {
+                    let mut nums = Vec::new();
+                    let mut basis = None;
+                    for t in tokens_ws(v) {
+                        if let Ok(n) = t.parse::<f32>() {
+                            nums.push(n);
+                        } else if t == "auto" || t == "content" {
+                            basis = Some(Value::Auto);
+                        } else if let Some(l) = length(t) {
+                            basis = Some(l);
+                        }
+                    }
+                    let g = nums.first().copied().unwrap_or(1.0);
+                    let s = nums.get(1).copied().unwrap_or(1.0);
+                    // A third unitless number is a zero basis.
+                    (g, s, basis.unwrap_or(if nums.is_empty() { Value::Auto } else { Value::Pct(0.0) }))
+                }
+            };
+            push!(FlexGrow, Value::Num(g));
+            push!(FlexShrink, Value::Num(s));
+            push!(FlexBasis, b);
+        }
+        "flex-grow" | "flex-shrink" | "order" => {
+            if let Ok(n) = v.parse::<f32>() {
+                push!(simple_prop(name).unwrap(), Value::Num(n));
+            }
+        }
+        "flex-basis" => {
+            let b = if v == "auto" || v == "content" { Some(Value::Auto) } else { length(v) };
+            if let Some(b) = b {
+                push!(FlexBasis, b);
+            }
+        }
+        "justify-content" | "align-items" | "align-self" | "align-content" | "justify-items" | "justify-self" => {
+            let t = v.split_whitespace().last().unwrap_or("");
+            if let Some(a) = align_kw(t) {
+                push!(simple_prop(name).unwrap(), a);
+            }
+        }
+        "place-items" | "place-content" | "place-self" => {
+            let toks: Vec<&str> = v.split_whitespace().collect();
+            let (a, j) = (toks.first().copied().unwrap_or(""), toks.get(1).or(toks.first()).copied().unwrap_or(""));
+            let (pa, pj) = match name {
+                "place-items" => (AlignItems, JustifyItems),
+                "place-content" => (AlignContent, JustifyContent),
+                _ => (AlignSelf, JustifySelf),
+            };
+            if let (Some(a), Some(j)) = (align_kw(a), align_kw(j)) {
+                push!(pa, a);
+                push!(pj, j);
+            }
+        }
+        "gap" | "grid-gap" | "row-gap" | "grid-row-gap" | "column-gap" | "grid-column-gap" => {
+            let gap = |t: &str| if t == "normal" { Some(Value::Px(0.0)) } else { length(t) };
+            let toks = tokens_ws(v);
+            match name {
+                "gap" | "grid-gap" => {
+                    if let Some(r) = toks.first().and_then(|t| gap(t)) {
+                        let c = toks.get(1).and_then(|t| gap(t)).unwrap_or(r);
+                        push!(RowGap, r);
+                        push!(ColumnGap, c);
+                    }
+                }
+                "row-gap" | "grid-row-gap" => {
+                    if let Some(r) = toks.first().and_then(|t| gap(t)) {
+                        push!(RowGap, r);
+                    }
+                }
+                _ => {
+                    if let Some(c) = toks.first().and_then(|t| gap(t)) {
+                        push!(ColumnGap, c);
+                    }
+                }
+            }
+        }
+        "grid-template-columns" | "grid-template-rows" | "grid-auto-rows" => {
+            if let Some(t) = store_tracks(v) {
+                push!(simple_prop(name).unwrap(), t);
+            }
+        }
+        "grid-template" => {
+            if let Some((r, c)) = v.split_once('/') {
+                if let (Some(r), Some(c)) = (store_tracks(r.trim()), store_tracks(c.trim())) {
+                    push!(GridTemplateRows, r);
+                    push!(GridTemplateColumns, c);
+                }
+            }
+        }
+        "grid-column" | "grid-row" => {
+            let (s, e) = match v.split_once('/') {
+                Some((a, b)) => (grid_line(a), grid_line(b)),
+                None => (grid_line(v), Value::Auto),
+            };
+            let (ps, pe) = if name == "grid-column" { (GridColumnStart, GridColumnEnd) } else { (GridRowStart, GridRowEnd) };
+            push!(ps, s);
+            push!(pe, e);
+        }
+        "grid-column-start" => push!(GridColumnStart, grid_line(v)),
+        "grid-column-end" => push!(GridColumnEnd, grid_line(v)),
+        "grid-row-start" => push!(GridRowStart, grid_line(v)),
+        "grid-row-end" => push!(GridRowEnd, grid_line(v)),
+        "grid-area" => {
+            let parts: Vec<Value> = v.split('/').map(grid_line).collect();
+            if parts.len() >= 2 {
+                push!(GridRowStart, parts[0]);
+                push!(GridColumnStart, parts[1]);
+                push!(GridRowEnd, parts.get(2).copied().unwrap_or(Value::Auto));
+                push!(GridColumnEnd, parts.get(3).copied().unwrap_or(Value::Auto));
+            }
+        }
+        _ => return false,
+    }
+    true
 }
 
 // ------------------------------------------------------------- stylesheet

@@ -17,13 +17,25 @@ use std::rc::Rc;
 /// Custom properties visible on an element (shared with the parent until modified).
 pub type Vars = FxHashMap<Box<str>, Rc<str>>;
 
+/// A length. Kept at 8 bytes: the rare percentage expressions (`calc()`,
+/// `min()`, `max()`, `clamp()`) live in a side table.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Len {
     Px(f32),
     Pct(f32),
-    /// calc(pct% + px)
-    Calc(f32, f32),
+    /// clamp(lo, pct% + px, hi): index into the expression table.
+    Ex(u32),
     Auto,
+}
+
+#[derive(Default)]
+struct LenTable {
+    exprs: Vec<[f32; 4]>,
+    keys: FxHashMap<[u32; 4], u32>,
+}
+
+thread_local! {
+    static LENS: std::cell::RefCell<LenTable> = std::cell::RefCell::new(LenTable::default());
 }
 
 impl Len {
@@ -32,13 +44,54 @@ impl Len {
         match self {
             Len::Px(v) => v,
             Len::Pct(p) => p * base / 100.0,
-            Len::Calc(p, x) => p * base / 100.0 + x,
+            Len::Ex(_) => {
+                let [p, x, lo, hi] = self.parts();
+                (p * base / 100.0 + x).min(hi).max(lo)
+            }
             Len::Auto => 0.0,
         }
     }
     #[inline]
     pub fn is_auto(self) -> bool {
         self == Len::Auto
+    }
+    /// clamp(lo, p% + x, hi)
+    pub fn clamp(p: f32, x: f32, lo: f32, hi: f32) -> Len {
+        let v = [p, x, lo, hi];
+        LENS.with(|t| {
+            let mut t = t.borrow_mut();
+            let key = v.map(f32::to_bits);
+            if let Some(&i) = t.keys.get(&key) {
+                return Len::Ex(i);
+            }
+            let i = t.exprs.len() as u32;
+            t.exprs.push(v);
+            t.keys.insert(key, i);
+            Len::Ex(i)
+        })
+    }
+
+    pub fn calc(p: f32, x: f32) -> Len {
+        Len::clamp(p, x, f32::NEG_INFINITY, f32::INFINITY)
+    }
+
+    /// [pct, px, lo, hi] of a percentage-relative length.
+    pub fn parts(self) -> [f32; 4] {
+        match self {
+            Len::Pct(p) => [p, 0.0, f32::NEG_INFINITY, f32::INFINITY],
+            Len::Ex(i) => LENS.with(|t| t.borrow().exprs[i as usize]),
+            Len::Px(x) => [0.0, x, f32::NEG_INFINITY, f32::INFINITY],
+            Len::Auto => [0.0, 0.0, f32::NEG_INFINITY, f32::INFINITY],
+        }
+    }
+
+    /// The length if it doesn't depend on a percentage base.
+    #[inline]
+    pub fn fixed(self) -> Option<f32> {
+        match self {
+            Len::Px(v) => Some(v),
+            _ => None,
+        }
     }
 }
 
@@ -56,6 +109,71 @@ pub enum Display {
     TableRowGroup,
     TableCaption,
     Contents,
+    Flex,
+    InlineFlex,
+    Grid,
+    InlineGrid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Pos {
+    Static,
+    Relative,
+    Absolute,
+    Fixed,
+    Sticky,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    None,
+    Left,
+    Right,
+    Both,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Ovf {
+    Visible,
+    Hidden,
+    Scroll,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlexDir {
+    Row,
+    RowRev,
+    Col,
+    ColRev,
+}
+
+/// justify-content / align-content
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Justify {
+    Start,
+    End,
+    Center,
+    Between,
+    Around,
+    Evenly,
+    Stretch,
+}
+
+/// align-items / align-self / justify-items / justify-self
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Al {
+    Stretch,
+    Start,
+    End,
+    Center,
+    Baseline,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GLine {
+    Auto,
+    Line(i16),
+    Span(i16),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -131,7 +249,39 @@ pub enum LineHeight {
 #[derive(Clone, Debug)]
 pub struct Style {
     pub display: Display,
-    pub out_of_flow: bool,
+    pub position: Pos,
+    /// top, right, bottom, left
+    pub inset: [Len; 4],
+    pub z: Option<i32>,
+    pub float: Side,
+    pub clear: Side,
+    pub overflow: Ovf,
+    pub flow_root: bool,
+    /// top-left, top-right, bottom-right, bottom-left
+    pub radius: [Len; 4],
+    pub shadow: Option<css::Shadow>,
+    pub opacity: f32,
+    pub flex_dir: FlexDir,
+    pub wrap: bool,
+    pub justify: Justify,
+    pub align_content: Justify,
+    pub align_items: Al,
+    pub align_self: Option<Al>,
+    pub justify_items: Al,
+    pub justify_self: Option<Al>,
+    pub grow: f32,
+    pub shrink: f32,
+    pub basis: Len,
+    pub order: i32,
+    pub row_gap: Len,
+    pub col_gap: Len,
+    pub grid_cols: Option<Rc<css::TrackList>>,
+    pub grid_rows: Option<Rc<css::TrackList>>,
+    pub grid_auto_rows: Option<Rc<css::TrackList>>,
+    /// grid-column start / end
+    pub gcol: [GLine; 2],
+    /// grid-row start / end
+    pub grow_: [GLine; 2],
     pub color: u32,
     pub bg: u32,
     pub font_size: f32,
@@ -168,7 +318,35 @@ pub struct Style {
 
 pub const INITIAL: Style = Style {
     display: Display::Inline,
-    out_of_flow: false,
+    position: Pos::Static,
+    inset: [Len::Auto; 4],
+    z: None,
+    float: Side::None,
+    clear: Side::None,
+    overflow: Ovf::Visible,
+    flow_root: false,
+    radius: [Len::Px(0.0); 4],
+    shadow: None,
+    opacity: 1.0,
+    flex_dir: FlexDir::Row,
+    wrap: false,
+    justify: Justify::Start,
+    align_content: Justify::Stretch,
+    align_items: Al::Stretch,
+    align_self: None,
+    justify_items: Al::Stretch,
+    justify_self: None,
+    grow: 0.0,
+    shrink: 1.0,
+    basis: Len::Auto,
+    order: 0,
+    row_gap: Len::Px(0.0),
+    col_gap: Len::Px(0.0),
+    grid_cols: None,
+    grid_rows: None,
+    grid_auto_rows: None,
+    gcol: [GLine::Auto; 2],
+    grow_: [GLine::Auto; 2],
     color: 0xFF00_0000,
     bg: 0,
     font_size: 16.0,
@@ -241,8 +419,46 @@ impl Style {
 fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
     use Prop::*;
     match p {
-        Display => d.display = s.display,
-        Position => d.out_of_flow = s.out_of_flow,
+        Display => {
+            d.display = s.display;
+            d.flow_root = s.flow_root
+        }
+        Position => d.position = s.position,
+        InsetTop | InsetRight | InsetBottom | InsetLeft => {
+            let i = p as usize - InsetTop as usize;
+            d.inset[i] = s.inset[i]
+        }
+        RadiusTL | RadiusTR | RadiusBR | RadiusBL => {
+            let i = p as usize - RadiusTL as usize;
+            d.radius[i] = s.radius[i]
+        }
+        ZIndex => d.z = s.z,
+        Float => d.float = s.float,
+        Clear => d.clear = s.clear,
+        Overflow => d.overflow = s.overflow,
+        BoxShadow => d.shadow = s.shadow,
+        Opacity => d.opacity = s.opacity,
+        FlexDirection => d.flex_dir = s.flex_dir,
+        FlexWrap => d.wrap = s.wrap,
+        JustifyContent => d.justify = s.justify,
+        AlignContent => d.align_content = s.align_content,
+        AlignItems => d.align_items = s.align_items,
+        AlignSelf => d.align_self = s.align_self,
+        JustifyItems => d.justify_items = s.justify_items,
+        JustifySelf => d.justify_self = s.justify_self,
+        FlexGrow => d.grow = s.grow,
+        FlexShrink => d.shrink = s.shrink,
+        FlexBasis => d.basis = s.basis,
+        Order => d.order = s.order,
+        RowGap => d.row_gap = s.row_gap,
+        ColumnGap => d.col_gap = s.col_gap,
+        GridTemplateColumns => d.grid_cols = s.grid_cols.clone(),
+        GridTemplateRows => d.grid_rows = s.grid_rows.clone(),
+        GridAutoRows => d.grid_auto_rows = s.grid_auto_rows.clone(),
+        GridColumnStart => d.gcol[0] = s.gcol[0],
+        GridColumnEnd => d.gcol[1] = s.gcol[1],
+        GridRowStart => d.grow_[0] = s.grow_[0],
+        GridRowEnd => d.grow_[1] = s.grow_[1],
         Color => d.color = s.color,
         Background => d.bg = s.bg,
         FontSize => d.font_size = s.font_size,
@@ -313,8 +529,40 @@ impl Ctx {
             Value::Vh(x) => x * self.vh / 100.0,
             Value::Num(n) if n == 0.0 => 0.0,
             Value::Calc(c) if c[0] == 0.0 => self.calc_px(c, fs),
+            Value::Expr(i) => return self.expr_len(&css::expr(i), fs)?.fixed(),
             _ => return None,
         })
+    }
+
+    /// Resolve min()/max()/clamp() into a length; percentages stay symbolic.
+    fn expr_len(&self, e: &css::Expr, fs: f32) -> Option<Len> {
+        match e {
+            css::Expr::Lin(c) => Some(if c[0] == 0.0 { Len::Px(self.calc_px(*c, fs)) } else { Len::calc(c[0], self.calc_px(*c, fs)) }),
+            css::Expr::Min(args) | css::Expr::Max(args) => {
+                let is_min = matches!(e, css::Expr::Min(_));
+                let mut bound: Option<f32> = None;
+                let mut rel: Option<Len> = None;
+                for a in args {
+                    match self.expr_len(a, fs)? {
+                        Len::Px(v) => bound = Some(bound.map_or(v, |b| if is_min { b.min(v) } else { b.max(v) })),
+                        other => {
+                            rel.get_or_insert(other);
+                        }
+                    }
+                }
+                match (rel, bound) {
+                    (None, b) => b.map(Len::Px),
+                    (Some(r), None) => Some(r),
+                    (Some(r), Some(b)) => {
+                        if r == Len::Auto {
+                            return Some(Len::Px(b));
+                        }
+                        let [p, x, lo, hi] = r.parts();
+                        Some(if is_min { Len::clamp(p, x, lo, hi.min(b)) } else { Len::clamp(p, x, lo.max(b), hi) })
+                    }
+                }
+            }
+        }
     }
 
     #[inline]
@@ -326,7 +574,8 @@ impl Ctx {
         match v {
             Value::Pct(p) => Some(Len::Pct(p)),
             Value::Auto => Some(Len::Auto),
-            Value::Calc(c) if c[0] != 0.0 => Some(Len::Calc(c[0], self.calc_px(c, fs))),
+            Value::Calc(c) if c[0] != 0.0 => Some(Len::calc(c[0], self.calc_px(c, fs))),
+            Value::Expr(i) => self.expr_len(&css::expr(i), fs),
             _ => self.px(v, fs).map(Len::Px),
         }
     }
@@ -372,11 +621,160 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                     Kw::TableRowGroup => self::Display::TableRowGroup,
                     Kw::TableCaption => self::Display::TableCaption,
                     Kw::Contents => self::Display::Contents,
+                    Kw::Flex => self::Display::Flex,
+                    Kw::InlineFlex => self::Display::InlineFlex,
+                    Kw::Grid => self::Display::Grid,
+                    Kw::InlineGrid => self::Display::InlineGrid,
+                    Kw::FlowRoot => self::Display::Block,
                     _ => return,
+                };
+                s.flow_root = k == Kw::FlowRoot;
+            }
+        }
+        Position => {
+            s.position = match kw {
+                Some(Kw::Relative) => Pos::Relative,
+                Some(Kw::Absolute) => Pos::Absolute,
+                Some(Kw::Fixed) => Pos::Fixed,
+                Some(Kw::Sticky) => Pos::Sticky,
+                _ => Pos::Static,
+            }
+        }
+        InsetTop | InsetRight | InsetBottom | InsetLeft => {
+            if let Some(l) = c.len(v, fs) {
+                s.inset[d.prop as usize - InsetTop as usize] = l
+            }
+        }
+        RadiusTL | RadiusTR | RadiusBR | RadiusBL => {
+            if let Some(l) = c.len(v, fs) {
+                s.radius[d.prop as usize - RadiusTL as usize] = l
+            }
+        }
+        ZIndex => {
+            s.z = match v {
+                Value::Num(n) => Some(n as i32),
+                _ => None,
+            }
+        }
+        Float | Clear => {
+            let side = match kw {
+                Some(Kw::Left) => Side::Left,
+                Some(Kw::Right) => Side::Right,
+                Some(Kw::Both) => Side::Both,
+                _ => Side::None,
+            };
+            if d.prop == Float {
+                s.float = side
+            } else {
+                s.clear = side
+            }
+        }
+        Overflow => {
+            s.overflow = match kw {
+                Some(Kw::Hidden) => Ovf::Hidden,
+                Some(Kw::Scroll) => Ovf::Scroll,
+                _ => Ovf::Visible,
+            }
+        }
+        BoxShadow => {
+            s.shadow = match v {
+                Value::Shadow(mut sh) => {
+                    if sh.color == CURRENT_COLOR {
+                        sh.color = s.color;
+                    }
+                    Some(sh)
+                }
+                _ => None,
+            }
+        }
+        Opacity => {
+            if let Value::Num(n) = v {
+                s.opacity = n
+            }
+        }
+        FlexDirection => {
+            s.flex_dir = match kw {
+                Some(Kw::RowReverse) => FlexDir::RowRev,
+                Some(Kw::Column) => FlexDir::Col,
+                Some(Kw::ColumnReverse) => FlexDir::ColRev,
+                _ => FlexDir::Row,
+            }
+        }
+        FlexWrap => s.wrap = kw == Some(Kw::Wrap),
+        JustifyContent | AlignContent => {
+            let j = match kw {
+                Some(Kw::End) => Justify::End,
+                Some(Kw::Center) => Justify::Center,
+                Some(Kw::SpaceBetween) => Justify::Between,
+                Some(Kw::SpaceAround) => Justify::Around,
+                Some(Kw::SpaceEvenly) => Justify::Evenly,
+                Some(Kw::Stretch) => Justify::Stretch,
+                _ => Justify::Start,
+            };
+            if d.prop == JustifyContent {
+                s.justify = j
+            } else {
+                s.align_content = j
+            }
+        }
+        AlignItems | AlignSelf | JustifyItems | JustifySelf => {
+            let a = match kw {
+                Some(Kw::Start) => Some(Al::Start),
+                Some(Kw::End) => Some(Al::End),
+                Some(Kw::Center) => Some(Al::Center),
+                Some(Kw::Baseline) => Some(Al::Baseline),
+                Some(_) => Some(Al::Stretch),
+                None => None,
+            };
+            match d.prop {
+                AlignItems => s.align_items = a.unwrap_or(Al::Stretch),
+                JustifyItems => s.justify_items = a.unwrap_or(Al::Stretch),
+                AlignSelf => s.align_self = a,
+                _ => s.justify_self = a,
+            }
+        }
+        FlexGrow | FlexShrink | Order => {
+            if let Value::Num(n) = v {
+                match d.prop {
+                    FlexGrow => s.grow = n.max(0.0),
+                    FlexShrink => s.shrink = n.max(0.0),
+                    _ => s.order = n as i32,
                 }
             }
         }
-        Position => s.out_of_flow = kw == Some(Kw::Out),
+        FlexBasis | RowGap | ColumnGap => {
+            if let Some(l) = c.len(v, fs) {
+                match d.prop {
+                    FlexBasis => s.basis = l,
+                    RowGap => s.row_gap = l,
+                    _ => s.col_gap = l,
+                }
+            }
+        }
+        GridTemplateColumns | GridTemplateRows | GridAutoRows => {
+            let t = match v {
+                Value::Tracks(i) => Some(css::track_list(i)),
+                _ => None,
+            };
+            match d.prop {
+                GridTemplateColumns => s.grid_cols = t,
+                GridTemplateRows => s.grid_rows = t,
+                _ => s.grid_auto_rows = t,
+            }
+        }
+        GridColumnStart | GridColumnEnd | GridRowStart | GridRowEnd => {
+            let l = match v {
+                Value::Num(n) => GLine::Line(n as i16),
+                Value::Span(n) => GLine::Span(n),
+                _ => GLine::Auto,
+            };
+            match d.prop {
+                GridColumnStart => s.gcol[0] = l,
+                GridColumnEnd => s.gcol[1] = l,
+                GridRowStart => s.grow_[0] = l,
+                _ => s.grow_[1] = l,
+            }
+        }
         Color => {
             if let Value::Color(col) = v {
                 s.color = if col == CURRENT_COLOR { ps.color } else { col }
@@ -1096,9 +1494,6 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
         if s.bg == CURRENT_COLOR {
             s.bg = s.color;
         }
-        if s.out_of_flow {
-            s.display = Display::None;
-        }
         if id as NodeId == doc.html {
             ctx.root_fs = s.font_size;
         }
@@ -1162,7 +1557,8 @@ mod tests {
         assert_eq!(a.color, 0xff123456);
         assert_eq!(b.color, 0xff0000ff);
         assert_eq!(a.padding[3], Len::Px(4.0));
-        assert_eq!(a.margin[3], Len::Calc(10.0, 8.0));
+        assert_eq!(a.margin[3].px(100.0), 18.0);
         assert_eq!(a.bc[0], 0xffff0000);
     }
 }
+

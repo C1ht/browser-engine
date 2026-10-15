@@ -9,6 +9,7 @@ use crate::{html, net};
 use std::time::Instant;
 
 pub const HOME: &str = include_str!("../pages/home.html");
+pub const FEATURES: &str = include_str!("../pages/features.html");
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Timings {
@@ -53,6 +54,7 @@ pub fn load(url: &str) -> Result<Loaded, String> {
     let (url, html) = match url {
         "about:home" | "about:" => (url.to_owned(), HOME.to_owned()),
         "about:blank" => (url.to_owned(), String::new()),
+        "about:features" => (url.to_owned(), FEATURES.to_owned()),
         "about:stress" => (url.to_owned(), stress_page()),
         _ => {
             let (u, bytes) = net::fetch(url)?;
@@ -96,7 +98,7 @@ pub fn render(doc: &Document, sheets: &[String], vw: f32, vh: f32, t: &mut Timin
     let styles = style::compute(doc, &cas, vw, vh);
     t.style = ms(t0);
     let t0 = Instant::now();
-    let tree = layout::layout(doc, &styles, vw);
+    let tree = layout::layout(doc, &styles, vw, vh);
     t.layout = ms(t0);
     let t0 = Instant::now();
     let dl = paint::build(&tree, doc, &styles);
@@ -146,7 +148,7 @@ mod tests {
             .iter()
             .find(|a| p.link_href(a.link).as_deref() == Some("about:stress"))
             .expect("about:stress link area");
-        let hit = p.dl.link_at(area.x + area.w / 2.0, area.y + area.h / 2.0);
+        let hit = p.dl.link_at(area.x + area.w / 2.0, area.y + area.h / 2.0, 0.0);
         assert_eq!(hit.and_then(|l| p.link_href(l)).as_deref(), Some("about:stress"));
         assert!(p.tree.height > 500.0);
     }

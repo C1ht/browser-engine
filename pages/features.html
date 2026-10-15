@@ -1,0 +1,108 @@
+<!doctype html>
+<html>
+<head>
+<title>Layout features</title>
+<style>
+  :root { --accent: #3b5bdb; --radius: 10px }
+  body { font-family: Arial, sans-serif; margin: 0; background: #f4f5f8; color: #1d2433 }
+  header { position: sticky; top: 0; background: var(--accent); color: white; padding: 12px 24px;
+           display: flex; align-items: center; gap: 16px }
+  header .logo { font-weight: bold; font-size: 20px }
+  header nav { margin-left: auto; display: flex; gap: 14px }
+  header nav a { color: white; text-decoration: none }
+  main { width: min(100% - 48px, 960px); margin: 24px auto }
+  h2 { margin: 28px 0 10px; font-size: 20px }
+  .card { background: white; border-radius: var(--radius); box-shadow: 0 2px 8px rgba(0,0,0,.15);
+          padding: 16px; border: 1px solid #dde1ea }
+
+  /* flexbox */
+  .row { display: flex; gap: 12px }
+  .row > div { background: #e7ecff; padding: 10px; border-radius: 6px }
+  .grow { flex: 1 }
+  .center { display: flex; justify-content: center; align-items: center; height: 80px; background: #fff3c4; border-radius: 6px }
+  .wrap { display: flex; flex-wrap: wrap; gap: 8px }
+  .wrap span { background: #d3f9d8; padding: 4px 10px; border-radius: 999px }
+  .between { display: flex; justify-content: space-between; align-items: flex-end; height: 70px; background: #ffe3e3; padding: 6px; border-radius: 6px }
+  .between div { background: #ff8787; color: white; padding: 6px 12px; border-radius: 4px }
+  .col { display: flex; flex-direction: column; gap: 6px; width: 200px }
+  .col div { background: #e5dbff; padding: 6px }
+
+  /* grid */
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px }
+  .grid .card { min-height: 60px }
+  .layout { display: grid; grid-template-columns: 200px 1fr; grid-template-rows: auto 1fr auto; gap: 8px }
+  .layout > div { background: #e3fafc; padding: 10px; border-radius: 6px }
+  .layout .hd, .layout .ft { grid-column: 1 / -1; background: #c5f6fa }
+  .span2 { grid-column: span 2 }
+
+  /* floats */
+  .floaty { overflow: hidden }
+  .floaty .pic { float: left; width: 120px; height: 90px; background: #74c0fc; margin: 0 14px 6px 0; border-radius: 8px }
+  .floaty .side { float: right; width: 160px; background: #ffd8a8; padding: 8px; margin-left: 12px }
+  .clear { clear: both; background: #eee; padding: 4px }
+
+  /* positioning */
+  .pos { position: relative; height: 140px; background: white; border: 2px dashed #adb5bd }
+  .badge { position: absolute; top: -10px; right: -10px; background: #fa5252; color: white;
+           width: 28px; height: 28px; border-radius: 50%; text-align: center; line-height: 28px; font-weight: bold }
+  .corner { position: absolute; bottom: 10px; left: 10px; background: #40c057; color: white; padding: 6px 10px; border-radius: 4px }
+  .over { position: absolute; top: 30px; left: 120px; width: 160px; height: 60px; background: rgba(250, 176, 5, .85); z-index: 2; padding: 6px }
+  .under { position: absolute; top: 50px; left: 200px; width: 160px; height: 60px; background: #4dabf7; z-index: 1; padding: 6px }
+  .rel { position: relative; left: 20px; top: 6px; background: #f3d9fa; display: inline-block; padding: 2px 6px }
+  .clip { width: 220px; height: 44px; overflow: hidden; background: #fff; border: 1px solid #ccc }
+  .faded { opacity: .4 }
+  .pill { display: inline-block; padding: 6px 16px; border-radius: 20px; border: 2px solid var(--accent); color: var(--accent); margin-right: 8px }
+  .size { width: clamp(200px, 50%, 400px); background: #e9ecef; padding: 6px; margin-top: 8px }
+</style>
+</head>
+<body>
+<header><span class="logo">&#9889; features</span><span>flex header</span>
+  <nav><a href="#flex">Flex</a><a href="#grid">Grid</a><a href="#floats">Floats</a><a href="#pos">Position</a></nav></header>
+<main>
+  <h2 id="flex">Flexbox</h2>
+  <div class="row"><div>fixed</div><div class="grow">flex: 1 grows to fill</div><div>end</div></div>
+  <p></p>
+  <div class="center"><b>centered both ways</b></div>
+  <p></p>
+  <div class="wrap"><span>wrap</span><span>these</span><span>chips</span><span>across</span><span>multiple</span><span>lines</span><span>when</span><span>they</span><span>run</span><span>out</span><span>of</span><span>room</span><span>in</span><span>the</span><span>row</span><span>container</span><span>below</span><span>the</span><span>edge</span></div>
+  <p></p>
+  <div class="between"><div>A</div><div>B (space-between, align end)</div><div>C</div></div>
+  <p></p>
+  <div class="col"><div>column 1</div><div>column 2</div><div>column 3</div></div>
+
+  <h2 id="grid">Grid</h2>
+  <div class="grid">
+    <div class="card">auto-fill</div><div class="card">minmax(180px, 1fr)</div><div class="card">cards</div>
+    <div class="card span2">span 2</div><div class="card">six</div><div class="card">seven</div>
+  </div>
+  <p></p>
+  <div class="layout"><div class="hd">header (1 / -1)</div><div>sidebar 200px</div><div>content 1fr<br>with two lines</div><div class="ft">footer</div></div>
+
+  <h2 id="floats">Floats</h2>
+  <div class="card floaty">
+    <div class="pic"></div>
+    <div class="side">A right float that text flows around.</div>
+    Lorem ipsum dolor sit amet, consectetur adipiscing elit. This text wraps around the floated box on the left and the box on
+    the right, then returns to full width below them. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut
+    enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure
+    dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur.
+    <div class="clear">clear: both</div>
+  </div>
+
+  <h2 id="pos">Positioning &amp; effects</h2>
+  <div class="pos">
+    <span class="badge">3</span>
+    Relative container with absolute children. <span class="rel">position: relative</span>
+    <div class="under">z-index 1</div><div class="over">z-index 2 (on top)</div>
+    <div class="corner">bottom-left</div>
+  </div>
+  <p></p>
+  <div class="card">
+    <span class="pill">rounded</span><span class="pill faded">opacity .4</span>
+    <div class="clip">overflow: hidden clips this long text that keeps going and going past the box edge</div>
+    <div class="size">width: clamp(200px, 50%, 400px)</div>
+  </div>
+  <p style="height: 40px"></p>
+</main>
+</body>
+</html>
