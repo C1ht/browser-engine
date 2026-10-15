@@ -6,8 +6,12 @@
 //! needed glyph is in the cache (single-threaded), then split the framebuffer
 //! into horizontal bands and rasterize them in parallel with no locking.
 
+use crate::css;
 use crate::dom::Document;
+use crate::engine::Resources;
 use crate::fonts::{fonts, glyph_key, Fonts, GlyphCache};
+use crate::image::Image;
+use std::sync::Arc;
 use crate::layout::*;
 use crate::style::*;
 
@@ -34,7 +38,30 @@ pub struct ShadowData {
     pub hr: [f32; 4],
 }
 
-#[derive(Clone, Debug)]
+pub struct ImgData {
+    pub img: Arc<Image>,
+    /// Where one copy of the image goes (x, y, w, h).
+    pub dst: [f32; 4],
+    /// Drawing is limited to this rect.
+    pub clip: [f32; 4],
+    /// Repeat horizontally / vertically.
+    pub tile: (bool, bool),
+    pub alpha: u32,
+    /// Corner radii of the clip rect.
+    pub radius: [f32; 4],
+}
+
+pub struct GradData {
+    pub rect: [f32; 4],
+    pub clip: [f32; 4],
+    pub radial: bool,
+    pub angle: f32,
+    /// repeating-*-gradient: the pattern repeats every this fraction of the line.
+    pub period: Option<f32>,
+    pub lut: Box<[u32; 256]>,
+    pub radius: [f32; 4],
+}
+
 pub enum DItem {
     Rect { x: f32, y: f32, w: f32, h: f32, c: u32 },
     /// `src` 0 = layout text buffer, 1 = display-list owned text (markers).
@@ -43,6 +70,8 @@ pub enum DItem {
     RRect(Box<([f32; 4], [f32; 4], u32)>),
     Ring(Box<RingData>),
     Shadow(Box<ShadowData>),
+    Image(Box<ImgData>),
+    Gradient(Box<GradData>),
     Clip { x: f32, y: f32, w: f32, h: f32 },
     Unclip,
 }
@@ -79,13 +108,14 @@ impl DisplayList {
 struct Builder<'a> {
     tree: &'a LayoutTree,
     styles: &'a [Style],
+    res: &'a Resources,
     f: &'static Fonts,
     dl: DisplayList,
     opacity: f32,
     in_fixed: bool,
 }
 
-pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style]) -> DisplayList {
+pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style], res: &Resources) -> DisplayList {
     let html_bg = styles[doc.html as usize].bg;
     let body_bg = styles[doc.body as usize].bg;
     let bg = if html_bg >> 24 != 0 {
@@ -98,6 +128,7 @@ pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style]) -> DisplayList
     let mut b = Builder {
         tree,
         styles,
+        res,
         f: fonts(),
         dl: DisplayList {
             items: Vec::with_capacity(tree.boxes.len() * 2),
@@ -193,6 +224,7 @@ impl Builder<'_> {
             if c >> 24 != 0 {
                 self.push(DItem::RRect(Box::new(([bx, by, bw, bh], r, c))));
             }
+            self.background_image(b, st, bx, by);
             let bc = self.fade(st.bc[0]);
             if b.b.iter().any(|&v| v > 0.0) && bc >> 24 != 0 {
                 let i = [bx + b.b[3], by + b.b[0], bw - b.b[1] - b.b[3], bh - b.b[0] - b.b[2]];
@@ -206,15 +238,86 @@ impl Builder<'_> {
             }
         } else {
             self.rect(bx, by, bw, bh, st.bg);
+            self.background_image(b, st, bx, by);
             self.rect(bx, by, bw, b.b[0], st.bc[0]);
             self.rect(bx, by + bh - b.b[2], bw, b.b[2], st.bc[2]);
             self.rect(bx, by, b.b[3], bh, st.bc[3]);
             self.rect(bx + bw - b.b[1], by, b.b[1], bh, st.bc[1]);
         }
-        if b.img && bw > 0.0 && bh > 0.0 {
-            self.rect(bx, by, bw, bh, 0xFFEE_EEEE);
-            for (x, y, w, h) in [(bx, by, bw, 1.0), (bx, by + bh - 1.0, bw, 1.0), (bx, by, 1.0, bh), (bx + bw - 1.0, by, 1.0, bh)] {
-                self.rect(x, y, w, h, 0xFFCC_CCCC);
+        if let Some(img) = &b.image {
+            // <img> content, honouring object-fit.
+            let (cx, cy) = (bx + b.b[3] + b.p[3], by + b.b[0] + b.p[0]);
+            let (cw, ch) = (b.w, b.h);
+            let (iw, ih) = (img.w as f32, img.h as f32);
+            let s = match st.object_fit {
+                1 => (cw / iw).min(ch / ih),
+                2 => (cw / iw).max(ch / ih),
+                3 => 1.0,
+                4 => (cw / iw).min(ch / ih).min(1.0),
+                _ => 0.0,
+            };
+            let dst = if st.object_fit == 0 { [cx, cy, cw, ch] } else { [cx + (cw - iw * s) / 2.0, cy + (ch - ih * s) / 2.0, iw * s, ih * s] };
+            let alpha = (255.0 * self.opacity) as u32;
+            let r = radii(st, b.border_w(), b.border_h());
+            let radius = [0, 1, 2, 3].map(|i| (r[i] - b.b[3].max(b.b[0]) - b.p[3].max(b.p[0])).max(0.0));
+            self.push(DItem::Image(Box::new(ImgData { img: img.clone(), dst, clip: [cx, cy, cw, ch], tile: (false, false), alpha, radius })));
+        }
+    }
+
+    fn background_image(&mut self, b: &LBox, st: &Style, bx: f32, by: f32) {
+        let Some(bi) = st.bg_image else { return };
+        let (bw, bh) = (b.border_w(), b.border_h());
+        let clip = [bx, by, bw, bh];
+        let radius = radii(st, bw, bh);
+        let (px, py) = (bx + b.b[3], by + b.b[0]);
+        let (pw, ph) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
+        if pw <= 0.0 || ph <= 0.0 {
+            return;
+        }
+        let sized = |iw: f32, ih: f32| -> (f32, f32) {
+            match st.bg_fit {
+                1 => {
+                    let s = (pw / iw).max(ph / ih);
+                    (iw * s, ih * s)
+                }
+                2 => {
+                    let s = (pw / iw).min(ph / ih);
+                    (iw * s, ih * s)
+                }
+                _ => match (st.bg_size[0], st.bg_size[1]) {
+                    (Len::Auto, Len::Auto) => (iw, ih),
+                    (x, Len::Auto) => {
+                        let w = x.px(pw);
+                        (w, w * ih / iw)
+                    }
+                    (Len::Auto, y) => {
+                        let h = y.px(ph);
+                        (h * iw / ih, h)
+                    }
+                    (x, y) => (x.px(pw), y.px(ph)),
+                },
+            }
+        };
+        match css::bg_image(bi) {
+            css::BgImage::Url(u) => {
+                let Some(img) = self.res.url(&u) else { return };
+                let (w, h) = sized(img.w as f32, img.h as f32);
+                if w < 0.5 || h < 0.5 {
+                    return;
+                }
+                let x = px + st.bg_pos[0].px(pw - w);
+                let y = py + st.bg_pos[1].px(ph - h);
+                let alpha = (255.0 * self.opacity) as u32;
+                self.push(DItem::Image(Box::new(ImgData { img: img.clone(), dst: [x, y, w, h], clip, tile: st.bg_repeat, alpha, radius })));
+            }
+            css::BgImage::Gradient(g) => {
+                let (w, h) = if st.bg_fit == 0 && st.bg_size[0] == Len::Auto && st.bg_size[1] == Len::Auto { (pw, ph) } else { sized(pw, ph) };
+                let x = px + st.bg_pos[0].px(pw - w);
+                let y = py + st.bg_pos[1].px(ph - h);
+                let a = g.angle.to_radians();
+                let len = if g.radial { (w * w + h * h).sqrt() / 2.0 } else { (w * a.sin()).abs() + (h * a.cos()).abs() };
+                let (lut, period) = gradient_lut(&g, len.max(1.0), self.opacity);
+                self.push(DItem::Gradient(Box::new(GradData { rect: [x, y, w, h], clip, radial: g.radial, angle: g.angle, period, lut, radius })));
             }
         }
     }
@@ -334,6 +437,69 @@ impl Builder<'_> {
         }
         self.opacity = saved_opacity;
     }
+}
+
+/// Sample a gradient's colour stops into a 256-entry table.
+fn gradient_lut(g: &css::Gradient, len: f32, opacity: f32) -> (Box<[u32; 256]>, Option<f32>) {
+    let n = g.stops.len();
+    let mut pos: Vec<Option<f32>> = g.stops.iter().map(|s| s.frac.or(s.px.map(|p| p / len))).collect();
+    if pos[0].is_none() {
+        pos[0] = Some(0.0);
+    }
+    if pos[n - 1].is_none() {
+        pos[n - 1] = Some(1.0);
+    }
+    // Spread unpositioned stops evenly between their neighbours.
+    let mut i = 0;
+    while i < n {
+        if pos[i].is_none() {
+            let start = i - 1;
+            let mut end = i;
+            while pos[end].is_none() {
+                end += 1;
+            }
+            let (a, b) = (pos[start].unwrap(), pos[end].unwrap());
+            for k in i..end {
+                pos[k] = Some(a + (b - a) * (k - start) as f32 / (end - start) as f32);
+            }
+            i = end;
+        }
+        i += 1;
+    }
+    let mut last = f32::NEG_INFINITY;
+    let pos: Vec<f32> = pos
+        .into_iter()
+        .map(|p| {
+            last = last.max(p.unwrap());
+            last
+        })
+        .collect();
+    // Repeating gradients: build the table over one period.
+    let period = (g.repeating && pos[n - 1] > pos[0] && pos[n - 1] > 0.0).then_some(pos[n - 1]);
+    let pos: Vec<f32> = match period {
+        Some(p) => pos.iter().map(|v| v / p).collect(),
+        None => pos,
+    };
+    let ch = |c: u32, s: u32| ((c >> s) & 255) as f32;
+    let mut lut = Box::new([0u32; 256]);
+    for (i, e) in lut.iter_mut().enumerate() {
+        let t = i as f32 / 255.0;
+        let k = pos.iter().position(|&p| p >= t).unwrap_or(n);
+        let c = if k == 0 {
+            g.stops[0].color
+        } else if k == n {
+            g.stops[n - 1].color
+        } else {
+            let (p0, p1) = (pos[k - 1], pos[k]);
+            let f = if p1 > p0 { (t - p0) / (p1 - p0) } else { 1.0 };
+            let (a, b) = (g.stops[k - 1].color, g.stops[k].color);
+            let mix = |s| (ch(a, s) + (ch(b, s) - ch(a, s)) * f).round() as u32;
+            mix(24) << 24 | mix(16) << 16 | mix(8) << 8 | mix(0)
+        };
+        let alpha = ((c >> 24) as f32 * opacity) as u32;
+        *e = alpha << 24 | (c & 0xFF_FFFF);
+    }
+    (lut, period)
 }
 
 // ------------------------------------------------------------- rasterizer
@@ -532,6 +698,118 @@ impl<'a> Surface<'a> {
         }
     }
 
+    pub fn image(&mut self, d: &ImgData) {
+        let img = &d.img;
+        let [dx, dy, dw, dh] = [d.dst[0] - self.ox, d.dst[1] - self.oy, d.dst[2], d.dst[3]];
+        if dw < 0.5 || dh < 0.5 || img.w == 0 || img.h == 0 {
+            return;
+        }
+        let cl = [d.clip[0] - self.ox, d.clip[1] - self.oy, d.clip[2], d.clip[3]];
+        let mut x0 = (cl[0].round() as i32).max(self.clip.0);
+        let mut x1 = ((cl[0] + cl[2]).round() as i32).min(self.clip.2);
+        let mut y0 = (cl[1].round() as i32).max(self.clip.1);
+        let mut y1 = ((cl[1] + cl[3]).round() as i32).min(self.clip.3);
+        if !d.tile.0 {
+            x0 = x0.max(dx.round() as i32);
+            x1 = x1.min((dx + dw).round() as i32);
+        }
+        if !d.tile.1 {
+            y0 = y0.max(dy.round() as i32);
+            y1 = y1.min((dy + dh).round() as i32);
+        }
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        // Pick the mip level closest to (but not below) the target size.
+        let mut scale = (img.w as f32 / dw).min(img.h as f32 / dh);
+        let mut level = 0;
+        while scale >= 2.0 && level < img.mips.len() {
+            scale /= 2.0;
+            level += 1;
+        }
+        let (sw, sh, src) = if level == 0 { (img.w, img.h, &img.px) } else { let m = &img.mips[level - 1]; (m.0, m.1, &m.2) };
+        let tap = |p: i32, d0: f32, dl: f32, tile: bool, sl: u32| -> (u32, u32, u32) {
+            let mut u = p as f32 + 0.5 - d0;
+            if tile {
+                u = u.rem_euclid(dl);
+            }
+            let f = (u * sl as f32 / dl - 0.5).clamp(0.0, sl as f32 - 1.0);
+            let i0 = f as u32;
+            (i0, (i0 + 1).min(sl - 1), ((f - i0 as f32) * 256.0) as u32)
+        };
+        let cols: Vec<(u32, u32, u32)> = (x0..x1).map(|p| tap(p, dx, dw, d.tile.0, sw)).collect();
+        #[inline]
+        fn lerp(a: u32, b: u32, w: u32) -> u32 {
+            let iw = 256 - w;
+            let rb = (((a & 0xFF00FF) * iw + (b & 0xFF00FF) * w) >> 8) & 0xFF00FF;
+            let ag = ((((a >> 8) & 0xFF00FF) * iw + ((b >> 8) & 0xFF00FF) * w)) & 0xFF00FF00;
+            rb | ag
+        }
+        let rounded = d.radius.iter().any(|&r| r > 0.0);
+        let rmax = d.radius.iter().copied().fold(0.0, f32::max);
+        for py in y0..y1 {
+            let (v0, v1, wv) = tap(py, dy, dh, d.tile.1, sh);
+            let fy = py as f32 + 0.5;
+            let corner_row = rounded && (fy < cl[1] + rmax || fy > cl[1] + cl[3] - rmax);
+            let (r0, r1) = (&src[(v0 * sw) as usize..][..sw as usize], &src[(v1 * sw) as usize..][..sw as usize]);
+            let row = &mut self.buf[py as usize * self.w..][..self.w];
+            for (i, &(u0, u1, wu)) in cols.iter().enumerate() {
+                let top = lerp(r0[u0 as usize], r0[u1 as usize], wu);
+                let bot = lerp(r1[u0 as usize], r1[u1 as usize], wu);
+                let c = lerp(top, bot, wv);
+                let mut a = (c >> 24) * d.alpha / 255;
+                if corner_row {
+                    let cov = (0.5 - rrect_sd(x0 as f32 + i as f32 + 0.5, fy, &cl, &d.radius)).clamp(0.0, 1.0);
+                    a = (a as f32 * cov) as u32;
+                }
+                if a == 0 {
+                    continue;
+                }
+                let p = &mut row[(x0 + i as i32) as usize];
+                *p = if a >= 255 { c | 0xFF00_0000 } else { blend(*p, c, a) };
+            }
+        }
+    }
+
+    pub fn gradient(&mut self, d: &GradData) {
+        let [rx, ry, rw, rh] = [d.rect[0] - self.ox, d.rect[1] - self.oy, d.rect[2], d.rect[3]];
+        let cl = [d.clip[0] - self.ox, d.clip[1] - self.oy, d.clip[2], d.clip[3]];
+        let x0 = (cl[0].max(rx).round() as i32).max(self.clip.0);
+        let x1 = ((cl[0] + cl[2]).min(rx + rw).round() as i32).min(self.clip.2);
+        let y0 = (cl[1].max(ry).round() as i32).max(self.clip.1);
+        let y1 = ((cl[1] + cl[3]).min(ry + rh).round() as i32).min(self.clip.3);
+        let (cx, cy) = (rx + rw / 2.0, ry + rh / 2.0);
+        let a = d.angle.to_radians();
+        let (dxv, dyv) = (a.sin(), -a.cos());
+        let len = ((rw * dxv).abs() + (rh * dyv).abs()).max(1.0);
+        let (erx, ery) = ((rw / 2.0 * std::f32::consts::SQRT_2).max(1.0), (rh / 2.0 * std::f32::consts::SQRT_2).max(1.0));
+        let rmax = d.radius.iter().copied().fold(0.0, f32::max);
+        for py in y0..y1 {
+            let fy = py as f32 + 0.5 - cy;
+            let corner_row = rmax > 0.0 && (py as f32 + 0.5 < cl[1] + rmax || py as f32 + 0.5 > cl[1] + cl[3] - rmax);
+            let row = &mut self.buf[py as usize * self.w..][..self.w];
+            for px in x0..x1 {
+                let fx = px as f32 + 0.5 - cx;
+                let t = if d.radial { ((fx / erx).powi(2) + (fy / ery).powi(2)).sqrt() } else { (fx * dxv + fy * dyv) / len + 0.5 };
+                let t = match d.period {
+                    Some(p) => (t / p).rem_euclid(1.0),
+                    None => t.clamp(0.0, 1.0),
+                };
+                let c = d.lut[(t * 255.0) as usize];
+                let mut a = c >> 24;
+                if corner_row {
+                    let cov = (0.5 - rrect_sd(px as f32 + 0.5, py as f32 + 0.5, &cl, &d.radius)).clamp(0.0, 1.0);
+                    a = (a as f32 * cov) as u32;
+                }
+                if a == 0 {
+                    continue;
+                }
+                let p = &mut row[px as usize];
+                *p = if a >= 255 { c } else { blend(*p, c, a) };
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn text(&mut self, s: &str, x: f32, y: f32, face: u8, size: f32, color: u32, f: &Fonts, cache: &GlyphCache) {
         let ca = color >> 24;
@@ -606,6 +884,8 @@ fn extent(it: &DItem) -> Option<(f32, f32)> {
         DItem::RRect(d) => (d.0[1], d.0[1] + d.0[3]),
         DItem::Text { y, size, .. } => (y - size * 1.5, y + size * 0.6),
         DItem::Ring(d) => (d.o[1], d.o[1] + d.o[3]),
+        DItem::Image(d) => (d.clip[1], d.clip[1] + d.clip[3]),
+        DItem::Gradient(d) => (d.clip[1], d.clip[1] + d.clip[3]),
         DItem::Shadow(d) => (d.s[1] - d.blur * 1.5 - 1.0, d.s[1] + d.s[3] + d.blur * 1.5 + 1.0),
         DItem::Clip { .. } | DItem::Unclip => return None,
     })
@@ -623,6 +903,8 @@ fn draw(s: &mut Surface, it: &DItem, texts: [&str; 2], f: &Fonts, cache: &GlyphC
         DItem::RRect(d) => s.rrect(d.0[0], d.0[1], d.0[2], d.0[3], d.1, d.2),
         DItem::Ring(d) => s.ring(d),
         DItem::Shadow(d) => s.shadow(d),
+        DItem::Image(d) => s.image(d),
+        DItem::Gradient(d) => s.gradient(d),
         DItem::Text { x, y, start, end, src, face, size, color } => {
             s.text(item_text(texts, *src, *start, *end), *x, *y, *face, *size, *color, f, cache)
         }

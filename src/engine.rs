@@ -1,11 +1,17 @@
-//! The rendering pipeline: load → parse → cascade → layout → display list.
+//! The rendering pipeline: load → parse → cascade → layout → display list,
+//! plus image loading (fetched in parallel after the first render).
 
-use crate::css::Media;
-use crate::dom::Document;
+use crate::atom::k;
+use crate::css::{self, Media};
+use crate::dom::{Data, Document, NodeId};
+use crate::fx::FxHashMap;
+use crate::image::{self, Image};
 use crate::layout::{self, LayoutTree};
 use crate::paint::{self, DisplayList};
-use crate::style::{self, Style};
+use crate::style::{self, Display, Style};
 use crate::{html, net};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub const HOME: &str = include_str!("../pages/home.html");
@@ -39,13 +45,35 @@ pub fn ms(t: Instant) -> f64 {
     t.elapsed().as_secs_f64() * 1000.0
 }
 
+/// Decoded images and which `<img>` uses which URL.
+#[derive(Default)]
+pub struct Resources {
+    /// By absolute URL; None = failed or unsupported format.
+    pub images: FxHashMap<String, Option<Arc<Image>>>,
+    pub img_src: FxHashMap<NodeId, String>,
+}
+
+impl Resources {
+    pub fn img(&self, node: NodeId) -> Option<&Arc<Image>> {
+        self.images.get(self.img_src.get(&node)?)?.as_ref()
+    }
+    pub fn url(&self, url: &str) -> Option<&Arc<Image>> {
+        self.images.get(url)?.as_ref()
+    }
+}
+
 pub struct Loaded {
     pub url: String,
     pub html: String,
-    pub sheets: Vec<String>,
+    /// (css, base url)
+    pub sheets: Vec<(String, String)>,
     pub doc: Document,
     pub fetch_ms: f64,
     pub parse_ms: f64,
+}
+
+fn base_of(doc: &Document, url: &str) -> String {
+    doc.base.as_ref().map(|b| net::resolve(url, b)).unwrap_or_else(|| url.to_owned())
 }
 
 /// Fetch a document and its stylesheets (in parallel).
@@ -67,41 +95,74 @@ pub fn load(url: &str) -> Result<Loaded, String> {
     let parse_ms = ms(tp);
 
     let t = Instant::now();
-    let base = doc.base.as_ref().map(|b| net::resolve(&url, b)).unwrap_or_else(|| url.clone());
+    let base = base_of(&doc, &url);
     let urls: Vec<String> = doc.stylesheet_links.iter().map(|h| net::resolve(&base, h)).collect();
-    let mut sheets: Vec<String> = std::thread::scope(|s| {
+    let mut sheets: Vec<(String, String)> = std::thread::scope(|s| {
         let handles: Vec<_> = urls
             .iter()
-            .map(|u| s.spawn(move || net::fetch(u).map(|(_, b)| net::decode(&b)).unwrap_or_default()))
+            .map(|u| s.spawn(move || (net::fetch(u).map(|(_, b)| net::decode(&b)).unwrap_or_default(), u.clone())))
             .collect();
         handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
     });
-    sheets.extend(doc.styles.iter().cloned());
+    sheets.extend(doc.styles.iter().map(|s| (s.clone(), base.clone())));
     Ok(Loaded { url, html, sheets, doc, fetch_ms: fetch_html + ms(t), parse_ms })
+}
+
+/// The URL an `<img>` shows (handles common lazy-loading attributes and srcset).
+fn img_url(doc: &Document, n: NodeId, base: &str) -> Option<String> {
+    let attr = |name: &str| crate::atom::lookup(name).and_then(|a| doc.attr(n, a)).map(str::trim).filter(|s| !s.is_empty());
+    let src = doc.attr(n, k::src).map(str::trim).filter(|s| !s.is_empty());
+    let placeholder = src.is_none_or(|s| s.starts_with("data:image/gif") || s.starts_with("data:image/svg") || s.contains("blank.gif"));
+    let pick = if placeholder { attr("data-src").or(attr("data-lazy-src")).or(attr("data-original")).or(src) } else { src };
+    let pick = pick.map(str::to_owned).or_else(|| {
+        let set = attr("srcset").or(attr("data-srcset"))?;
+        set.split(',').next()?.split_whitespace().next().map(str::to_owned)
+    })?;
+    Some(if pick.starts_with("data:") { pick } else { net::resolve(base, &pick) })
+}
+
+/// Fetch and decode images in parallel; `done` is called as each finishes.
+pub fn fetch_images(urls: &[String], done: &(dyn Fn(String, Option<Arc<Image>>) + Sync)) {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..urls.len().min(8) {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(u) = urls.get(i) else { break };
+                let bytes = if u.starts_with("data:") { image::data_url(u) } else { net::fetch(u).ok().map(|(_, b)| b) };
+                let img = bytes.and_then(|b| image::decode(&b)).map(Arc::new);
+                done(u.clone(), img);
+            });
+        }
+    });
 }
 
 pub struct Page {
     pub url: String,
+    pub base: String,
     pub doc: Document,
-    pub sheets: Vec<String>,
+    pub sheets: Vec<(String, String)>,
     pub styles: Vec<Style>,
     pub tree: LayoutTree,
     pub dl: DisplayList,
+    pub res: Resources,
     pub t: Timings,
 }
 
-pub fn render(doc: &Document, sheets: &[String], vw: f32, vh: f32, t: &mut Timings) -> (Vec<Style>, LayoutTree, DisplayList) {
+#[allow(clippy::too_many_arguments)]
+pub fn render(doc: &Document, sheets: &[(String, String)], base: &str, res: &Resources, vw: f32, vh: f32, t: &mut Timings) -> (Vec<Style>, LayoutTree, DisplayList) {
     let t0 = Instant::now();
     let cas = style::build_cascade(sheets, &Media { vw, vh }, doc.quirks);
     t.css = ms(t0);
     let t0 = Instant::now();
+    css::set_base(base);
     let styles = style::compute(doc, &cas, vw, vh);
     t.style = ms(t0);
     let t0 = Instant::now();
-    let tree = layout::layout(doc, &styles, vw, vh);
+    let tree = layout::layout(doc, &styles, vw, vh, res);
     t.layout = ms(t0);
     let t0 = Instant::now();
-    let dl = paint::build(&tree, doc, &styles);
+    let dl = paint::build(&tree, doc, &styles, res);
     t.display = ms(t0);
     t.nodes = doc.nodes.len();
     t.rules = cas.rule_count();
@@ -112,16 +173,65 @@ pub fn render(doc: &Document, sheets: &[String], vw: f32, vh: f32, t: &mut Timin
 impl Page {
     pub fn new(l: Loaded, vw: f32, vh: f32) -> Page {
         let mut t = Timings { fetch: l.fetch_ms, parse: l.parse_ms, ..Default::default() };
-        let (styles, tree, dl) = render(&l.doc, &l.sheets, vw, vh, &mut t);
-        Page { url: l.url, doc: l.doc, sheets: l.sheets, styles, tree, dl, t }
+        let base = base_of(&l.doc, &l.url);
+        let mut res = Resources::default();
+        for (i, n) in l.doc.nodes.iter().enumerate() {
+            if let Data::Element(e) = &n.data {
+                if e.tag == k::img {
+                    if let Some(u) = img_url(&l.doc, i as NodeId, &base) {
+                        res.img_src.insert(i as NodeId, u);
+                    }
+                }
+            }
+        }
+        let (styles, tree, dl) = render(&l.doc, &l.sheets, &base, &res, vw, vh, &mut t);
+        Page { url: l.url, base, doc: l.doc, sheets: l.sheets, styles, tree, dl, res, t }
     }
 
     /// Re-run style + layout for a new viewport size (media queries may change).
     pub fn relayout(&mut self, vw: f32, vh: f32) {
-        let (styles, tree, dl) = render(&self.doc, &self.sheets, vw, vh, &mut self.t);
+        let (styles, tree, dl) = render(&self.doc, &self.sheets, &self.base, &self.res, vw, vh, &mut self.t);
         self.styles = styles;
         self.tree = tree;
         self.dl = dl;
+    }
+
+    /// Images used by rendered elements that haven't been fetched yet.
+    pub fn wanted_images(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (i, st) in self.styles.iter().enumerate() {
+            if st.display == Display::None || self.doc.elem(i as NodeId).is_none() {
+                continue;
+            }
+            if let Some(u) = self.res.img_src.get(&(i as NodeId)) {
+                if !self.res.images.contains_key(u) && seen.insert(u.clone()) {
+                    out.push(u.clone());
+                }
+            }
+            if let Some(bi) = st.bg_image {
+                if let css::BgImage::Url(u) = css::bg_image(bi) {
+                    if !self.res.images.contains_key(&*u) && seen.insert(u.to_string()) {
+                        out.push(u.to_string());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Fetch every wanted image now (used for screenshots and benchmarks).
+    pub fn load_images_blocking(&mut self, vw: f32, vh: f32) {
+        let urls = self.wanted_images();
+        if urls.is_empty() {
+            return;
+        }
+        let got = std::sync::Mutex::new(Vec::new());
+        fetch_images(&urls, &|u, img| got.lock().unwrap().push((u, img)));
+        for (u, img) in got.into_inner().unwrap() {
+            self.res.images.insert(u, img);
+        }
+        self.relayout(vw, vh);
     }
 
     pub fn title(&self) -> &str {
@@ -130,8 +240,7 @@ impl Page {
 
     pub fn link_href(&self, link: u32) -> Option<String> {
         let href = self.tree.links.get(link as usize)?;
-        let base = self.doc.base.as_ref().map(|b| net::resolve(&self.url, b)).unwrap_or_else(|| self.url.clone());
-        Some(net::resolve(&base, href))
+        Some(net::resolve(&self.base, href))
     }
 }
 

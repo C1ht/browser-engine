@@ -1,0 +1,33 @@
+<!doctype html><html><head><title>Images</title><style>
+body { font-family: Arial, sans-serif; margin: 20px; background: #f4f5f8 }
+.row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap }
+figure { margin: 0; background: white; padding: 8px; border-radius: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.2) }
+figcaption { font-size: 12px; color: #555; margin-top: 4px }
+.thumb { width: 120px; height: 120px; border-radius: 50%; object-fit: cover }
+.contain { width: 160px; height: 100px; object-fit: contain; background: #222 }
+.hero { height: 160px; background: url(photo.jpg) center / cover no-repeat; border-radius: 12px; color: white; padding: 20px; font-size: 28px; font-weight: bold; margin: 16px 0 }
+.tile { width: 200px; height: 90px; background-image: url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgoBAw4pK4oxH1H5mvcmMZVrWMhDSiA3SDmEjRjE0NEymasallYqAQMJFqO7ormKjigoE3QAVHIsEHYHqYqOICBhJdgawWxQXEGIKuhuLMRDEAAPV8JBr6HfkvAAAAAElFTkSuQmCC"); background-size: 20px 20px; border: 1px solid #ccc }
+.pos { width: 200px; height: 90px; background: #fff url(data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgoBAw4pK4oxH1H5mvcmMZVrWMhDSiA3SDmEjRjE0NEymasallYqAQMJFqO7ormKjigoE3QAVHIsEHYHqYqOICBhJdgawWxQXEGIKuhuLMRDEAAPV8JBr6HfkvAAAAAElFTkSuQmCC) no-repeat right 10px bottom 10px; border: 1px solid #ccc }
+.g1 { width: 200px; height: 90px; background: linear-gradient(135deg, #ff6b6b, #845ef7) }
+.g2 { width: 200px; height: 90px; background: radial-gradient(circle, #fff3bf, #f08c00 70%, #862e9c) }
+.g3 { width: 200px; height: 90px; background: repeating-linear-gradient(45deg, #dee2e6 0, #dee2e6 10px, #fff 10px, #fff 20px) }
+.g4 { width: 200px; height: 90px; background-image: linear-gradient(to right, rgba(255,255,255,0), #fff), url(photo.jpg); background-size: cover }
+</style></head><body>
+<h2>Images</h2>
+<div class="row">
+ <figure><img src="photo.jpg" style="max-width: 240px"><figcaption>progressive JPEG, max-width</figcaption></figure>
+ <figure><img class="thumb" src="photo.jpg"><figcaption>object-fit: cover, round</figcaption></figure>
+ <figure><img class="contain" src="photo.jpg"><figcaption>object-fit: contain</figcaption></figure>
+ <figure><img src="rgba.png" width="106"><figcaption>PNG with alpha</figcaption></figure>
+ <figure><img src="img.gif" width="106"><figcaption>GIF</figcaption></figure>
+ <figure><img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAWklEQVR4nGNgoBAw4pK4oxH1H5mvcmMZVrWMhDSiA3SDmEjRjE0NEymasallYqAQMJFqO7ormKjigoE3QAVHIsEHYHqYqOICBhJdgawWxQXEGIKuhuLMRDEAAPV8JBr6HfkvAAAAAElFTkSuQmCC" width="32"> <img src="missing.png" alt="[missing image alt text]"><figcaption>data: URL + alt</figcaption></figure>
+</div>
+<div class="hero">background-size: cover</div>
+<div class="row">
+ <figure><div class="tile"></div><figcaption>repeat + size</figcaption></figure>
+ <figure><div class="pos"></div><figcaption>position right bottom</figcaption></figure>
+ <figure><div class="g1"></div><figcaption>linear 135deg</figcaption></figure>
+ <figure><div class="g2"></div><figcaption>radial</figcaption></figure>
+ <figure><div class="g3"></div><figcaption>repeating stripes</figcaption></figure>
+</div>
+</body></html>

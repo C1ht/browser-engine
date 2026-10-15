@@ -12,9 +12,12 @@
 use crate::atom::k;
 use crate::css::{self, Breadth, Track};
 use crate::dom::*;
+use crate::engine::Resources;
 use crate::fonts::{fonts, Fonts};
+use crate::image::Image;
 use crate::style::*;
 use std::rc::Rc;
+use std::sync::Arc;
 
 pub const NO_LINK: u32 = u32::MAX;
 const NO_BOX: u32 = u32::MAX;
@@ -95,6 +98,8 @@ pub struct LBox {
     pub static_pos: (f32, f32),
     /// position: relative offset.
     pub rel: (f32, f32),
+    /// Decoded image for <img>.
+    pub image: Option<Arc<Image>>,
 }
 
 impl LBox {
@@ -284,9 +289,10 @@ struct Engine<'a> {
     /// Positioned ancestors while building (containing blocks for absolute boxes).
     cbs: Vec<u32>,
     root: u32,
+    res: &'a Resources,
 }
 
-pub fn layout(doc: &Document, styles: &[Style], vw: f32, vh: f32) -> LayoutTree {
+pub fn layout(doc: &Document, styles: &[Style], vw: f32, vh: f32, res: &Resources) -> LayoutTree {
     let mut e = Engine {
         doc,
         styles,
@@ -302,6 +308,7 @@ pub fn layout(doc: &Document, styles: &[Style], vw: f32, vh: f32) -> LayoutTree 
         bfcs: Vec::new(),
         cbs: Vec::new(),
         root: 0,
+        res,
     };
     e.compute_contains_block();
     let root = e.build_box(doc.html, NO_LINK, 0);
@@ -389,6 +396,7 @@ impl<'a> Engine<'a> {
             abs_kids: Vec::new(),
             static_pos: (0.0, 0.0),
             rel: (0.0, 0.0),
+            image: None,
         });
         id
     }
@@ -449,9 +457,11 @@ impl<'a> Engine<'a> {
                     k::iframe | k::video | k::canvas | k::embed | k::object => (300.0, 150.0),
                     _ => (0.0, 0.0),
                 };
+                let img = if tag == k::img { self.res.img(c).cloned() } else { None };
                 let b = &mut self.boxes[bx as usize];
-                b.repl = size;
+                b.repl = img.as_ref().map_or(size, |i| (i.w as f32, i.h as f32));
                 b.img = tag == k::img;
+                b.image = img;
             }
             Kind::Table => {
                 let mut anon_row = None;
@@ -685,8 +695,8 @@ impl<'a> Engine<'a> {
                     self.ws_space = true;
                     return;
                 }
-                if el.tag == k::img && st.width.is_auto() && st.height.is_auto() {
-                    // We don't decode images; show the alt text instead.
+                if el.tag == k::img && st.width.is_auto() && st.height.is_auto() && self.res.img(c).is_none() {
+                    // Not loaded (yet): show the alt text instead.
                     if let Some(alt) = el.attr(k::alt) {
                         if !alt.trim().is_empty() {
                             let link = self.link_for(c, link);
@@ -904,7 +914,11 @@ impl<'a> Engine<'a> {
         let v = match kind {
             Kind::Replaced => {
                 let st = self.st(id);
-                let w = st.width.fixed().unwrap_or(self.boxes[id as usize].repl.0);
+                let (nw, nh) = self.boxes[id as usize].repl;
+                let w = st.width.fixed().unwrap_or_else(|| match st.height.fixed() {
+                    Some(h) if nh > 0.0 => h * nw / nh,
+                    _ => nw,
+                });
                 (w, w)
             }
             Kind::Table => {
@@ -1078,24 +1092,45 @@ impl<'a> Engine<'a> {
         let adj_v = if st.border_box { pb_v } else { 0.0 };
 
         if kind == Kind::Replaced {
-            let repl = self.boxes[id as usize].repl;
-            let w = match mode {
-                Mode::Forced(fw) if st.width.is_auto() => fw - pb_h,
-                _ => match st.width {
-                    Len::Auto => repl.0,
-                    l => l.px(cb_w) - adj_h,
-                },
+            let (nw, nh) = self.boxes[id as usize].repl;
+            let ratio = if nw > 0.0 && nh > 0.0 { Some(nh / nw) } else { None };
+            let spec_w = match mode {
+                Mode::Forced(fw) if st.width.is_auto() => Some(fw - pb_h),
+                _ => (!st.width.is_auto()).then(|| st.width.px(cb_w) - adj_h),
             };
-            let h = match st.height.fixed() {
-                Some(h) => h - adj_v,
-                None => {
-                    if st.width.is_auto() && !matches!(mode, Mode::Forced(_)) {
-                        repl.1
-                    } else {
-                        w * if repl.0 > 0.0 { repl.1 / repl.0 } else { 0.0 }
+            let spec_h = st.height.fixed().map(|h| h - adj_v);
+            let (mut w, mut h) = match (spec_w, spec_h) {
+                (Some(w), Some(h)) => (w, h),
+                (Some(w), None) => (w, ratio.map_or(nh, |r| w * r)),
+                (None, Some(h)) => (ratio.map_or(nw, |r| h / r), h),
+                (None, None) => (nw, nh),
+            };
+            // min/max constraints keep the aspect ratio of auto dimensions.
+            if !st.max_w.is_auto() {
+                let mx = st.max_w.px(cb_w) - adj_h;
+                if w > mx {
+                    w = mx;
+                    if spec_h.is_none() {
+                        h = ratio.map_or(h, |r| w * r);
                     }
                 }
-            };
+            }
+            let mn = st.min_w.px(cb_w) - adj_h;
+            if w < mn {
+                w = mn;
+                if spec_h.is_none() {
+                    h = ratio.map_or(h, |r| w * r);
+                }
+            }
+            if let Some(mx) = st.max_h.fixed() {
+                let mx = mx - adj_v;
+                if h > mx {
+                    h = mx;
+                    if spec_w.is_none() {
+                        w = ratio.map_or(w, |r| h / r);
+                    }
+                }
+            }
             let bx = &mut self.boxes[id as usize];
             bx.w = w.max(0.0);
             bx.h = h.max(0.0);
@@ -1946,6 +1981,12 @@ impl<'a> Engine<'a> {
 
         let auto = Track { min: Breadth::Auto, max: Breadth::Auto };
         let mut cols = self.expand_tracks(st.grid_cols.as_ref(), w, gap_c, fs);
+        let areas = st.grid_areas.clone();
+        if let Some(a) = &areas {
+            while cols.len() < a.cols {
+                cols.push(auto);
+            }
+        }
         if cols.is_empty() {
             cols.push(auto);
         }
@@ -1983,8 +2024,14 @@ impl<'a> Engine<'a> {
             let cs = self.st(c);
             let canon = self.boxes[c as usize].anon;
             let (gc, gr) = if canon { ([GLine::Auto; 2], [GLine::Auto; 2]) } else { (cs.gcol, cs.grow_) };
-            let (col, mut cspan) = resolve(gc[0], gc[1], explicit_cols);
-            let (row, rspan) = resolve(gr[0], gr[1], row_tracks.len());
+            let (mut col, mut cspan) = resolve(gc[0], gc[1], explicit_cols);
+            let (mut row, mut rspan) = resolve(gr[0], gr[1], row_tracks.len());
+            // grid-area: <name> from grid-template-areas
+            if let (Some(a), Some(name), false) = (&areas, cs.garea, canon) {
+                if let Some((_, [r0, c0, r1, c1])) = a.map.iter().find(|(n, _)| *n == name) {
+                    (row, rspan, col, cspan) = (Some(*r0), r1 - r0, Some(*c0), c1 - c0);
+                }
+            }
             if let Some(cl) = col {
                 if cl + cspan > ncols {
                     ncols = cl + cspan;

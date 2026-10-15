@@ -34,6 +34,12 @@ pub enum Value {
     Tracks(u32),
     /// `span N` in grid placement.
     Span(i16),
+    /// background-image: index into the image table.
+    Image(u32),
+    /// grid-template-areas: index into the areas table.
+    Areas(u32),
+    /// An identifier (interned), e.g. a grid area name.
+    Name(u32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -115,6 +121,14 @@ pub enum Kw {
     SpaceAround,
     SpaceEvenly,
     Stretch,
+    Cover,
+    Contain,
+    Repeat,
+    NoRepeat,
+    RepeatX,
+    RepeatY,
+    Fill,
+    ScaleDown,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -200,6 +214,15 @@ pub enum Prop {
     GridColumnEnd,
     GridRowStart,
     GridRowEnd,
+    GridTemplateAreas,
+    GridArea,
+    BackgroundImage,
+    BgSizeX,
+    BgSizeY,
+    BgPosX,
+    BgPosY,
+    BgRepeat,
+    ObjectFit,
     Custom,
     Unresolved,
 }
@@ -728,7 +751,7 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
         return;
     }
 
-    if parse_more(name, v, important, out) {
+    if parse_more(name, v, value.trim(), important, out) {
         return;
     }
     let kw = |k: Kw| Some(Value::Kw(k));
@@ -1051,6 +1074,9 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "grid-template-columns" => GridTemplateColumns,
         "grid-template-rows" => GridTemplateRows,
         "grid-auto-rows" => GridAutoRows,
+        "background-image" => BackgroundImage,
+        "background-repeat" => BgRepeat,
+        "object-fit" => ObjectFit,
         _ => return None,
     })
 }
@@ -1479,6 +1505,65 @@ fn store_tracks(v: &str) -> Option<Value> {
     })
 }
 
+/// Named grid areas: rows × cols and each name's [row0, col0, row1, col1).
+#[derive(Debug, Default, PartialEq)]
+pub struct Areas {
+    pub rows: usize,
+    pub cols: usize,
+    pub map: Vec<(u32, [usize; 4])>,
+}
+
+thread_local! {
+    static AREAS: RefCell<(Vec<Rc<Areas>>, FxHashMap<String, u32>)> = RefCell::new(Default::default());
+}
+
+pub fn areas(i: u32) -> Rc<Areas> {
+    AREAS.with(|t| t.borrow().0[i as usize].clone())
+}
+
+fn store_areas(v: &str) -> Option<Value> {
+    if v.eq_ignore_ascii_case("none") {
+        return Some(Value::Kw(Kw::None));
+    }
+    if let Some(&i) = AREAS.with(|t| t.borrow().1.get(v).copied()).as_ref() {
+        return Some(Value::Areas(i));
+    }
+    let mut rows: Vec<Vec<&str>> = Vec::new();
+    let mut rest = v;
+    while let Some(q0) = rest.find(['"', '\'']) {
+        let q = rest.as_bytes()[q0] as char;
+        let end = rest[q0 + 1..].find(q)? + q0 + 1;
+        rows.push(rest[q0 + 1..end].split_whitespace().collect());
+        rest = &rest[end + 1..];
+    }
+    let cols = rows.iter().map(|r| r.len()).max()?;
+    let mut a = Areas { rows: rows.len(), cols, map: Vec::new() };
+    for (r, row) in rows.iter().enumerate() {
+        for (c, name) in row.iter().enumerate() {
+            if name.chars().all(|ch| ch == '.') {
+                continue;
+            }
+            let id = crate::atom::intern(name).0;
+            match a.map.iter_mut().find(|(n, _)| *n == id) {
+                Some((_, b)) => {
+                    b[0] = b[0].min(r);
+                    b[1] = b[1].min(c);
+                    b[2] = b[2].max(r + 1);
+                    b[3] = b[3].max(c + 1);
+                }
+                None => a.map.push((id, [r, c, r + 1, c + 1])),
+            }
+        }
+    }
+    Some(AREAS.with(|t| {
+        let mut t = t.borrow_mut();
+        let i = t.0.len() as u32;
+        t.0.push(Rc::new(a));
+        t.1.insert(v.to_owned(), i);
+        Value::Areas(i)
+    }))
+}
+
 fn grid_line(t: &str) -> Value {
     let toks: Vec<&str> = t.split_whitespace().collect();
     match toks.as_slice() {
@@ -1539,7 +1624,7 @@ fn align_kw(t: &str) -> Option<Value> {
 
 /// Properties added for positioning, floats, effects, flexbox and grid.
 /// Returns false if `name` isn't one of them.
-fn parse_more(name: &str, v: &str, important: bool, out: &mut Vec<Decl>) -> bool {
+fn parse_more(name: &str, v: &str, orig: &str, important: bool, out: &mut Vec<Decl>) -> bool {
     macro_rules! push {
         ($p:expr, $v:expr) => {
             out.push(Decl { prop: $p, value: $v, important })
@@ -1759,13 +1844,50 @@ fn parse_more(name: &str, v: &str, important: bool, out: &mut Vec<Decl>) -> bool
             push!(ps, s);
             push!(pe, e);
         }
+        "background" => background(orig, important, out),
+        "background-image" => {
+            let first = split_top(orig, b',').into_iter().next().unwrap_or("").trim();
+            push!(BackgroundImage, if first.eq_ignore_ascii_case("none") { Value::Kw(Kw::None) } else { image_value(first).unwrap_or(Value::Kw(Kw::None)) });
+        }
+        "background-size" => {
+            let first = split_top(v, b',').into_iter().next().unwrap_or("");
+            bg_size(first, important, out);
+        }
+        "background-position" => {
+            let first = split_top(v, b',').into_iter().next().unwrap_or("");
+            bg_position(&tokens_ws(first), important, out);
+        }
+        "background-repeat" => {
+            let first = split_top(v, b',').into_iter().next().unwrap_or("");
+            if let Some(r) = bg_repeat(&tokens_ws(first)) {
+                push!(BgRepeat, r);
+            }
+        }
+        "object-fit" => {
+            let k = match v {
+                "contain" => Kw::Contain,
+                "cover" => Kw::Cover,
+                "none" => Kw::None,
+                "scale-down" => Kw::ScaleDown,
+                _ => Kw::Fill,
+            };
+            push!(ObjectFit, Value::Kw(k));
+        }
         "grid-column-start" => push!(GridColumnStart, grid_line(v)),
         "grid-column-end" => push!(GridColumnEnd, grid_line(v)),
         "grid-row-start" => push!(GridRowStart, grid_line(v)),
         "grid-row-end" => push!(GridRowEnd, grid_line(v)),
+        "grid-template-areas" => {
+            if let Some(a) = store_areas(orig) {
+                push!(GridTemplateAreas, a);
+            }
+        }
         "grid-area" => {
             let parts: Vec<Value> = v.split('/').map(grid_line).collect();
-            if parts.len() >= 2 {
+            let first = orig.split('/').next().unwrap_or("").trim();
+            if parts.len() == 1 && first.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_' || c == '-') && first != "auto" && !first.starts_with("span") {
+                push!(GridArea, Value::Name(crate::atom::intern(first).0));
+            } else if parts.len() >= 2 {
                 push!(GridRowStart, parts[0]);
                 push!(GridColumnStart, parts[1]);
                 push!(GridRowEnd, parts.get(2).copied().unwrap_or(Value::Auto));
@@ -1779,11 +1901,334 @@ fn parse_more(name: &str, v: &str, important: bool, out: &mut Vec<Decl>) -> bool
 
 // ------------------------------------------------------------- stylesheet
 
-pub fn parse_stylesheet(src: &str, media: &Media) -> Stylesheet {
+/// Parse a stylesheet; `url()`s resolve against `base`.
+pub fn parse_stylesheet(src: &str, media: &Media, base: &str) -> Stylesheet {
+    let saved = BASE.with(|b| std::mem::replace(&mut *b.borrow_mut(), base.to_owned()));
     let mut sheet = Stylesheet::default();
     let s = strip_comments(src);
     parse_rules(&s, &mut sheet, media);
+    BASE.with(|b| *b.borrow_mut() = saved);
     sheet
+}
+
+// ------------------------------------------------------------ backgrounds
+
+thread_local! {
+    /// Base URL for url() in the declarations being parsed.
+    static BASE: RefCell<String> = const { RefCell::new(String::new()) };
+    static IMAGES: RefCell<(Vec<BgImage>, FxHashMap<String, u32>)> = RefCell::new(Default::default());
+}
+
+/// Set the base URL used for url() in inline style attributes.
+pub fn set_base(base: &str) {
+    BASE.with(|b| *b.borrow_mut() = base.to_owned());
+}
+
+#[derive(Clone, Debug)]
+pub struct Stop {
+    pub color: u32,
+    /// Position as a fraction of the gradient line, if given in %.
+    pub frac: Option<f32>,
+    /// Position in px, if given as a length.
+    pub px: Option<f32>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Gradient {
+    pub radial: bool,
+    pub repeating: bool,
+    /// CSS angle in degrees (0 = towards the top, 90 = towards the right).
+    pub angle: f32,
+    pub stops: Vec<Stop>,
+}
+
+#[derive(Clone, Debug)]
+pub enum BgImage {
+    Url(Rc<str>),
+    Gradient(Rc<Gradient>),
+}
+
+pub fn bg_image(i: u32) -> BgImage {
+    IMAGES.with(|t| t.borrow().0[i as usize].clone())
+}
+
+fn store_image(key: String, img: BgImage) -> Value {
+    IMAGES.with(|t| {
+        let mut t = t.borrow_mut();
+        if let Some(&i) = t.1.get(&key) {
+            return Value::Image(i);
+        }
+        let i = t.0.len() as u32;
+        t.0.push(img);
+        t.1.insert(key, i);
+        Value::Image(i)
+    })
+}
+
+/// url(...) or a gradient function (original case preserved).
+fn image_value(t: &str) -> Option<Value> {
+    let lower = t.to_ascii_lowercase();
+    if lower.starts_with("url(") {
+        let inner = t[4..].strip_suffix(')')?.trim().trim_matches(|c| c == '"' || c == '\'');
+        if inner.is_empty() {
+            return None;
+        }
+        let abs = BASE.with(|b| crate::net::resolve(&b.borrow(), inner));
+        return Some(store_image(format!("u{abs}"), BgImage::Url(Rc::from(abs.as_str()))));
+    }
+    let name_end = lower.find('(')?;
+    let name = lower[..name_end].trim_start_matches("-webkit-").trim_start_matches("-moz-");
+    let (radial, repeating) = match name {
+        "linear-gradient" => (false, false),
+        "repeating-linear-gradient" => (false, true),
+        "radial-gradient" => (true, false),
+        "repeating-radial-gradient" => (true, true),
+        _ => return None,
+    };
+    let legacy = lower.starts_with("-webkit-") || lower.starts_with("-moz-");
+    let inner = lower[name_end + 1..].strip_suffix(')')?;
+    let args = split_top(inner, b',');
+    let mut angle = 180.0;
+    let mut first = 0;
+    if let Some(a) = args.first().map(|a| a.trim()) {
+        let side = |s: &str| -> Option<f32> {
+            let (mut x, mut y) = (0.0f32, 0.0f32);
+            for w in s.split_whitespace() {
+                match w {
+                    "top" => y = -1.0,
+                    "bottom" => y = 1.0,
+                    "left" => x = -1.0,
+                    "right" => x = 1.0,
+                    _ => return None,
+                }
+            }
+            Some(x.atan2(-y).to_degrees().rem_euclid(360.0))
+        };
+        if let Some(rest) = a.strip_prefix("to ") {
+            if let Some(d) = side(rest) {
+                angle = d;
+                first = 1;
+            }
+        } else if legacy && side(a).is_some() {
+            angle = (side(a).unwrap() + 180.0).rem_euclid(360.0);
+            first = 1;
+        } else if let Some(n) = a.strip_suffix("deg") {
+            if let Ok(d) = n.parse::<f32>() {
+                angle = if legacy { 90.0 - d } else { d };
+                first = 1;
+            }
+        } else if let Some(n) = a.strip_suffix("turn") {
+            if let Ok(d) = n.parse::<f32>() {
+                angle = d * 360.0;
+                first = 1;
+            }
+        } else if let Some(n) = a.strip_suffix("rad") {
+            if let Ok(d) = n.parse::<f32>() {
+                angle = d.to_degrees();
+                first = 1;
+            }
+        } else if radial && tokens_ws(a).first().and_then(|t| color_value(t)).is_none() {
+            first = 1; // shape / size / position: ignored
+        }
+    }
+    let mut stops = Vec::new();
+    for a in &args[first..] {
+        let toks = tokens_ws(a.trim());
+        let Some(Value::Color(c)) = toks.iter().find_map(|t| color_value(t)) else { continue };
+        let color = if c == CURRENT_COLOR { 0xFF00_0000 } else { c };
+        let mut positions = toks.iter().filter_map(|t| length(t));
+        let pos = |v: Option<Value>| match v {
+            Some(Value::Pct(p)) => (Some(p / 100.0), None),
+            Some(Value::Px(p)) => (None, Some(p)),
+            Some(Value::Em(e)) | Some(Value::Rem(e)) => (None, Some(e * 16.0)),
+            _ => (None, None),
+        };
+        let (frac, px) = pos(positions.next());
+        stops.push(Stop { color, frac, px });
+        // A second position repeats the colour (hard stops).
+        let (f2, p2) = pos(positions.next());
+        if f2.is_some() || p2.is_some() {
+            stops.push(Stop { color, frac: f2, px: p2 });
+        }
+    }
+    if stops.is_empty() {
+        return None;
+    }
+    Some(store_image(format!("g{lower}"), BgImage::Gradient(Rc::new(Gradient { radial, repeating, angle, stops }))))
+}
+
+fn bg_pos_kw(t: &str) -> Option<(Value, Option<bool>)> {
+    // (value, Some(true) if it can only be horizontal, Some(false) if only vertical)
+    Some(match t {
+        "left" => (Value::Pct(0.0), Some(true)),
+        "right" => (Value::Pct(100.0), Some(true)),
+        "top" => (Value::Pct(0.0), Some(false)),
+        "bottom" => (Value::Pct(100.0), Some(false)),
+        "center" => (Value::Pct(50.0), None),
+        _ => (length(t)?, None),
+    })
+}
+
+fn bg_position(toks: &[&str], important: bool, out: &mut Vec<Decl>) {
+    // Four-value syntax: `right 10px bottom 20px`.
+    if toks.len() >= 3 {
+        let (mut x, mut y) = (Value::Pct(50.0), Value::Pct(50.0));
+        let mut i = 0;
+        while i < toks.len() {
+            let kw = toks[i];
+            let off = toks.get(i + 1).and_then(|t| length(t)).filter(|_| !matches!(toks.get(i + 1), Some(&("left" | "right" | "top" | "bottom" | "center"))));
+            let px = match off {
+                Some(Value::Px(p)) => p,
+                Some(Value::Em(e)) | Some(Value::Rem(e)) => e * 16.0,
+                _ => 0.0,
+            };
+            let pct_off = if let Some(Value::Pct(p)) = off { p } else { 0.0 };
+            let v = |from_end: bool| {
+                if from_end { Value::Calc([100.0 - pct_off, -px, 0.0, 0.0, 0.0, 0.0]) } else { Value::Calc([pct_off, px, 0.0, 0.0, 0.0, 0.0]) }
+            };
+            match kw {
+                "left" => x = v(false),
+                "right" => x = v(true),
+                "top" => y = v(false),
+                "bottom" => y = v(true),
+                _ => {}
+            }
+            i += if off.is_some() { 2 } else { 1 };
+        }
+        out.push(Decl { prop: BgPosX, value: x, important });
+        out.push(Decl { prop: BgPosY, value: y, important });
+        return;
+    }
+    let vals: Vec<(Value, Option<bool>)> = toks.iter().filter_map(|t| bg_pos_kw(t)).take(2).collect();
+    let (x, y) = match vals.as_slice() {
+        [(v, Some(false))] => (Value::Pct(50.0), *v),
+        [(v, _)] => (*v, Value::Pct(50.0)),
+        [(a, sa), (b, sb)] => {
+            if *sa == Some(false) || *sb == Some(true) {
+                (*b, *a)
+            } else {
+                (*a, *b)
+            }
+        }
+        _ => return,
+    };
+    out.push(Decl { prop: BgPosX, value: x, important });
+    out.push(Decl { prop: BgPosY, value: y, important });
+}
+
+fn bg_size(v: &str, important: bool, out: &mut Vec<Decl>) {
+    let toks = tokens_ws(v);
+    let (x, y) = match toks.as_slice() {
+        ["cover"] => (Value::Kw(Kw::Cover), Value::Auto),
+        ["contain"] => (Value::Kw(Kw::Contain), Value::Auto),
+        [a] => (length(a).unwrap_or(Value::Auto), Value::Auto),
+        [a, b, ..] => (length(a).unwrap_or(Value::Auto), length(b).unwrap_or(Value::Auto)),
+        _ => return,
+    };
+    out.push(Decl { prop: BgSizeX, value: x, important });
+    out.push(Decl { prop: BgSizeY, value: y, important });
+}
+
+fn bg_repeat(toks: &[&str]) -> Option<Value> {
+    let k = |t: &str| -> Option<bool> {
+        match t {
+            "repeat" | "space" | "round" => Some(true),
+            "no-repeat" => Some(false),
+            _ => None,
+        }
+    };
+    Some(Value::Kw(match toks {
+        ["repeat-x"] => Kw::RepeatX,
+        ["repeat-y"] => Kw::RepeatY,
+        [a] => {
+            if k(a)? { Kw::Repeat } else { Kw::NoRepeat }
+        }
+        [a, b, ..] => match (k(a)?, k(b)?) {
+            (true, true) => Kw::Repeat,
+            (false, false) => Kw::NoRepeat,
+            (true, false) => Kw::RepeatX,
+            (false, true) => Kw::RepeatY,
+        },
+        _ => return None,
+    }))
+}
+
+/// The `background` shorthand: first layer's image, last layer's colour.
+fn background(orig: &str, important: bool, out: &mut Vec<Decl>) {
+    let layers = split_top(orig, b',');
+    let mut color = Value::Color(0);
+    let mut image = Value::Kw(Kw::None);
+    let mut repeat = Value::Kw(Kw::Repeat);
+    let (mut pos, mut size): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    for (li, layer) in layers.iter().enumerate() {
+        // Space out a '/' between position and size.
+        let mut spaced = String::new();
+        let mut depth = 0;
+        for ch in layer.chars() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if ch == '/' && depth == 0 {
+                spaced.push_str(" / ");
+            } else {
+                spaced.push(ch);
+            }
+        }
+        let mut after_slash = false;
+        let mut reps = Vec::new();
+        for t in tokens_ws(&spaced) {
+            let lt = t.to_ascii_lowercase();
+            if li == 0 {
+                if lt == "/" {
+                    after_slash = true;
+                    continue;
+                }
+                if let Some(img) = image_value(t) {
+                    image = img;
+                    continue;
+                }
+                if matches!(lt.as_str(), "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round") {
+                    reps.push(lt);
+                    continue;
+                }
+                if after_slash && (length(&lt).is_some() || lt == "auto" || lt == "cover" || lt == "contain") {
+                    size.push(lt);
+                    continue;
+                }
+                if bg_pos_kw(&lt).is_some() {
+                    pos.push(lt);
+                    continue;
+                }
+            }
+            if li == layers.len() - 1 {
+                if let Some(c) = color_value(&lt) {
+                    color = c;
+                }
+            }
+        }
+        if li == 0 && !reps.is_empty() {
+            let r: Vec<&str> = reps.iter().map(|s| s.as_str()).collect();
+            repeat = bg_repeat(&r).unwrap_or(repeat);
+        }
+    }
+    out.push(Decl { prop: Background, value: color, important });
+    out.push(Decl { prop: BackgroundImage, value: image, important });
+    out.push(Decl { prop: BgRepeat, value: repeat, important });
+    let p: Vec<&str> = pos.iter().map(|s| s.as_str()).collect();
+    if p.is_empty() {
+        out.push(Decl { prop: BgPosX, value: Value::Pct(0.0), important });
+        out.push(Decl { prop: BgPosY, value: Value::Pct(0.0), important });
+    } else {
+        bg_position(&p, important, out);
+    }
+    if size.is_empty() {
+        out.push(Decl { prop: BgSizeX, value: Value::Auto, important });
+        out.push(Decl { prop: BgSizeY, value: Value::Auto, important });
+    } else {
+        bg_size(&size.join(" "), important, out);
+    }
 }
 
 fn parse_rules(s: &str, sheet: &mut Stylesheet, media: &Media) {
@@ -2213,6 +2658,7 @@ mod tests {
              @media (max-width: 500px) { p { color: blue } }
              @media (min-width: 500px) { p { color: green } }",
             &m,
+            "",
         );
         assert_eq!(s.rules.len(), 3);
         assert_eq!(s.decls.len(), 5 + 1);

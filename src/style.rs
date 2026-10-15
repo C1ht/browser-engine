@@ -282,6 +282,9 @@ pub struct Style {
     pub gcol: [GLine; 2],
     /// grid-row start / end
     pub grow_: [GLine; 2],
+    pub grid_areas: Option<Rc<css::Areas>>,
+    /// grid-area: <name> (interned atom id)
+    pub garea: Option<u32>,
     pub color: u32,
     pub bg: u32,
     pub font_size: f32,
@@ -314,6 +317,15 @@ pub struct Style {
     pub bc: [u32; 4],
     pub bs: [bool; 4],
     pub vars: Option<Rc<Vars>>,
+    pub bg_image: Option<u32>,
+    /// background-size: lengths, or Ex-free markers for cover/contain via `bg_fit`.
+    pub bg_size: [Len; 2],
+    /// 0 = explicit/auto, 1 = cover, 2 = contain
+    pub bg_fit: u8,
+    pub bg_pos: [Len; 2],
+    pub bg_repeat: (bool, bool),
+    /// object-fit: 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down
+    pub object_fit: u8,
 }
 
 pub const INITIAL: Style = Style {
@@ -347,6 +359,8 @@ pub const INITIAL: Style = Style {
     grid_auto_rows: None,
     gcol: [GLine::Auto; 2],
     grow_: [GLine::Auto; 2],
+    grid_areas: None,
+    garea: None,
     color: 0xFF00_0000,
     bg: 0,
     font_size: 16.0,
@@ -378,6 +392,12 @@ pub const INITIAL: Style = Style {
     bc: [CURRENT_COLOR; 4],
     bs: [false; 4],
     vars: None,
+    bg_image: None,
+    bg_size: [Len::Auto; 2],
+    bg_fit: 0,
+    bg_pos: [Len::Pct(0.0); 2],
+    bg_repeat: (true, true),
+    object_fit: 0,
 };
 
 impl Style {
@@ -459,6 +479,17 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         GridColumnEnd => d.gcol[1] = s.gcol[1],
         GridRowStart => d.grow_[0] = s.grow_[0],
         GridRowEnd => d.grow_[1] = s.grow_[1],
+        GridTemplateAreas => d.grid_areas = s.grid_areas.clone(),
+        GridArea => d.garea = s.garea,
+        BackgroundImage => d.bg_image = s.bg_image,
+        BgSizeX | BgSizeY => {
+            d.bg_size = s.bg_size;
+            d.bg_fit = s.bg_fit
+        }
+        BgPosX => d.bg_pos[0] = s.bg_pos[0],
+        BgPosY => d.bg_pos[1] = s.bg_pos[1],
+        BgRepeat => d.bg_repeat = s.bg_repeat,
+        ObjectFit => d.object_fit = s.object_fit,
         Color => d.color = s.color,
         Background => d.bg = s.bg,
         FontSize => d.font_size = s.font_size,
@@ -762,6 +793,61 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                 _ => s.grid_auto_rows = t,
             }
         }
+        GridTemplateAreas => {
+            s.grid_areas = match v {
+                Value::Areas(i) => Some(css::areas(i)),
+                _ => None,
+            }
+        }
+        GridArea => {
+            s.garea = match v {
+                Value::Name(n) => Some(n),
+                _ => None,
+            }
+        }
+        BackgroundImage => {
+            s.bg_image = match v {
+                Value::Image(i) => Some(i),
+                _ => None,
+            }
+        }
+        BgSizeX | BgSizeY => {
+            let i = (d.prop == BgSizeY) as usize;
+            match v {
+                Value::Kw(Kw::Cover) => s.bg_fit = 1,
+                Value::Kw(Kw::Contain) => s.bg_fit = 2,
+                _ => {
+                    if let Some(l) = c.len(v, fs) {
+                        s.bg_size[i] = l;
+                        if i == 0 {
+                            s.bg_fit = 0;
+                        }
+                    }
+                }
+            }
+        }
+        BgPosX | BgPosY => {
+            if let Some(l) = c.len(v, fs) {
+                s.bg_pos[(d.prop == BgPosY) as usize] = l
+            }
+        }
+        BgRepeat => {
+            s.bg_repeat = match kw {
+                Some(Kw::NoRepeat) => (false, false),
+                Some(Kw::RepeatX) => (true, false),
+                Some(Kw::RepeatY) => (false, true),
+                _ => (true, true),
+            }
+        }
+        ObjectFit => {
+            s.object_fit = match kw {
+                Some(Kw::Contain) => 1,
+                Some(Kw::Cover) => 2,
+                Some(Kw::None) => 3,
+                Some(Kw::ScaleDown) => 4,
+                _ => 0,
+            }
+        }
         GridColumnStart | GridColumnEnd | GridRowStart | GridRowEnd => {
             let l = match v {
                 Value::Num(n) => GLine::Line(n as i16),
@@ -918,8 +1004,17 @@ enum Pass {
 
 /// Apply one declaration for the given pass, resolving custom properties
 /// and var() references.
+/// Parsed results of var()-substituted declarations, keyed by (declaration,
+/// custom-property map). Elements mostly share their parent's map, so most
+/// lookups hit and the string substitution + parse happens once.
+#[derive(Default)]
+struct VarCache {
+    map: FxHashMap<(u32, usize), Rc<[Decl]>>,
+    scratch: Vec<Decl>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn apply_decl(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, pass: Pass, raws: &[css::Raw], scratch: &mut Vec<Decl>) {
+fn apply_decl(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, pass: Pass, raws: &[css::Raw], inline: bool, cache: &mut VarCache) {
     match (d.prop, d.value) {
         (Prop::Custom, Value::Raw(i)) => {
             if pass == Pass::Custom {
@@ -932,15 +1027,27 @@ fn apply_decl(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, pass: Pass, raws: &[
             if pass == Pass::Custom {
                 return;
             }
+            let key = (i, s.vars.as_ref().map_or(0, |v| Rc::as_ptr(v) as usize));
+            if !inline {
+                if let Some(ds) = cache.map.get(&key).cloned() {
+                    for d in ds.iter() {
+                        apply(s, ps, d, c, pass == Pass::Font);
+                    }
+                    return;
+                }
+            }
             let (name, val) = &raws[i as usize];
             let vars = s.vars.clone();
             let lookup = |n: &str| vars.as_ref().and_then(|m| m.get(n)).map(|v| v.to_string());
+            cache.scratch.clear();
             if let Some(text) = css::substitute_vars(val, &lookup, 0) {
-                scratch.clear();
-                css::parse_property(name, &text, d.important, scratch);
-                for d in scratch.iter() {
-                    apply(s, ps, d, c, pass == Pass::Font);
-                }
+                css::parse_property(name, &text, d.important, &mut cache.scratch);
+            }
+            for d in cache.scratch.iter() {
+                apply(s, ps, d, c, pass == Pass::Font);
+            }
+            if !inline {
+                cache.map.insert(key, Rc::from(&cache.scratch[..]));
             }
         }
         _ => {
@@ -1020,6 +1127,10 @@ struct CRule {
     order: u32,
     /// Declares custom properties (needs the extra cascade pass).
     custom: bool,
+    /// Has !important declarations.
+    important: bool,
+    /// Can affect font-size (needed in the font pass).
+    font: bool,
 }
 
 pub const LEVEL_UA: u8 = 0;
@@ -1061,8 +1172,11 @@ impl Cascade {
             };
             bucket.push(idx);
             let (start, end) = (r.start + off, r.end + off);
-            let custom = self.decls[start as usize..end as usize].iter().any(|d| d.prop == Prop::Custom);
-            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom });
+            let ds = &self.decls[start as usize..end as usize];
+            let custom = ds.iter().any(|d| d.prop == Prop::Custom);
+            let important = ds.iter().any(|d| d.important);
+            let font = ds.iter().any(|d| matches!(d.prop, Prop::FontSize | Prop::Unresolved));
+            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom, important, font });
         }
     }
 
@@ -1073,12 +1187,13 @@ impl Cascade {
 
 // ------------------------------------------------------------------ bloom
 
-type Bloom = [u64; 4];
+/// 512-bit filter: 256 bits saturate on deep trees with many classes.
+type Bloom = [u64; 8];
 
 #[inline]
 fn bloom_bits(a: Atom) -> (usize, usize) {
     let h = a.0.wrapping_mul(0x9E37_79B1);
-    ((h >> 24) as usize, ((h >> 16) & 0xff) as usize)
+    ((h >> 23) as usize, ((h >> 12) & 0x1ff) as usize)
 }
 
 #[inline]
@@ -1376,12 +1491,12 @@ fn css_family(v: &str) -> Value {
 pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
     let n = doc.nodes.len();
     let mut styles: Vec<Style> = vec![INITIAL; n];
-    let mut blooms: Vec<Bloom> = vec![[0; 4]; n];
+    let mut blooms: Vec<Bloom> = vec![[0; 8]; n];
     let mut matched: Vec<u32> = Vec::with_capacity(64);
     let mut hint_decls: Vec<Decl> = Vec::new();
     let mut inline_decls: Vec<Decl> = Vec::new();
     let mut inline_raws: Vec<css::Raw> = Vec::new();
-    let mut scratch: Vec<Decl> = Vec::new();
+    let mut scratch = VarCache::default();
     let mut ctx = Ctx { root_fs: 16.0, vw, vh };
 
     for id in 1..n {
@@ -1450,35 +1565,34 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
         let passes: &[Pass] = if has_custom { &[Pass::Custom, Pass::Font, Pass::Rest] } else { &[Pass::Font, Pass::Rest] };
         let raws = &cas.raws[..];
         for &pass in passes {
-            let decls = |ri: &u32| {
-                let r = &cas.rules[*ri as usize];
-                (r.level, &cas.decls[r.start as usize..r.end as usize])
-            };
+            let font_pass = pass == Pass::Font;
+            let rules = || matched.iter().map(|&ri| &cas.rules[ri as usize]).filter(|r| !font_pass || r.font);
+            let decls = |r: &CRule| (r.level, &cas.decls[r.start as usize..r.end as usize]);
             // normal declarations: UA, hints, author, inline
-            for (_, ds) in matched.iter().map(decls).filter(|(l, _)| *l == LEVEL_UA) {
+            for (_, ds) in rules().map(decls).filter(|(l, _)| *l == LEVEL_UA) {
                 for d in ds.iter().filter(|d| !d.important) {
-                    apply_decl(s, ps, d, &ctx, pass, raws, &mut scratch);
+                    apply_decl(s, ps, d, &ctx, pass, raws, false, &mut scratch);
                 }
             }
             for d in &hint_decls {
-                apply_decl(s, ps, d, &ctx, pass, &[], &mut scratch);
+                apply_decl(s, ps, d, &ctx, pass, &[], true, &mut scratch);
             }
-            for (_, ds) in matched.iter().map(decls).filter(|(l, _)| *l != LEVEL_UA) {
+            for (_, ds) in rules().map(decls).filter(|(l, _)| *l != LEVEL_UA) {
                 for d in ds.iter().filter(|d| !d.important) {
-                    apply_decl(s, ps, d, &ctx, pass, raws, &mut scratch);
+                    apply_decl(s, ps, d, &ctx, pass, raws, false, &mut scratch);
                 }
             }
             for d in inline_decls.iter().filter(|d| !d.important) {
-                apply_decl(s, ps, d, &ctx, pass, &inline_raws, &mut scratch);
+                apply_decl(s, ps, d, &ctx, pass, &inline_raws, true, &mut scratch);
             }
             // !important
-            for (_, ds) in matched.iter().map(decls) {
+            for (_, ds) in rules().filter(|r| r.important).map(decls) {
                 for d in ds.iter().filter(|d| d.important) {
-                    apply_decl(s, ps, d, &ctx, pass, raws, &mut scratch);
+                    apply_decl(s, ps, d, &ctx, pass, raws, false, &mut scratch);
                 }
             }
             for d in inline_decls.iter().filter(|d| d.important) {
-                apply_decl(s, ps, d, &ctx, pass, &inline_raws, &mut scratch);
+                apply_decl(s, ps, d, &ctx, pass, &inline_raws, true, &mut scratch);
             }
         }
 
@@ -1504,14 +1618,15 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
 /// Extra UA rules for documents without a doctype (as in quirks.css).
 pub const QUIRKS_CSS: &str = "table { text-align: left; font-size: medium; font-weight: normal;     font-style: normal; line-height: normal; white-space: normal }";
 
-pub fn build_cascade(author_sheets: &[String], media: &Media, quirks: bool) -> Cascade {
+/// Author stylesheets as (css text, base url).
+pub fn build_cascade(author_sheets: &[(String, String)], media: &Media, quirks: bool) -> Cascade {
     let mut cas = Cascade::default();
-    cas.add_sheet(css::parse_stylesheet(UA_CSS, media), LEVEL_UA);
+    cas.add_sheet(css::parse_stylesheet(UA_CSS, media, ""), LEVEL_UA);
     if quirks {
-        cas.add_sheet(css::parse_stylesheet(QUIRKS_CSS, media), LEVEL_UA);
+        cas.add_sheet(css::parse_stylesheet(QUIRKS_CSS, media, ""), LEVEL_UA);
     }
-    for s in author_sheets {
-        cas.add_sheet(css::parse_stylesheet(s, media), LEVEL_AUTHOR);
+    for (s, base) in author_sheets {
+        cas.add_sheet(css::parse_stylesheet(s, media, base), LEVEL_AUTHOR);
     }
     cas
 }
@@ -1528,7 +1643,8 @@ mod tests {
             <div><p>a</p><p id=x class=big>b</p></div><p>c</p>"#,
         );
         let m = Media { vw: 800.0, vh: 600.0 };
-        let cas = build_cascade(&doc.styles, &m, doc.quirks);
+        let sheets: Vec<(String, String)> = doc.styles.iter().map(|s| (s.clone(), String::new())).collect();
+        let cas = build_cascade(&sheets, &m, doc.quirks);
         let st = compute(&doc, &cas, 800.0, 600.0);
         let elems = |n| doc.children(n).filter(|&c| doc.elem(c).is_some()).collect::<Vec<_>>();
         let body = elems(doc.body);
@@ -1550,7 +1666,8 @@ mod tests {
                .x { --fg: blue }</style><p>a</p><div class=x><p>b</p></div>"#,
         );
         let m = Media { vw: 800.0, vh: 600.0 };
-        let cas = build_cascade(&doc.styles, &m, doc.quirks);
+        let sheets: Vec<(String, String)> = doc.styles.iter().map(|s| (s.clone(), String::new())).collect();
+        let cas = build_cascade(&sheets, &m, doc.quirks);
         let st = compute(&doc, &cas, 800.0, 600.0);
         let ps: Vec<_> = (0..doc.nodes.len() as u32).filter(|&n| doc.tag(n) == Some(k::p)).collect();
         let (a, b) = (&st[ps[0] as usize], &st[ps[1] as usize]);

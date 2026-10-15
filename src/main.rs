@@ -14,6 +14,7 @@ mod engine;
 mod fonts;
 mod fx;
 mod html;
+mod image;
 mod layout;
 mod net;
 mod paint;
@@ -147,6 +148,12 @@ fn bench(a: &Args) {
     };
     let (w, h) = (a.width, if a.height == 0 { 768 } else { a.height });
     println!("bench {}  ({} bytes html, {} stylesheets, fetch {:.1}ms)", l.url, l.html.len(), l.sheets.len(), l.fetch_ms);
+    let (html, sheets, url) = (l.html.clone(), l.sheets.clone(), l.url.clone());
+    // Load images once so layout and paint include them.
+    let mut page = Page::new(l, w as f32, h as f32);
+    page.load_images_blocking(w as f32, h as f32);
+    let (res, base) = (page.res, page.base);
+    let _ = url;
     let mut glyphs = GlyphCache::default();
     let mut buf = vec![0u32; w * h];
     let mut runs: Vec<[f64; 7]> = Vec::new();
@@ -155,10 +162,10 @@ fn bench(a: &Args) {
     for i in 0..a.iters.max(1) + 1 {
         let total = Instant::now();
         let t0 = Instant::now();
-        let doc = html::parse(&l.html);
+        let doc = html::parse(&html);
         let parse = ms(t0);
         let mut t = engine::Timings::default();
-        let (_styles, tree, dl) = engine::render(&doc, &l.sheets, w as f32, h as f32, &mut t);
+        let (_styles, tree, dl) = engine::render(&doc, &sheets, &base, &res, w as f32, h as f32, &mut t);
         let t0 = Instant::now();
         paint::paint(&dl, &tree.text, &mut glyphs, &mut buf, w, h, 0.0);
         let paint = ms(t0);
@@ -190,7 +197,9 @@ fn screenshot(a: &Args, out: &str) {
         Err(e) => return eprintln!("load failed: {e}"),
     };
     let w = a.width;
-    let page = Page::new(l, w as f32, if a.height == 0 { 768.0 } else { a.height as f32 });
+    let vh = if a.height == 0 { 768.0 } else { a.height as f32 };
+    let mut page = Page::new(l, w as f32, vh);
+    page.load_images_blocking(w as f32, vh);
     let h = if a.height == 0 { (page.tree.height.ceil() as usize).clamp(1, 16000) } else { a.height };
     let mut buf = vec![0u32; w * h];
     let mut glyphs = GlyphCache::default();
@@ -229,6 +238,11 @@ struct Browser {
     hover: Option<String>,
     chars: Rc<RefCell<Vec<u32>>>,
     was_down: bool,
+    /// Decoded images arriving from the background loader, tagged with the
+    /// page generation they were requested for.
+    img_rx: std::sync::mpsc::Receiver<(u64, String, Option<std::sync::Arc<image::Image>>)>,
+    img_tx: std::sync::mpsc::Sender<(u64, String, Option<std::sync::Arc<image::Image>>)>,
+    generation: u64,
 }
 
 impl Browser {
@@ -243,6 +257,7 @@ impl Browser {
         window.set_target_fps(120);
         let chars = Rc::new(RefCell::new(Vec::new()));
         window.set_input_callback(Box::new(CharSink(chars.clone())));
+        let (img_tx, img_rx) = std::sync::mpsc::channel();
         let mut b = Browser {
             window,
             page: None,
@@ -260,6 +275,9 @@ impl Browser {
             hover: None,
             chars,
             was_down: false,
+            img_rx,
+            img_tx,
+            generation: 0,
         };
         b.navigate(url, true);
         b.event_loop();
@@ -297,6 +315,9 @@ impl Browser {
             Ok(l) => {
                 let page = Page::new(l, self.w as f32, self.vh() as f32);
                 self.url_input = page.url.clone();
+                self.generation += 1;
+                let mut page = page;
+                self.request_images(&mut page);
                 self.page = Some(page);
                 self.error = None;
             }
@@ -312,6 +333,57 @@ impl Browser {
             self.window.set_title(&format!("{title} — bolt"));
             eprintln!("[bolt] {}\n        fetch {:.1}ms | {}", p.url, p.t.fetch, p.t.summary());
         }
+    }
+
+    /// Fetch the page's images on a background thread.
+    fn request_images(&self, page: &mut Page) {
+        let urls = page.wanted_images();
+        if urls.is_empty() {
+            return;
+        }
+        for u in &urls {
+            page.res.images.insert(u.clone(), None); // pending
+        }
+        let (tx, generation) = (self.img_tx.clone(), self.generation);
+        std::thread::spawn(move || {
+            engine::fetch_images(&urls, &|u, img| {
+                let _ = tx.send((generation, u, img));
+            });
+        });
+    }
+
+    /// Apply images that finished loading; returns true if the page changed.
+    fn poll_images(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok((generation, u, img)) = self.img_rx.try_recv() {
+            if generation != self.generation {
+                continue;
+            }
+            if let Some(p) = &mut self.page {
+                p.res.images.insert(u, img);
+                changed = true;
+            }
+        }
+        if changed {
+            let (w, vh) = (self.w as f32, self.vh() as f32);
+            if let Some(p) = &mut self.page {
+                p.relayout(w, vh);
+                // Newly visible elements (e.g. via media queries) may want more images.
+                let urls = p.wanted_images();
+                if !urls.is_empty() {
+                    let (tx, generation) = (self.img_tx.clone(), self.generation);
+                    for u in &urls {
+                        p.res.images.insert(u.clone(), None);
+                    }
+                    std::thread::spawn(move || {
+                        engine::fetch_images(&urls, &|u, img| {
+                            let _ = tx.send((generation, u, img));
+                        });
+                    });
+                }
+            }
+        }
+        changed
     }
 
     fn find_anchor(&self, frag: &str) -> Option<f32> {
@@ -434,6 +506,9 @@ impl Browser {
     fn event_loop(&mut self) {
         while self.window.is_open() {
             let mut dirty = false;
+            if self.poll_images() {
+                dirty = true;
+            }
             let (w, h) = self.window.get_size();
             if (w, h) != (self.w, self.h) && w > 0 && h > BAR {
                 let width_changed = w != self.w;
