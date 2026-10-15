@@ -15,6 +15,7 @@ mod fonts;
 mod fx;
 mod html;
 mod image;
+mod js;
 mod layout;
 mod net;
 mod paint;
@@ -199,9 +200,16 @@ fn screenshot(a: &Args, out: &str) {
     };
     let w = a.width;
     let vh = if a.height == 0 { 768.0 } else { a.height as f32 };
+    let fetch_ms = l.fetch_ms;
+    let t_page = Instant::now();
     let mut page = Page::new(l, w as f32, vh);
+    let page_ms = ms(t_page);
+    let t_fonts = Instant::now();
     page.load_fonts_blocking(w as f32, vh);
+    let fonts_ms = ms(t_fonts);
+    let t_imgs = Instant::now();
     page.load_images_blocking(w as f32, vh);
+    eprintln!("[bolt] fetch {fetch_ms:.0}ms | page {page_ms:.0}ms (scripts {:.0}ms) | fonts {fonts_ms:.0}ms | images {:.0}ms", page.script_ms, ms(t_imgs));
     let h = if a.height == 0 { (page.tree.height.ceil() as usize).clamp(1, 16000) } else { a.height };
     let mut buf = vec![0u32; w * h];
     let mut glyphs = GlyphCache::default();
@@ -245,6 +253,7 @@ struct Browser {
     img_rx: std::sync::mpsc::Receiver<(u64, String, Option<std::sync::Arc<image::Image>>)>,
     img_tx: std::sync::mpsc::Sender<(u64, String, Option<std::sync::Arc<image::Image>>)>,
     generation: u64,
+    loaded_at: Instant,
 }
 
 impl Browser {
@@ -280,6 +289,7 @@ impl Browser {
             img_rx,
             img_tx,
             generation: 0,
+            loaded_at: Instant::now(),
         };
         b.navigate(url, true);
         b.event_loop();
@@ -318,6 +328,7 @@ impl Browser {
                 let page = Page::new(l, self.w as f32, self.vh() as f32);
                 self.url_input = page.url.clone();
                 self.generation += 1;
+                self.loaded_at = Instant::now();
                 let mut page = page;
                 self.request_images(&mut page);
                 self.page = Some(page);
@@ -333,7 +344,7 @@ impl Browser {
         if let Some(p) = &self.page {
             let title = if p.title().is_empty() { p.url.as_str() } else { p.title() };
             self.window.set_title(&format!("{title} — bolt"));
-            eprintln!("[bolt] {}\n        fetch {:.1}ms | {}", p.url, p.t.fetch, p.t.summary());
+            eprintln!("[bolt] {}\n        fetch {:.1}ms | scripts {:.1}ms | {}", p.url, p.t.fetch, p.script_ms, p.t.summary());
         }
     }
 
@@ -519,6 +530,11 @@ impl Browser {
             if self.poll_images() {
                 dirty = true;
             }
+            // JavaScript timers.
+            let now = self.loaded_at.elapsed().as_secs_f64() * 1000.0;
+            if self.page.as_mut().is_some_and(|p| p.tick(now)) {
+                dirty = true;
+            }
             let (w, h) = self.window.get_size();
             if (w, h) != (self.w, self.h) && w > 0 && h > BAR {
                 let width_changed = w != self.w;
@@ -651,11 +667,23 @@ impl Browser {
                         self.editing = true;
                         self.select_all = true;
                         dirty = true;
-                    } else if let Some(target) = hover {
-                        self.hover = None;
-                        self.navigate(&target, true);
-                        continue;
-                    } else if self.editing {
+                    } else {
+                        // Scripts see the click first; preventDefault() stops navigation.
+                        let py = my - BAR as f32 + self.scroll.round();
+                        let prevented = self.page.as_mut().is_some_and(|p| p.click(mx, py));
+                        if prevented {
+                            dirty = true;
+                        } else if let Some(target) = hover {
+                            self.hover = None;
+                            if !target.starts_with("javascript:") {
+                                self.navigate(&target, true);
+                                continue;
+                            }
+                        }
+                        // The page may have changed (handlers ran).
+                        dirty = true;
+                    }
+                    if self.editing && (my as usize) >= BAR {
                         self.editing = false;
                         dirty = true;
                     }

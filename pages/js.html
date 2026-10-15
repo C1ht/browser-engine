@@ -1,0 +1,133 @@
+<!doctype html>
+<html>
+<head>
+<title>JavaScript demo</title>
+<style>
+  body { font-family: Arial, sans-serif; margin: 0; background: #f4f5f8; color: #1d2433 }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 24px }
+  h1 { margin: 0 0 4px; font-size: 30px }
+  .sub { color: #6b7488; margin: 0 0 20px }
+  .card { background: white; border-radius: 10px; border: 1px solid #dde1ea; padding: 16px 20px; margin: 14px 0; box-shadow: 0 1px 3px rgba(0,0,0,.08) }
+  .card h2 { margin: 0 0 10px; font-size: 18px }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap }
+  button { background: #3b5bdb; color: white; border: none; border-radius: 6px; padding: 8px 14px; font-size: 14px }
+  button.secondary { background: #e9ecef; color: #1d2433 }
+  .count { font-size: 28px; font-weight: bold; min-width: 60px; text-align: center }
+  table { border-collapse: collapse; width: 100% }
+  td, th { border-bottom: 1px solid #eee; padding: 6px 8px; text-align: left }
+  th { color: #6b7488; font-weight: normal; font-size: 13px }
+  .done { text-decoration: line-through; color: #adb5bd }
+  .todo { padding: 6px 0; border-bottom: 1px solid #f1f3f5 }
+  .bar { height: 10px; background: #e9ecef; border-radius: 5px; overflow: hidden }
+  .fill { height: 10px; background: linear-gradient(to right, #51cf66, #20c997); width: 0 }
+  body.dark { background: #1d2433; color: #e9ecef }
+  body.dark .card { background: #2b3245; border-color: #3b4458 }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #e7f5ff; color: #1971c2; font-size: 12px; margin-right: 4px }
+  code { background: #f1f3f5; padding: 1px 4px; border-radius: 3px; font-size: 13px }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1 id="title">JavaScript</h1>
+  <p class="sub" id="sub">If you can read this, scripts did not run.</p>
+
+  <div class="card">
+    <h2>Counter</h2>
+    <div class="row">
+      <button id="dec" class="secondary">&minus;</button>
+      <span class="count" id="count">0</span>
+      <button id="inc">+</button>
+      <button class="secondary" onclick="document.getElementById('count').textContent = 0; window.counter = 0">reset (inline onclick)</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Rendered from data</h2>
+    <table id="langs"><tr><th>Language</th><th>Year</th><th>Typed</th></tr></table>
+  </div>
+
+  <div class="card">
+    <h2>To-do list</h2>
+    <div id="todos"></div>
+    <div class="row" style="margin-top: 10px"><button id="add">Add item</button><button id="theme" class="secondary">Toggle dark</button></div>
+  </div>
+
+  <div class="card">
+    <h2>Timer</h2>
+    <div class="bar"><div class="fill" id="fill"></div></div>
+    <p id="ticks">waiting for timers&hellip;</p>
+  </div>
+
+  <div class="card">
+    <h2>Engine checks</h2>
+    <div id="checks"></div>
+  </div>
+</div>
+<script>
+  'use strict';
+  const $ = (sel) => document.querySelector(sel);
+  window.counter = 0;
+  const render = () => { $('#count').textContent = window.counter; };
+  $('#inc').addEventListener('click', () => { window.counter++; render(); });
+  $('#dec').addEventListener('click', () => { window.counter--; render(); });
+
+  $('#sub').textContent = `Built by script at ${new Date().toISOString().slice(0, 10)} — ${navigator.userAgent.split(' ').pop()}`;
+
+  const langs = [
+    { name: 'Rust', year: 2015, typed: true },
+    { name: 'JavaScript', year: 1995, typed: false },
+    { name: 'TypeScript', year: 2012, typed: true },
+    { name: 'Python', year: 1991, typed: false },
+  ];
+  const table = $('#langs');
+  for (const { name, year, typed } of langs.sort((a, b) => a.year - b.year)) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td><b>${name}</b></td><td>${year}</td><td>${typed ? '✓' : '—'}</td>`;
+    table.appendChild(tr);
+  }
+
+  class TodoList {
+    #items = [];
+    constructor(el) { this.el = el; }
+    add(text) { this.#items.push({ text, done: false }); this.draw(); }
+    toggle(i) { this.#items[i].done = !this.#items[i].done; this.draw(); }
+    draw() {
+      this.el.innerHTML = '';
+      this.#items.forEach((item, i) => {
+        const div = document.createElement('div');
+        div.className = 'todo' + (item.done ? ' done' : '');
+        div.textContent = `${i + 1}. ${item.text}`;
+        div.addEventListener('click', () => this.toggle(i));
+        this.el.append(div);
+      });
+    }
+  }
+  const todos = new TodoList($('#todos'));
+  ['Write a JS engine', 'Wire up the DOM', 'Click an item to strike it'].forEach(t => todos.add(t));
+  todos.toggle(0);
+  let n = 3;
+  $('#add').onclick = () => todos.add(`Item ${++n}`);
+  $('#theme').addEventListener('click', () => document.body.classList.toggle('dark'));
+
+  let ticks = 0;
+  const timer = setInterval(() => {
+    ticks++;
+    $('#fill').style.width = Math.min(100, ticks * 10) + '%';
+    $('#ticks').textContent = `${ticks} tick${ticks === 1 ? '' : 's'} (setInterval)`;
+    if (ticks >= 10) { clearInterval(timer); $('#ticks').textContent += ' — done'; }
+  }, 200);
+
+  const checks = [
+    ['closures & classes', typeof TodoList === 'function'],
+    ['destructuring & spread', (([a, ...r]) => a + r.length)([1, 2, 3]) === 3],
+    ['regex', /^(\d{4})-(\d\d)$/.exec('2026-10')[2] === '10'],
+    ['JSON round trip', JSON.parse(JSON.stringify({ x: [1, { y: 'z' }] })).x[1].y === 'z'],
+    ['Map / Set', new Map([[1, 2]]).get(1) === 2 && new Set('aab').size === 2],
+    ['localStorage', (localStorage.setItem('k', 'v'), localStorage.getItem('k') === 'v')],
+    ['getBoundingClientRect', typeof $('#title').getBoundingClientRect().width === 'number'],
+  ];
+  $('#checks').innerHTML = checks.map(([name, ok]) => `<span class="tag">${ok ? '✓' : '✗'} ${name}</span>`).join('');
+  $('#title').textContent = 'JavaScript ✓';
+</script>
+</body>
+</html>

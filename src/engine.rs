@@ -9,7 +9,7 @@ use crate::image::{self, Image};
 use crate::layout::{self, LayoutTree};
 use crate::paint::{self, DisplayList};
 use crate::style::{self, Display, Style};
-use crate::{html, net};
+use crate::{html, js, net};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use std::time::Instant;
 
 pub const HOME: &str = include_str!("../pages/home.html");
 pub const FEATURES: &str = include_str!("../pages/features.html");
+pub const JS_DEMO: &str = include_str!("../pages/js.html");
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct Timings {
@@ -69,6 +70,8 @@ pub struct Loaded {
     /// (css, base url)
     pub sheets: Vec<(String, String)>,
     pub doc: Document,
+    /// External script sources by absolute URL.
+    pub scripts: FxHashMap<String, String>,
     pub fetch_ms: f64,
     pub parse_ms: f64,
 }
@@ -84,6 +87,7 @@ pub fn load(url: &str) -> Result<Loaded, String> {
         "about:home" | "about:" => (url.to_owned(), HOME.to_owned()),
         "about:blank" => (url.to_owned(), String::new()),
         "about:features" => (url.to_owned(), FEATURES.to_owned()),
+        "about:js" => (url.to_owned(), JS_DEMO.to_owned()),
         "about:stress" => (url.to_owned(), stress_page()),
         _ => {
             let (u, bytes) = net::fetch(url)?;
@@ -98,15 +102,108 @@ pub fn load(url: &str) -> Result<Loaded, String> {
     let t = Instant::now();
     let base = base_of(&doc, &url);
     let urls: Vec<String> = doc.stylesheet_links.iter().map(|h| net::resolve(&base, h)).collect();
-    let mut sheets: Vec<(String, String)> = std::thread::scope(|s| {
-        let handles: Vec<_> = urls
-            .iter()
-            .map(|u| s.spawn(move || (net::fetch(u).map(|(_, b)| net::decode(&b)).unwrap_or_default(), u.clone())))
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+    let script_urls: Vec<String> = doc
+        .scripts
+        .iter()
+        .filter(|&&s| is_js(&doc, s))
+        .filter_map(|&s| doc.attr(s, k::src))
+        .map(|h| net::resolve(&base, h.trim()))
+        .collect();
+    // Stylesheets and scripts download in parallel.
+    let fetch = |u: &String| (net::fetch(u).map(|(_, b)| net::decode(&b)).unwrap_or_default(), u.clone());
+    let (mut sheets, scripts): (Vec<(String, String)>, Vec<(String, String)>) = std::thread::scope(|s| {
+        let hs: Vec<_> = urls.iter().map(|u| s.spawn(move || fetch(u))).collect();
+        let hj: Vec<_> = script_urls.iter().map(|u| s.spawn(move || fetch(u))).collect();
+        (
+            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect(),
+            hj.into_iter().map(|h| h.join().unwrap_or_default()).collect(),
+        )
     });
     sheets.extend(doc.styles.iter().map(|s| (s.clone(), base.clone())));
-    Ok(Loaded { url, html, sheets, doc, fetch_ms: fetch_html + ms(t), parse_ms })
+    let scripts = scripts.into_iter().map(|(code, u)| (u, code)).collect();
+    Ok(Loaded { url, html, sheets, doc, scripts, fetch_ms: fetch_html + ms(t), parse_ms })
+}
+
+/// Is this <script> classic JavaScript we should run?
+fn is_js(doc: &Document, s: NodeId) -> bool {
+    match doc.attr(s, k::type_).map(|t| t.trim().to_ascii_lowercase()) {
+        None => true,
+        Some(t) => t.is_empty() || t.contains("javascript") || t.contains("ecmascript"),
+    }
+}
+
+/// Wall-clock budget for running a page's scripts at load.
+const SCRIPT_BUDGET: f64 = 3000.0;
+
+/// Run a page's scripts (in document order), load events and zero-delay timers.
+fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, base: &str, vw: f32, vh: f32) -> (Document, Option<js::Interp>, f64) {
+    let has_handlers = doc.nodes.iter().any(|n| match &n.data {
+        Data::Element(e) => e.attrs.iter().any(|(a, _)| crate::atom::name(*a).starts_with("on")),
+        _ => false,
+    });
+    if doc.scripts.is_empty() && !has_handlers {
+        return (doc, None, 0.0);
+    }
+    let t0 = Instant::now();
+    let scripts = doc.scripts.clone();
+    let mut it = js::Interp::new(doc, url, vw, vh);
+    for s in scripts {
+        if !is_js(&it.doc, s) || ms(t0) > SCRIPT_BUDGET {
+            continue;
+        }
+        let code = match it.doc.attr(s, k::src) {
+            Some(src) => sources.get(&net::resolve(base, src.trim())).cloned().unwrap_or_default(),
+            None => {
+                let mut c = String::new();
+                it.doc.text_content(s, &mut c);
+                c
+            }
+        };
+        run_one(&mut it, &code);
+        run_pending(&mut it, &t0);
+    }
+    js::dombind::dispatch(&mut it, 0, "DOMContentLoaded", |_, _| {});
+    js::dombind::dispatch(&mut it, js::WINDOW, "load", |_, _| {});
+    it.run_microtasks();
+    // Timers that fire "immediately" so the first paint includes their work.
+    for _ in 0..5 {
+        if it.run_timers(1.0) == 0 || ms(t0) > SCRIPT_BUDGET {
+            break;
+        }
+        run_pending(&mut it, &t0);
+    }
+    let elapsed = ms(t0);
+    it.dirty = false;
+    let doc = std::mem::take(&mut it.doc);
+    (doc, Some(it), elapsed)
+}
+
+fn run_one(it: &mut js::Interp, code: &str) {
+    if code.trim().is_empty() {
+        return;
+    }
+    it.steps = 0;
+    if let Err(e) = it.run_script(code) {
+        it.log(&e);
+    }
+    it.run_microtasks();
+}
+
+/// Fetch and run scripts that were inserted by other scripts.
+fn run_pending(it: &mut js::Interp, t0: &Instant) {
+    for _ in 0..3 {
+        let urls = std::mem::take(&mut it.pending_scripts);
+        if urls.is_empty() || ms(*t0) > SCRIPT_BUDGET {
+            return;
+        }
+        let codes: Vec<String> = std::thread::scope(|s| {
+            let hs: Vec<_> = urls.iter().map(|u| s.spawn(move || net::fetch(u).map(|(_, b)| net::decode(&b)).unwrap_or_default())).collect();
+            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
+        });
+        for c in codes {
+            run_one(it, &c);
+        }
+    }
 }
 
 /// The URL an `<img>` shows (handles common lazy-loading attributes and srcset).
@@ -162,7 +259,14 @@ pub struct Page {
     pub tree: LayoutTree,
     pub dl: DisplayList,
     pub res: Resources,
+    pub js: Option<js::Interp>,
     pub t: Timings,
+    /// Time spent running scripts at load.
+    pub script_ms: f64,
+    /// Number of relayouts (used to tell whether a tick changed the page).
+    pub layouts: u64,
+    vw: f32,
+    vh: f32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -190,26 +294,88 @@ impl Page {
     pub fn new(l: Loaded, vw: f32, vh: f32) -> Page {
         let mut t = Timings { fetch: l.fetch_ms, parse: l.parse_ms, ..Default::default() };
         let base = base_of(&l.doc, &l.url);
+        let (doc, js, script_ms) = run_scripts(l.doc, &l.scripts, &l.url, &base, vw, vh);
         let mut res = Resources::default();
-        for (i, n) in l.doc.nodes.iter().enumerate() {
+        Self::collect_img_src(&doc, &base, &mut res);
+        let (styles, tree, dl) = render(&doc, &l.sheets, &base, &res, vw, vh, &mut t);
+        let mut page = Page { url: l.url, base, doc, sheets: l.sheets, styles, tree, dl, res, js, t, script_ms, layouts: 0, vw, vh };
+        page.sync_js_geometry();
+        page
+    }
+
+    fn collect_img_src(doc: &Document, base: &str, res: &mut Resources) {
+        res.img_src.clear();
+        for (i, n) in doc.nodes.iter().enumerate() {
             if let Data::Element(e) = &n.data {
                 if e.tag == k::img {
-                    if let Some(u) = img_url(&l.doc, i as NodeId, &base) {
+                    if let Some(u) = img_url(doc, i as NodeId, base) {
                         res.img_src.insert(i as NodeId, u);
                     }
                 }
             }
         }
-        let (styles, tree, dl) = render(&l.doc, &l.sheets, &base, &res, vw, vh, &mut t);
-        Page { url: l.url, base, doc: l.doc, sheets: l.sheets, styles, tree, dl, res, t }
+    }
+
+    /// Give scripts the latest element geometry.
+    fn sync_js_geometry(&mut self) {
+        if let Some(it) = &mut self.js {
+            it.rects = self.tree.node_rects();
+            it.vw = self.vw;
+            it.vh = self.vh;
+        }
+    }
+
+    /// Run `f` with the document moved into the script engine; relayout if
+    /// the DOM changed.
+    fn with_js<T>(&mut self, f: impl FnOnce(&mut js::Interp) -> T) -> Option<T> {
+        let it = self.js.as_mut()?;
+        it.doc = std::mem::take(&mut self.doc);
+        let r = f(it);
+        let t0 = Instant::now();
+        run_pending(it, &t0);
+        self.doc = std::mem::take(&mut it.doc);
+        if std::mem::take(&mut it.dirty) {
+            Self::collect_img_src(&self.doc, &self.base, &mut self.res);
+            self.relayout(self.vw, self.vh);
+        }
+        Some(r)
+    }
+
+    /// Dispatch a click on the element at a page point. Returns true if a
+    /// handler called preventDefault() (so links shouldn't navigate).
+    pub fn click(&mut self, x: f32, y: f32) -> bool {
+        let Some(node) = self.tree.node_at(x, y) else { return false };
+        self.with_js(|it| {
+            js::dombind::dispatch(it, node, "click", |it, e| {
+                let _ = it.put(e, "clientX", js::Value::Num(x as f64));
+                let _ = it.put(e, "clientY", js::Value::Num(y as f64));
+                let _ = it.put(e, "button", js::Value::Num(0.0));
+            })
+        })
+        .unwrap_or(false)
+    }
+
+    /// Run due timers (`now` = ms since load). Returns true if the page changed.
+    pub fn tick(&mut self, now: f64) -> bool {
+        let due = self.js.as_ref().and_then(|it| it.next_timer_at()).is_some_and(|t| t <= now);
+        if !due {
+            return false;
+        }
+        let before = self.layouts;
+        self.with_js(|it| it.run_timers(now));
+        self.layouts != before
     }
 
     /// Re-run style + layout for a new viewport size (media queries may change).
     pub fn relayout(&mut self, vw: f32, vh: f32) {
+        self.vw = vw;
+        self.vh = vh;
         let (styles, tree, dl) = render(&self.doc, &self.sheets, &self.base, &self.res, vw, vh, &mut self.t);
         self.styles = styles;
         self.tree = tree;
         self.dl = dl;
+        self.layouts += 1;
+        self.sync_js_geometry();
     }
 
     /// Images used by rendered elements that haven't been fetched yet.
@@ -307,6 +473,56 @@ mod tests {
         let hit = p.dl.link_at(area.x + area.w / 2.0, area.y + area.h / 2.0, 0.0);
         assert_eq!(hit.and_then(|l| p.link_href(l)).as_deref(), Some("about:stress"));
         assert!(p.tree.height > 500.0);
+    }
+
+    fn text_of(p: &Page, id: &str) -> String {
+        let a = crate::atom::lookup(id).unwrap();
+        let n = (0..p.doc.nodes.len() as u32).find(|&n| p.doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap();
+        let mut s = String::new();
+        p.doc.text_content(n, &mut s);
+        s
+    }
+
+    fn center_of(p: &Page, id: &str) -> (f32, f32) {
+        let a = crate::atom::lookup(id).unwrap();
+        let n = (0..p.doc.nodes.len() as u32).find(|&n| p.doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap();
+        let r = p.tree.node_rects()[&n];
+        (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
+    }
+
+    #[test]
+    fn javascript_page_and_clicks() {
+        let mut p = Page::new(load("about:js").unwrap(), 900.0, 800.0);
+        assert_eq!(text_of(&p, "title"), "JavaScript ✓");
+        assert_eq!(text_of(&p, "count"), "0");
+        let (x, y) = center_of(&p, "inc");
+        p.click(x, y);
+        p.click(x, y);
+        assert_eq!(text_of(&p, "count"), "2");
+        let (x, y) = center_of(&p, "dec");
+        p.click(x, y);
+        assert_eq!(text_of(&p, "count"), "1");
+        // inline onclick attribute handler
+        let reset = (0..p.doc.nodes.len() as u32).find(|&n| p.doc.attr(n, crate::atom::lookup("onclick").unwrap()).is_some()).unwrap();
+        let r = p.tree.node_rects()[&reset];
+        p.click(r[0] + 5.0, r[1] + 5.0);
+        assert_eq!(text_of(&p, "count"), "0");
+        // clicking a to-do toggles it; the page relays out
+        let before = p.layouts;
+        let todos = text_of(&p, "todos");
+        assert!(todos.contains("Wire up the DOM"), "{todos}");
+        let (x, y) = center_of(&p, "add");
+        p.click(x, y);
+        assert!(text_of(&p, "todos").contains("Item 4"));
+        assert!(p.layouts > before);
+        // timers advance the progress text
+        assert!(p.tick(250.0));
+        assert!(text_of(&p, "ticks").contains("1 tick"));
+        // Intervals don't catch up after a stall; step through time like frames do.
+        for i in 1..20 {
+            p.tick(250.0 + 200.0 * i as f64);
+        }
+        assert!(text_of(&p, "ticks").contains("done"), "{}", text_of(&p, "ticks"));
     }
 }
 

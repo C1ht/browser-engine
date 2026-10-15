@@ -5,8 +5,7 @@
 //!    only tests rules that could possibly match;
 //!  * a 256-bit bloom filter of ancestor atoms rejects most descendant
 //!    selectors without walking up the tree (as in Blink/Servo);
-//!  * the DOM arena guarantees parent index < child index, so styles are
-//!    computed in a single linear pass with no recursion or traversal stack.
+//!  * styles are computed in one tree-order pass with no recursion.
 
 use crate::atom::{k, Atom};
 use crate::css::{self, *};
@@ -1081,7 +1080,7 @@ header, hr, legend, listing, main, p, plaintext, pre, search, xmp, article, asid
 h1, h2, h3, h4, h5, h6, hgroup, nav, section, dir, dd, dl, dt, menu, ol, ul,
 fieldset, details, summary, optgroup { display: block }
 head, script, style, link, meta, title, template, area, base, param, datalist, noembed,
-noframes, rp, option, col, colgroup, [hidden], input[type=hidden], dialog:not([open]) { display: none }
+noframes, noscript, rp, option, col, colgroup, [hidden], input[type=hidden], dialog:not([open]) { display: none }
 li { display: list-item }
 table { display: table; border-spacing: 2px; box-sizing: border-box }
 caption { display: table-caption; text-align: center }
@@ -1323,6 +1322,11 @@ fn match_compound(c: &Compound, doc: &Document, id: NodeId) -> bool {
     true
 }
 
+/// Does `sel` match element `id`? (used by querySelector and friends)
+pub fn selector_matches(sel: &Selector, doc: &Document, id: NodeId) -> bool {
+    doc.elem(id).is_some() && match_from(sel, 0, doc, id)
+}
+
 fn match_from(sel: &Selector, idx: usize, doc: &Document, id: NodeId) -> bool {
     if !match_compound(&sel.comps[idx], doc, id) {
         return false;
@@ -1514,10 +1518,11 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
     let mut scratch = VarCache::default();
     let mut ctx = Ctx { root_fs: 16.0, vw, vh };
 
-    for id in 1..n {
+    // Tree order: parents before children (scripts may have moved nodes, so
+    // arena order isn't enough).
+    for id in doc.preorder().into_iter().skip(1).map(|n| n as usize) {
         let Data::Element(el) = &doc.nodes[id].data else { continue };
         let parent = doc.nodes[id].parent as usize;
-        debug_assert!(parent < id);
 
         // Bloom filter of this element's ancestors-or-self.
         let mut bloom = blooms[parent];
@@ -1569,10 +1574,9 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
             css::parse_declarations(st, &mut inline_decls, &mut inline_raws);
         }
 
-        let (before, after) = styles.split_at_mut(id);
-        let ps = &before[parent];
-        let s = &mut after[0];
-        *s = Style::inherit(ps);
+        let ps = &styles[parent];
+        let mut own = Style::inherit(ps);
+        let s = &mut own;
 
         // Custom properties get their own first pass, so var() can see them.
         let has_custom = matched.iter().any(|&ri| cas.rules[ri as usize].custom)
@@ -1626,6 +1630,7 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
         if id as NodeId == doc.html {
             ctx.root_fs = s.font_size;
         }
+        styles[id] = own;
     }
     styles
 }

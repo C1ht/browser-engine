@@ -249,7 +249,7 @@ impl Parser {
         match tag {
             k::html => return self.merge_attrs(self.doc.html, attrs),
             k::body => return self.merge_attrs(self.doc.body, attrs),
-            k::head | k::meta | k::script => return,
+            k::head | k::meta => return,
             k::title if !self.in_foreign() => {
                 if self.doc.title.is_empty() {
                     let t = decode_entities(raw.unwrap_or(""));
@@ -312,6 +312,9 @@ impl Parser {
         }
         if tag == k::select {
             self.selects.push(id);
+        }
+        if tag == k::script {
+            self.doc.scripts.push(id);
         }
         if let Some(t) = raw {
             let t = if tag == k::textarea { decode_entities(t) } else { t.to_owned() };

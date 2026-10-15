@@ -102,6 +102,83 @@ pub struct LBox {
     pub image: Option<Arc<Image>>,
 }
 
+impl LayoutTree {
+    /// Visit every box with its absolute border-box origin, in paint order.
+    /// `f(box, x, y)`; text fragments are reported as (node, rect) via `t`.
+    fn walk(&self, id: u32, ox: f32, oy: f32, f: &mut dyn FnMut(&LBox, f32, f32), t: &mut dyn FnMut(NodeId, [f32; 4])) {
+        let b = &self.boxes[id as usize];
+        let (bx, by) = (ox + b.x + b.rel.0, oy + b.y + b.rel.1);
+        f(b, bx, by);
+        let (px, py) = (bx + b.b[3], by + b.b[0]);
+        let (cx, cy) = (px + b.p[3], py + b.p[0] + b.cell_off);
+        for &c in &b.children {
+            if !self.boxes[c as usize].abs {
+                self.walk(c, cx, cy, f, t);
+            }
+        }
+        for &fl in &b.floats {
+            self.walk(fl, cx, cy, f, t);
+        }
+        for fr in &b.frags {
+            match fr.kind {
+                FragKind::Text { node, w, .. } => t(node, [cx + fr.x, cy + fr.y - 14.0, w, 18.0]),
+                FragKind::Atomic(a) => self.walk(a, cx, cy, f, t),
+            }
+        }
+        for &a in &b.abs_kids {
+            let (ax, ay) = if self.boxes[a as usize].fixed { (0.0, 0.0) } else { (px, py) };
+            self.walk(a, ax, ay, f, t);
+        }
+    }
+
+    /// Border boxes of elements (inline elements: union of their text).
+    pub fn node_rects(&self) -> crate::fx::FxHashMap<NodeId, [f32; 4]> {
+        let mut m: crate::fx::FxHashMap<NodeId, [f32; 4]> = crate::fx::FxHashMap::default();
+        let mut add = |n: NodeId, r: [f32; 4]| {
+            m.entry(n)
+                .and_modify(|e| {
+                    let (x0, y0) = (e[0].min(r[0]), e[1].min(r[1]));
+                    let (x1, y1) = ((e[0] + e[2]).max(r[0] + r[2]), (e[1] + e[3]).max(r[1] + r[3]));
+                    *e = [x0, y0, x1 - x0, y1 - y0];
+                })
+                .or_insert(r);
+        };
+        let mut boxes = Vec::new();
+        let mut texts = Vec::new();
+        self.walk(self.root, 0.0, 0.0, &mut |b, x, y| {
+            if !b.anon {
+                boxes.push((b.node, [x, y, b.border_w(), b.border_h()]));
+            }
+        }, &mut |n, r| texts.push((n, r)));
+        for (n, r) in boxes.into_iter().chain(texts) {
+            add(n, r);
+        }
+        m
+    }
+
+    /// The element at page point (x, y): the last-painted box or text under it.
+    pub fn node_at(&self, x: f32, y: f32) -> Option<NodeId> {
+        let mut hit = None;
+        let inside = |r: [f32; 4]| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3];
+        let mut last_box = None;
+        let mut last_text = None;
+        self.walk(self.root, 0.0, 0.0, &mut |b, bx, by| {
+            if !b.anon && inside([bx, by, b.border_w(), b.border_h()]) {
+                last_box = Some(b.node);
+            }
+        }, &mut |n, r| {
+            if inside(r) {
+                last_text = Some(n);
+            }
+        });
+        // Text is painted over its container's background.
+        if let Some(t) = last_text {
+            hit = Some(t);
+        }
+        hit.or(last_box)
+    }
+}
+
 impl LBox {
     #[inline]
     pub fn border_w(&self) -> f32 {
@@ -336,7 +413,8 @@ impl<'a> Engine<'a> {
 
     fn compute_contains_block(&mut self) {
         let doc = self.doc;
-        for id in (1..doc.nodes.len()).rev() {
+        // Reverse tree order visits descendants before their ancestors.
+        for id in doc.preorder().into_iter().rev().map(|n| n as usize) {
             if doc.elem(id as NodeId).is_none() {
                 continue;
             }
