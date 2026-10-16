@@ -1463,6 +1463,14 @@ impl<'a> Engine<'a> {
             // Sticky elements stay in flow.
             self.boxes[id as usize].rel = if st.position == Pos::Relative { (dx, dy) } else { (0.0, 0.0) };
         }
+        if !self.boxes[id as usize].anon {
+            let (bw, bh) = (self.boxes[id as usize].border_w(), self.boxes[id as usize].border_h());
+            if let Some((tx, ty)) = st.pure_translate(bw, bh) {
+                let r = &mut self.boxes[id as usize].rel;
+                r.0 += tx;
+                r.1 += ty;
+            }
+        }
         if !self.boxes[id as usize].abs_kids.is_empty() {
             self.layout_abs(id);
         }

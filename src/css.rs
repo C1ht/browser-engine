@@ -38,6 +38,8 @@ pub enum Value {
     Image(u32),
     /// `content`: index into the content table.
     Content(u32),
+    /// transform / translate / rotate / scale: index into the transform table.
+    Transform(u32),
     /// grid-template-areas: index into the areas table.
     Areas(u32),
     /// An identifier (interned), e.g. a grid area name.
@@ -222,6 +224,12 @@ pub enum Prop {
     GridArea,
     BackgroundImage,
     Content,
+    TransformP,
+    TranslateP,
+    RotateP,
+    ScaleP,
+    TransformOriginX,
+    TransformOriginY,
     BgSizeX,
     BgSizeY,
     BgPosX,
@@ -1147,6 +1155,31 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             push!(p, if unset && inherited(p) { Value::Inherit } else { $g })
         }};
     }
+    if global.is_none() {
+        match name {
+            "transform" => {
+                if let Some(t) = transform_value(&lower) {
+                    push!(TransformP, t);
+                }
+                return;
+            }
+            "translate" | "rotate" | "scale" => {
+                if let Some(t) = transform_prop(name, &lower) {
+                    push!(match name { "translate" => TranslateP, "rotate" => RotateP, _ => ScaleP }, t);
+                }
+                return;
+            }
+            "transform-origin" => {
+                let mut tmp = Vec::new();
+                bg_position(&tokens_ws(&lower), important, &mut tmp);
+                for d in tmp {
+                    out.push(Decl { prop: if d.prop == BgPosX { TransformOriginX } else { TransformOriginY }, ..d });
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
     if global.is_none() && name == "content" {
         if let Some(c) = content_value(value) {
             push!(Content, c);
@@ -1503,6 +1536,10 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "grid-auto-rows" => GridAutoRows,
         "background-image" => BackgroundImage,
         "content" => Content,
+        "transform" => TransformP,
+        "translate" => TranslateP,
+        "rotate" => RotateP,
+        "scale" => ScaleP,
         "background-repeat" => BgRepeat,
         "object-fit" => ObjectFit,
         _ => return None,
@@ -2444,6 +2481,138 @@ pub enum ContentItem {
 
 thread_local! {
     static CONTENTS: RefCell<Vec<Rc<[ContentItem]>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// One transform function (lengths unresolved; angles in degrees).
+#[derive(Clone, Copy, Debug)]
+pub enum TfOp {
+    Translate(Value, Value),
+    Scale(f32, f32),
+    Rotate(f32),
+    Skew(f32, f32),
+    Matrix([f32; 6]),
+}
+
+thread_local! {
+    static TRANSFORMS: RefCell<Vec<Rc<[TfOp]>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn transform_ops(i: u32) -> Rc<[TfOp]> {
+    TRANSFORMS.with(|t| t.borrow()[i as usize].clone())
+}
+
+fn store_transform(ops: Vec<TfOp>) -> Value {
+    TRANSFORMS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push(ops.into());
+        Value::Transform(t.len() as u32 - 1)
+    })
+}
+
+/// An angle in degrees.
+fn angle_deg(s: &str) -> Option<f32> {
+    let s = s.trim();
+    if let Some(v) = s.strip_suffix("deg") {
+        v.parse().ok()
+    } else if let Some(v) = s.strip_suffix("grad") {
+        v.parse::<f32>().ok().map(|g| g * 0.9)
+    } else if let Some(v) = s.strip_suffix("rad") {
+        v.parse::<f32>().ok().map(f32::to_degrees)
+    } else if let Some(v) = s.strip_suffix("turn") {
+        v.parse::<f32>().ok().map(|t| t * 360.0)
+    } else if s == "0" {
+        Some(0.0)
+    } else {
+        None
+    }
+}
+
+fn scale_num(s: &str) -> Option<f32> {
+    match s.trim().strip_suffix('%') {
+        Some(p) => p.parse::<f32>().ok().map(|v| v / 100.0),
+        None => s.trim().parse().ok(),
+    }
+}
+
+/// `transform` (a list of functions) or `none`.
+fn transform_value(v: &str) -> Option<Value> {
+    let v = v.trim();
+    if v == "none" {
+        return Some(Value::Kw(Kw::None));
+    }
+    let mut ops = Vec::new();
+    let mut rest = v;
+    while !rest.trim().is_empty() {
+        let r = rest.trim_start();
+        let open = r.find('(')?;
+        let close = open + r[open..].find(')')?;
+        let name = r[..open].trim();
+        let args: Vec<&str> = r[open + 1..close].split(|c: char| c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
+        rest = &r[close + 1..];
+        let len = |s: &str| length(s).or_else(|| (s == "0").then_some(Value::Px(0.0)));
+        let a = |i: usize| args.get(i).copied();
+        ops.push(match name {
+            "translate" | "translate3d" => TfOp::Translate(len(a(0)?)?, a(1).map_or(Some(Value::Px(0.0)), len)?),
+            "translatex" => TfOp::Translate(len(a(0)?)?, Value::Px(0.0)),
+            "translatey" => TfOp::Translate(Value::Px(0.0), len(a(0)?)?),
+            "translatez" | "perspective" | "rotatex" | "rotatey" => continue,
+            "scale" | "scale3d" => {
+                let x = scale_num(a(0)?)?;
+                TfOp::Scale(x, a(1).map_or(Some(x), scale_num)?)
+            }
+            "scalex" => TfOp::Scale(scale_num(a(0)?)?, 1.0),
+            "scaley" => TfOp::Scale(1.0, scale_num(a(0)?)?),
+            "scalez" => continue,
+            "rotate" | "rotatez" => TfOp::Rotate(angle_deg(a(0)?)?),
+            "rotate3d" => {
+                // Only rotations about the z axis are 2D.
+                if a(2).and_then(scale_num) == Some(0.0) || a(0).and_then(scale_num) != Some(0.0) || a(1).and_then(scale_num) != Some(0.0) {
+                    continue;
+                }
+                TfOp::Rotate(angle_deg(a(3)?)? * a(2).and_then(scale_num).unwrap_or(1.0).signum())
+            }
+            "skew" => TfOp::Skew(angle_deg(a(0)?)?, a(1).map_or(Some(0.0), angle_deg)?),
+            "skewx" => TfOp::Skew(angle_deg(a(0)?)?, 0.0),
+            "skewy" => TfOp::Skew(0.0, angle_deg(a(0)?)?),
+            "matrix" => {
+                let m: Vec<f32> = args.iter().filter_map(|s| s.parse().ok()).collect();
+                if m.len() != 6 {
+                    return None;
+                }
+                TfOp::Matrix([m[0], m[1], m[2], m[3], m[4], m[5]])
+            }
+            "matrix3d" => {
+                let m: Vec<f32> = args.iter().filter_map(|s| s.parse().ok()).collect();
+                if m.len() != 16 {
+                    return None;
+                }
+                TfOp::Matrix([m[0], m[1], m[4], m[5], m[12], m[13]])
+            }
+            _ => return None,
+        });
+    }
+    Some(store_transform(ops))
+}
+
+/// The individual `translate` / `rotate` / `scale` properties.
+fn transform_prop(name: &str, v: &str) -> Option<Value> {
+    let v = v.trim();
+    if v == "none" {
+        return Some(Value::Kw(Kw::None));
+    }
+    let toks: Vec<&str> = v.split_whitespace().collect();
+    let op = match name {
+        "translate" => {
+            let l = |s: &str| length(s).or_else(|| (s == "0").then_some(Value::Px(0.0)));
+            TfOp::Translate(l(toks.first()?)?, toks.get(1).map_or(Some(Value::Px(0.0)), |s| l(s))?)
+        }
+        "rotate" => TfOp::Rotate(angle_deg(toks.last()?)?),
+        _ => {
+            let x = scale_num(toks.first()?)?;
+            TfOp::Scale(x, toks.get(1).map_or(Some(x), |s| scale_num(s))?)
+        }
+    };
+    Some(store_transform(vec![op]))
 }
 
 pub fn content(i: u32) -> Rc<[ContentItem]> {

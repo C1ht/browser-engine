@@ -1389,6 +1389,31 @@ mod tests {
     }
 
     #[test]
+    fn transforms() {
+        let p = page_from(
+            r#"<!doctype html><style>body { margin: 0 }
+               #modal { position: fixed; left: 50%; top: 50%; width: 200px; height: 100px; transform: translate(-50%, -50%); background: rgb(0, 0, 255) }
+               #rot { position: absolute; left: 20px; top: 20px; width: 100px; height: 20px; background: rgb(255, 0, 0); transform: rotate(90deg) }
+               #sc { position: absolute; left: 600px; top: 20px; width: 40px; height: 40px; background: rgb(0, 255, 0); scale: 2 }</style>
+               <div id=modal></div><div id=rot></div><div id=sc></div>"#,
+        );
+        let r = p.tree.node_rects()[&node_by_id(&p, "modal")];
+        assert_eq!(r, [300.0, 250.0, 200.0, 100.0]);
+        assert_eq!(p.tree.node_at(400.0, 300.0), Some(node_by_id(&p, "modal")));
+        let (w, h) = (800, 600);
+        let mut buf = vec![0u32; w * h];
+        let mut glyphs = crate::fonts::GlyphCache::default();
+        paint::paint(&p.dl, &p.tree.text, &mut glyphs, &mut buf, w, h, 0.0);
+        let px = |x: usize, y: usize| buf[y * w + x] & 0xFFFFFF;
+        // Rotated 90° about its centre (70, 30): now spans x 60..80, y -20..80.
+        assert_eq!(px(70, 70), 0xFF0000);
+        assert_ne!(px(110, 30), 0xFF0000);
+        // Scaled 2x about its centre (620, 40): spans 580..660.
+        assert_eq!(px(585, 45), 0x00FF00);
+        assert_eq!(px(400, 300), 0x0000FF);
+    }
+
+    #[test]
     fn percentage_heights() {
         let p = page_from(
             r#"<!doctype html><style>html, body { height: 100%; margin: 0 } #half { height: 50% }

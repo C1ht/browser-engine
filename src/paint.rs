@@ -74,6 +74,64 @@ pub enum DItem {
     Gradient(Box<GradData>),
     Clip { x: f32, y: f32, w: f32, h: f32 },
     Unclip,
+    /// A transformed element: its items are rasterized offscreen, then
+    /// drawn through the matrix.
+    Layer(Box<LayerData>),
+}
+
+pub struct LayerData {
+    pub items: Vec<DItem>,
+    /// Untransformed bounds of the items (page coordinates).
+    pub bounds: [f32; 4],
+    /// Page-to-page affine matrix [a, b, c, d, e, f].
+    pub m: [f32; 6],
+    /// Bounds after transformation.
+    pub tbounds: [f32; 4],
+}
+
+/// a · b (apply b first).
+fn mat_mul(a: [f32; 6], b: [f32; 6]) -> [f32; 6] {
+    [
+        a[0] * b[0] + a[2] * b[1],
+        a[1] * b[0] + a[3] * b[1],
+        a[0] * b[2] + a[2] * b[3],
+        a[1] * b[2] + a[3] * b[3],
+        a[0] * b[4] + a[2] * b[5] + a[4],
+        a[1] * b[4] + a[3] * b[5] + a[5],
+    ]
+}
+
+/// The transform of a box with border box (x, y, w, h), about its origin.
+fn box_matrix(st: &Style, x: f32, y: f32, w: f32, h: f32) -> Option<[f32; 6]> {
+    let lists = [&st.x_translate, &st.x_rotate, &st.x_scale, &st.xform];
+    if lists.iter().all(|l| l.is_none()) {
+        return None;
+    }
+    let mut m = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    for op in lists.iter().filter_map(|l| l.as_ref()).flat_map(|l| l.iter()) {
+        let om = match *op {
+            Tf::Translate(tx, ty) => [1.0, 0.0, 0.0, 1.0, tx.px(w), ty.px(h)],
+            Tf::M(mm) => mm,
+        };
+        m = mat_mul(m, om);
+    }
+    let (ox, oy) = (x + st.tf_origin[0].px(w), y + st.tf_origin[1].px(h));
+    let m = mat_mul(mat_mul([1.0, 0.0, 0.0, 1.0, ox, oy], m), [1.0, 0.0, 0.0, 1.0, -ox, -oy]);
+    let identity = (m[0] - 1.0).abs() < 1e-6 && m[1].abs() < 1e-6 && m[2].abs() < 1e-6 && (m[3] - 1.0).abs() < 1e-6 && m[4].abs() < 1e-4 && m[5].abs() < 1e-4;
+    (!identity).then_some(m)
+}
+
+fn transform_rect(m: [f32; 6], r: [f32; 4]) -> [f32; 4] {
+    let pts = [(r[0], r[1]), (r[0] + r[2], r[1]), (r[0], r[1] + r[3]), (r[0] + r[2], r[1] + r[3])];
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (x, y) in pts {
+        let (tx, ty) = (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+        x0 = x0.min(tx);
+        y0 = y0.min(ty);
+        x1 = x1.max(tx);
+        y1 = y1.max(ty);
+    }
+    [x0, y0, x1 - x0, y1 - y0]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -324,7 +382,69 @@ impl Builder<'_> {
         }
     }
 
+    /// Bounding box of an item (page coordinates).
+    fn item_bbox(&self, it: &DItem) -> Option<[f32; 4]> {
+        Some(match it {
+            DItem::Rect { x, y, w, h, .. } => [*x, *y, *w, *h],
+            DItem::RRect(d) => d.0,
+            DItem::Ring(d) => d.o,
+            DItem::Image(d) => d.clip,
+            DItem::Gradient(d) => d.clip,
+            DItem::Shadow(d) => {
+                let e = d.blur * 1.5 + 1.0;
+                [d.s[0] - e, d.s[1] - e, d.s[2] + 2.0 * e, d.s[3] + 2.0 * e]
+            }
+            DItem::Text { x, y, start, end, src, face, size, .. } => {
+                let text = if *src == 0 { &self.tree.text[*start as usize..*end as usize] } else { &self.dl.extra[*start as usize..*end as usize] };
+                let w = self.f.measure(*face, *size, text);
+                [*x - 1.0, y - size * 1.2, w + 2.0, size * 1.6]
+            }
+            DItem::Layer(l) => l.tbounds,
+            DItem::Clip { .. } | DItem::Unclip => return None,
+        })
+    }
+
+    fn target(&mut self) -> &mut Vec<DItem> {
+        if self.in_fixed { &mut self.dl.fixed } else { &mut self.dl.items }
+    }
+
     fn paint_box(&mut self, id: u32, ox: f32, oy: f32) {
+        let b = &self.tree.boxes[id as usize];
+        let st = &self.styles[b.node as usize];
+        if b.anon || !st.has_transform() || st.pure_translate(b.border_w(), b.border_h()).is_some() {
+            // (Translations are applied by layout.)
+            return self.paint_box_inner(id, ox, oy);
+        }
+        let (bx, by) = (ox + b.x + b.rel.0, oy + b.y + b.rel.1);
+        let Some(m) = box_matrix(st, bx, by, b.border_w(), b.border_h()) else {
+            return self.paint_box_inner(id, ox, oy);
+        };
+        if m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3] == 1.0 {
+            // A translation: just move the content (links included).
+            return self.paint_box_inner(id, ox + m[4], oy + m[5]);
+        }
+        let saved = std::mem::take(self.target());
+        self.paint_box_inner(id, ox, oy);
+        let items = std::mem::replace(self.target(), saved);
+        let mut bb: Option<[f32; 4]> = None;
+        for it in &items {
+            if let Some(r) = self.item_bbox(it) {
+                bb = Some(match bb {
+                    None => r,
+                    Some(u) => {
+                        let (x0, y0) = (u[0].min(r[0]), u[1].min(r[1]));
+                        let (x1, y1) = ((u[0] + u[2]).max(r[0] + r[2]), (u[1] + u[3]).max(r[1] + r[3]));
+                        [x0, y0, x1 - x0, y1 - y0]
+                    }
+                });
+            }
+        }
+        let Some(bounds) = bb else { return };
+        let tbounds = transform_rect(m, bounds);
+        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds })));
+    }
+
+    fn paint_box_inner(&mut self, id: u32, ox: f32, oy: f32) {
         let tree = self.tree;
         let b = &tree.boxes[id as usize];
         let st = &self.styles[b.node as usize];
@@ -870,11 +990,18 @@ fn item_text<'a>(texts: [&'a str; 2], src: u8, start: u32, end: u32) -> &'a str 
 pub fn prepare_glyphs(items: &[&DItem], texts: [&str; 2], cache: &mut GlyphCache) {
     let f = fonts();
     for it in items {
-        if let DItem::Text { start, end, src, face, size, .. } = **it {
-            for c in item_text(texts, src, start, end).chars() {
-                let a = f.adv(face, c);
-                cache.ensure(f, a.face, c, size);
+        match **it {
+            DItem::Text { start, end, src, face, size, .. } => {
+                for c in item_text(texts, src, start, end).chars() {
+                    let a = f.adv(face, c);
+                    cache.ensure(f, a.face, c, size);
+                }
             }
+            DItem::Layer(ref l) => {
+                let inner: Vec<&DItem> = l.items.iter().collect();
+                prepare_glyphs(&inner, texts, cache);
+            }
+            _ => {}
         }
     }
 }
@@ -889,6 +1016,7 @@ fn extent(it: &DItem) -> Option<(f32, f32)> {
         DItem::Image(d) => (d.clip[1], d.clip[1] + d.clip[3]),
         DItem::Gradient(d) => (d.clip[1], d.clip[1] + d.clip[3]),
         DItem::Shadow(d) => (d.s[1] - d.blur * 1.5 - 1.0, d.s[1] + d.s[3] + d.blur * 1.5 + 1.0),
+        DItem::Layer(l) => (l.tbounds[1], l.tbounds[1] + l.tbounds[3]),
         DItem::Clip { .. } | DItem::Unclip => return None,
     })
 }
@@ -925,6 +1053,77 @@ fn draw(s: &mut Surface, it: &DItem, texts: [&str; 2], f: &Fonts, cache: &GlyphC
             if let Some(c) = clips.pop() {
                 s.clip = c;
             }
+        }
+        DItem::Layer(l) => draw_layer(s, l, texts, f, cache),
+    }
+}
+
+/// Rasterize a layer's items offscreen (over black and over white, which
+/// gives both colour and coverage), then draw them through the matrix with
+/// bilinear sampling.
+fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache: &GlyphCache) {
+    let m = l.m;
+    let det = m[0] * m[3] - m[1] * m[2];
+    if det.abs() < 1e-6 {
+        return;
+    }
+    let tb = l.tbounds;
+    let x0 = ((tb[0] - s.ox).floor() as i32).max(s.clip.0);
+    let x1 = ((tb[0] + tb[2] - s.ox).ceil() as i32).min(s.clip.2);
+    let y0 = ((tb[1] - s.oy).floor() as i32).max(s.clip.1);
+    let y1 = ((tb[1] + tb[3] - s.oy).ceil() as i32).min(s.clip.3);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let (lx, ly) = (l.bounds[0].floor(), l.bounds[1].floor());
+    let w = ((l.bounds[0] + l.bounds[2] - lx).ceil() as usize + 1).min(4096);
+    let h = ((l.bounds[1] + l.bounds[3] - ly).ceil() as usize + 1).min(4096);
+    let mut black = vec![0xFF00_0000u32; w * h];
+    let mut white = vec![0xFFFF_FFFFu32; w * h];
+    for buf in [&mut black, &mut white] {
+        let mut sub = Surface::new(buf, w, h, lx, ly);
+        let mut clips = Vec::new();
+        for it in &l.items {
+            draw(&mut sub, it, texts, f, cache, &mut clips);
+        }
+    }
+    // Inverse matrix: page -> layer.
+    let inv = [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
+    // Premultiplied colour (over black) and alpha (white - black) at a pixel.
+    let at = |x: i32, y: i32| -> [f32; 4] {
+        if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
+            return [0.0; 4];
+        }
+        let i = y as usize * w + x as usize;
+        let (b, wt) = (black[i], white[i]);
+        let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as f32;
+        let a = 255.0 - ((ch(wt, 16) - ch(b, 16)) + (ch(wt, 8) - ch(b, 8)) + (ch(wt, 0) - ch(b, 0))) / 3.0;
+        [ch(b, 16), ch(b, 8), ch(b, 0), a.clamp(0.0, 255.0)]
+    };
+    for py in y0..y1 {
+        let gy = py as f32 + 0.5 + s.oy;
+        let row = py as usize * s.w;
+        for px in x0..x1 {
+            let gx = px as f32 + 0.5 + s.ox;
+            let u = inv[0] * gx + inv[2] * gy + inv[4] - lx - 0.5;
+            let v = inv[1] * gx + inv[3] * gy + inv[5] - ly - 0.5;
+            if u < -1.0 || v < -1.0 || u >= w as f32 || v >= h as f32 {
+                continue;
+            }
+            let (iu, iv) = (u.floor() as i32, v.floor() as i32);
+            let (fu, fv) = (u - iu as f32, v - iv as f32);
+            let (p00, p10, p01, p11) = (at(iu, iv), at(iu + 1, iv), at(iu, iv + 1), at(iu + 1, iv + 1));
+            let mut c = [0.0f32; 4];
+            for k in 0..4 {
+                c[k] = (p00[k] * (1.0 - fu) + p10[k] * fu) * (1.0 - fv) + (p01[k] * (1.0 - fu) + p11[k] * fu) * fv;
+            }
+            if c[3] < 0.5 {
+                continue;
+            }
+            let d = s.buf[row + px as usize];
+            let ia = 1.0 - c[3] / 255.0;
+            let mix = |k: usize, sh: u32| ((c[k] + ((d >> sh) & 0xFF) as f32 * ia).round().clamp(0.0, 255.0) as u32) << sh;
+            s.buf[row + px as usize] = 0xFF00_0000 | mix(0, 16) | mix(1, 8) | mix(2, 0);
         }
     }
 }

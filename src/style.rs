@@ -335,6 +335,49 @@ pub struct Style {
     pub after: u32,
     /// For a pseudo-element style: the element it belongs to.
     pub owner: u32,
+    /// transform, translate, rotate, scale (each None if none).
+    pub xform: Option<Rc<[Tf]>>,
+    pub x_translate: Option<Rc<[Tf]>>,
+    pub x_rotate: Option<Rc<[Tf]>>,
+    pub x_scale: Option<Rc<[Tf]>>,
+    pub tf_origin: [Len; 2],
+}
+
+/// A resolved transform step: a translation (percentages of the border box)
+/// or a 2D matrix [a, b, c, d, e, f].
+#[derive(Clone, Copy, Debug)]
+pub enum Tf {
+    Translate(Len, Len),
+    M([f32; 6]),
+}
+
+impl Style {
+    pub fn has_transform(&self) -> bool {
+        self.xform.is_some() || self.x_translate.is_some() || self.x_rotate.is_some() || self.x_scale.is_some()
+    }
+
+    /// If the transform is only translations: the offset for a border box
+    /// of w × h (layout applies it, so hit-testing and rects follow).
+    pub fn pure_translate(&self, w: f32, h: f32) -> Option<(f32, f32)> {
+        if !self.has_transform() {
+            return None;
+        }
+        let (mut x, mut y) = (0.0, 0.0);
+        for op in [&self.x_translate, &self.x_rotate, &self.x_scale, &self.xform].iter().filter_map(|l| l.as_ref()).flat_map(|l| l.iter()) {
+            match *op {
+                Tf::Translate(tx, ty) => {
+                    x += tx.px(w);
+                    y += ty.px(h);
+                }
+                Tf::M(m) if m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3] == 1.0 => {
+                    x += m[4];
+                    y += m[5];
+                }
+                Tf::M(_) => return None,
+            }
+        }
+        Some((x, y))
+    }
 }
 
 pub const INITIAL: Style = Style {
@@ -412,6 +455,11 @@ pub const INITIAL: Style = Style {
     before: 0,
     after: 0,
     owner: u32::MAX,
+    xform: None,
+    x_translate: None,
+    x_rotate: None,
+    x_scale: None,
+    tf_origin: [Len::Pct(50.0), Len::Pct(50.0)],
 };
 
 impl Style {
@@ -498,6 +546,12 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         GridArea => d.garea = s.garea,
         BackgroundImage => d.bg_image = s.bg_image,
         Content => d.content = s.content.clone(),
+        TransformP => d.xform = s.xform.clone(),
+        TranslateP => d.x_translate = s.x_translate.clone(),
+        RotateP => d.x_rotate = s.x_rotate.clone(),
+        ScaleP => d.x_scale = s.x_scale.clone(),
+        TransformOriginX => d.tf_origin[0] = s.tf_origin[0],
+        TransformOriginY => d.tf_origin[1] = s.tf_origin[1],
         BgSizeX | BgSizeY => {
             d.bg_size = s.bg_size;
             d.bg_fit = s.bg_fit
@@ -828,6 +882,38 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
             s.bg_image = match v {
                 Value::Image(i) => Some(i),
                 _ => None,
+            }
+        }
+        TransformP | TranslateP | RotateP | ScaleP => {
+            let ops = match v {
+                Value::Transform(i) => {
+                    let ops: Vec<Tf> = css::transform_ops(i)
+                        .iter()
+                        .filter_map(|op| match *op {
+                            css::TfOp::Translate(x, y) => Some(Tf::Translate(c.len(x, fs)?, c.len(y, fs)?)),
+                            css::TfOp::Scale(a, b) => Some(Tf::M([a, 0.0, 0.0, b, 0.0, 0.0])),
+                            css::TfOp::Rotate(deg) => {
+                                let r = deg.to_radians();
+                                Some(Tf::M([r.cos(), r.sin(), -r.sin(), r.cos(), 0.0, 0.0]))
+                            }
+                            css::TfOp::Skew(ax, ay) => Some(Tf::M([1.0, ay.to_radians().tan(), ax.to_radians().tan(), 1.0, 0.0, 0.0])),
+                            css::TfOp::Matrix(m) => Some(Tf::M(m)),
+                        })
+                        .collect();
+                    (!ops.is_empty()).then(|| Rc::from(ops))
+                }
+                _ => None,
+            };
+            match d.prop {
+                TransformP => s.xform = ops,
+                TranslateP => s.x_translate = ops,
+                RotateP => s.x_rotate = ops,
+                _ => s.x_scale = ops,
+            }
+        }
+        TransformOriginX | TransformOriginY => {
+            if let Some(l) = c.len(v, fs) {
+                s.tf_origin[(d.prop == TransformOriginY) as usize] = l;
             }
         }
         Content => {
