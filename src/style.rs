@@ -2099,6 +2099,189 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
     styles
 }
 
+fn css_color(c: u32) -> String {
+    let (a, r, g, b) = (c >> 24, (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+    if a == 255 {
+        format!("rgb({r}, {g}, {b})")
+    } else {
+        let a = (a as f32 / 255.0 * 1000.0).round() / 1000.0;
+        format!("rgba({r}, {g}, {b}, {a})")
+    }
+}
+
+fn css_px(v: f32) -> String {
+    let r = (v * 100.0).round() / 100.0;
+    if r.fract() == 0.0 { format!("{}px", r as i64) } else { format!("{r}px") }
+}
+
+fn css_len(l: Len, base: f32) -> String {
+    match l {
+        Len::Auto => "auto".into(),
+        l => css_px(l.px(base)),
+    }
+}
+
+/// `getComputedStyle` values (property name, serialized value) for a
+/// computed style; `rect` is the element's border box from layout.
+pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut put = |k: &str, v: String| out.push((k.to_owned(), v));
+    let display = match st.display {
+        Display::None => "none",
+        Display::Block => "block",
+        Display::Inline => "inline",
+        Display::InlineBlock => "inline-block",
+        Display::ListItem => "list-item",
+        Display::Table => "table",
+        Display::InlineTable => "inline-table",
+        Display::TableRow => "table-row",
+        Display::TableCell => "table-cell",
+        Display::TableRowGroup => "table-row-group",
+        Display::TableCaption => "table-caption",
+        Display::Contents => "contents",
+        Display::Flex => "flex",
+        Display::InlineFlex => "inline-flex",
+        Display::Grid => "grid",
+        Display::InlineGrid => "inline-grid",
+    };
+    put("display", if st.flow_root && st.display == Display::Block { "flow-root".into() } else { display.into() });
+    put(
+        "position",
+        match st.position {
+            Pos::Static => "static",
+            Pos::Relative => "relative",
+            Pos::Absolute => "absolute",
+            Pos::Fixed => "fixed",
+            Pos::Sticky => "sticky",
+        }
+        .into(),
+    );
+    put("color", css_color(st.color));
+    put("background-color", css_color(st.bg));
+    put("opacity", format!("{}", (st.opacity * 1000.0).round() / 1000.0));
+    put("visibility", if st.hidden { "hidden" } else { "visible" }.into());
+    put("z-index", st.z.map_or("auto".into(), |z| z.to_string()));
+    let ovf = |o: Ovf| match o {
+        Ovf::Visible => "visible",
+        Ovf::Hidden => "hidden",
+        Ovf::Scroll => "auto",
+    };
+    put("overflow-x", ovf(st.ovf_x).into());
+    put("overflow-y", ovf(st.ovf_y).into());
+    put("overflow", if st.ovf_x == st.ovf_y { ovf(st.ovf_x).into() } else { format!("{} {}", ovf(st.ovf_x), ovf(st.ovf_y)) });
+    let [_, _, bw, bh] = rect.unwrap_or([0.0; 4]);
+    let pad = st.padding.map(|p| p.px(bw));
+    let (cw, ch) = ((bw - pad[1] - pad[3] - st.bw[1] - st.bw[3]).max(0.0), (bh - pad[0] - pad[2] - st.bw[0] - st.bw[2]).max(0.0));
+    let (w, h) = if st.border_box { (bw, bh) } else { (cw, ch) };
+    put("width", if rect.is_some() && st.display != Display::Inline { css_px(if st.border_box { w } else { cw }) } else { "auto".into() });
+    put("height", if rect.is_some() && st.display != Display::Inline { css_px(if st.border_box { h } else { ch }) } else { "auto".into() });
+    put("min-width", css_len(st.min_w, bw));
+    put("max-width", if st.max_w == Len::Auto { "none".into() } else { css_len(st.max_w, bw) });
+    put("min-height", css_len(st.min_h, bh));
+    put("max-height", if st.max_h == Len::Auto { "none".into() } else { css_len(st.max_h, bh) });
+    for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
+        put(&format!("margin-{side}"), css_len(st.margin[i], bw));
+        put(&format!("padding-{side}"), css_px(pad[i]));
+        put(&format!("border-{side}-width"), css_px(st.bw[i]));
+        put(&format!("border-{side}-color"), css_color(st.bc[i]));
+        put(&format!("border-{side}-style"), if st.bs[i] { "solid" } else { "none" }.into());
+        put(side, css_len(st.inset[i], if i % 2 == 0 { bh } else { bw }));
+    }
+    put("margin", ["top", "right", "bottom", "left"].iter().enumerate().map(|(i, _)| css_len(st.margin[i], bw)).collect::<Vec<_>>().join(" "));
+    put("padding", pad.iter().map(|p| css_px(*p)).collect::<Vec<_>>().join(" "));
+    put("box-sizing", if st.border_box { "border-box" } else { "content-box" }.into());
+    put("font-size", css_px(st.font_size));
+    put("font-weight", if st.bold { "700" } else { "400" }.into());
+    put("font-style", if st.italic { "italic" } else { "normal" }.into());
+    put(
+        "font-family",
+        match &st.families {
+            Some(f) => f.join(", "),
+            None => match st.family {
+                Family::Sans => "sans-serif",
+                Family::Serif => "serif",
+                Family::Mono => "monospace",
+            }
+            .into(),
+        },
+    );
+    put(
+        "line-height",
+        match st.line_height {
+            LineHeight::Normal => "normal".into(),
+            LineHeight::Px(p) => css_px(p),
+            LineHeight::Mult(m) => css_px(m * st.font_size),
+        },
+    );
+    put(
+        "text-align",
+        match st.align {
+            Align::Left => "start",
+            Align::Right => "right",
+            Align::Center => "center",
+        }
+        .into(),
+    );
+    put(
+        "white-space",
+        match st.ws {
+            WhiteSpace::Normal => "normal",
+            WhiteSpace::Pre => "pre",
+            WhiteSpace::PreWrap => "pre-wrap",
+            WhiteSpace::PreLine => "pre-line",
+            WhiteSpace::NoWrap => "nowrap",
+        }
+        .into(),
+    );
+    put("text-decoration-line", match (st.underline, st.strike) {
+        (true, true) => "underline line-through",
+        (true, false) => "underline",
+        (false, true) => "line-through",
+        _ => "none",
+    }.into());
+    put(
+        "float",
+        match st.float {
+            Side::Left => "left",
+            Side::Right => "right",
+            _ => "none",
+        }
+        .into(),
+    );
+    put(
+        "flex-direction",
+        match st.flex_dir {
+            FlexDir::Row => "row",
+            FlexDir::RowRev => "row-reverse",
+            FlexDir::Col => "column",
+            FlexDir::ColRev => "column-reverse",
+        }
+        .into(),
+    );
+    put("flex-wrap", if st.wrap { "wrap" } else { "nowrap" }.into());
+    put("flex-grow", format!("{}", st.grow));
+    put("flex-shrink", format!("{}", st.shrink));
+    put("flex-basis", css_len(st.basis, bw));
+    put("transform", if st.has_transform() { "matrix(1, 0, 0, 1, 0, 0)".into() } else { "none".into() });
+    put("pointer-events", "auto".into());
+    put("cursor", "auto".into());
+    put(
+        "content",
+        match &st.content {
+            Some(items) => items
+                .iter()
+                .map(|i| match i {
+                    css::ContentItem::Str(s) => format!("\"{s}\""),
+                    _ => String::new(),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+            None => "none".into(),
+        },
+    );
+    out
+}
+
 /// Extra UA rules for documents without a doctype (as in quirks.css).
 pub const QUIRKS_CSS: &str = "table { text-align: left; font-size: medium; font-weight: normal;     font-style: normal; line-height: normal; white-space: normal }";
 

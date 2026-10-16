@@ -227,6 +227,12 @@ pub fn has(it: &mut Interp, o: &ObjRef, key: &str) -> bool {
 }
 
 pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
+    if matches!(
+        key,
+        "offsetWidth" | "offsetHeight" | "offsetLeft" | "offsetTop" | "clientWidth" | "clientHeight" | "scrollWidth" | "scrollHeight" | "clientTop" | "clientLeft"
+    ) {
+        it.ensure_layout();
+    }
     let kind = match o.borrow().kind {
         Kind::Node(id) => (0, id),
         Kind::Style(id) => (1, id),
@@ -931,6 +937,7 @@ fn n_insert_adjacent_html(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 }
 fn n_bounding_rect(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let n = this_node(&t)?;
+    it.ensure_layout();
     let [x, y, w, h] = rect(it, n);
     // Relative to the viewport.
     Ok(crate::js::observe::rect_obj(it, x, y - it.scroll_y, w, h))
@@ -1373,15 +1380,55 @@ fn cl_replace(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 // --------------------------------------------------------------- window
 
 fn w_get_computed_style(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
-    // Approximation: the element's inline style view plus a few computed values.
     let n = node_id(&arg(a, 0)).unwrap_or(0);
-    let o = it.new_obj(it.p.style.clone(), Kind::Style(n));
-    if let Some(cs) = it.computed.get(&n).cloned() {
-        for (k, v) in cs {
-            Interp::set_prop(&o, &k, Value::str(&v));
+    let pseudo = match arg(a, 1) {
+        Value::Str(s) => s.trim_start_matches(':').to_ascii_lowercase(),
+        _ => String::new(),
+    };
+    let o = it.plain();
+    let styles = it.computed_styles();
+    it.ensure_layout();
+    let rect = it.rects.get(&n).copied();
+    if let Some(styles) = styles {
+        let mut idx = n as usize;
+        if let Some(st) = styles.get(idx) {
+            match pseudo.as_str() {
+                "before" if st.before != 0 => idx = st.before as usize,
+                "after" if st.after != 0 => idx = st.after as usize,
+                _ => {}
+            }
+        }
+        if let Some(st) = styles.get(idx) {
+            for (k, v) in crate::style::computed_values(st, rect) {
+                Interp::set_prop(&o, &kebab_to_camel(&k), Value::str(&v));
+                Interp::set_hidden(&o, &format!("@@css:{k}"), Value::str(&v));
+            }
         }
     }
+    it.def_method(&o, "getPropertyValue", computed_get_property);
     Ok(Value::Obj(o))
+}
+
+fn kebab_to_camel(s: &str) -> String {
+    let mut out = String::new();
+    let mut up = false;
+    for c in s.chars() {
+        if c == '-' {
+            up = true;
+        } else if up {
+            out.extend(c.to_uppercase());
+            up = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn computed_get_property(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let name = it.to_str(&arg(a, 0))?.to_ascii_lowercase();
+    let v = it.get(&t, &format!("@@css:{name}"))?;
+    Ok(if matches!(v, Value::Undef) { Value::str("") } else { v })
 }
 fn w_match_media(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let q = it.to_str(&arg(a, 0))?;

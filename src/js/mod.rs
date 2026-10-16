@@ -252,6 +252,37 @@ pub struct GenStart {
     pub fobj: ObjRef,
 }
 
+pub struct LayoutSrc {
+    pub css: FxHashMap<String, String>,
+    pub base: String,
+}
+
+impl Interp {
+    /// Make `rects` / `scroll_metrics` reflect the current DOM (a forced,
+    /// synchronous layout when scripts changed it since the last one).
+    pub fn ensure_layout(&mut self) {
+        let want = (self.doc.version, self.vw.to_bits(), self.vh.to_bits());
+        if self.geom_version == want {
+            return;
+        }
+        let Some(src) = self.layout_src.clone() else { return };
+        let (rects, metrics, styles) = crate::engine::script_layout(&self.doc, &src, self.vw, self.vh);
+        self.rects = rects;
+        self.scroll_metrics = metrics;
+        self.styles = Some((self.doc.version, Rc::new(styles)));
+        self.geom_version = want;
+    }
+
+    /// Computed styles of the current DOM.
+    pub fn computed_styles(&mut self) -> Option<Rc<Vec<crate::style::Style>>> {
+        if !matches!(&self.styles, Some((v, _)) if *v == self.doc.version) {
+            self.geom_version = (u64::MAX, 0, 0);
+            self.ensure_layout();
+        }
+        self.styles.as_ref().map(|s| s.1.clone())
+    }
+}
+
 /// A same-document URL change (`history.pushState` / `replaceState`).
 pub struct UrlEvent {
     pub push: bool,
@@ -362,7 +393,6 @@ pub struct Interp {
     pub cookie: String,
     /// Element border boxes from the last layout (x, y, w, h).
     pub rects: FxHashMap<NodeId, [f32; 4]>,
-    pub computed: FxHashMap<NodeId, Vec<(String, String)>>,
     pub start: std::time::Instant,
     /// Label of the loop about to execute (for labeled break/continue).
     label: Option<Name>,
@@ -412,6 +442,13 @@ pub struct Interp {
     pub elem_scroll_dirty: bool,
     /// Per element: [scrollWidth, scrollHeight, clientWidth, clientHeight].
     pub scroll_metrics: FxHashMap<NodeId, [f32; 4]>,
+    /// What scripts need to lay the page out themselves (when they read
+    /// geometry of a changed DOM): cached stylesheets and the base URL.
+    pub layout_src: Option<Rc<LayoutSrc>>,
+    /// Document version / viewport the geometry above was computed for.
+    pub geom_version: (u64, u32, u32),
+    /// Computed styles from a script-triggered layout (for getComputedStyle).
+    pub styles: Option<(u64, Rc<Vec<crate::style::Style>>)>,
     /// Generators / async calls whose coroutines are running, innermost last.
     pub co_stack: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
@@ -459,7 +496,6 @@ impl Interp {
             pending_scripts: Vec::new(),
             cookie: String::new(),
             rects: FxHashMap::default(),
-            computed: FxHashMap::default(),
             start: std::time::Instant::now(),
             label: None,
             deadline: None,
@@ -488,6 +524,9 @@ impl Interp {
             elem_scroll: FxHashMap::default(),
             elem_scroll_dirty: false,
             scroll_metrics: FxHashMap::default(),
+            layout_src: None,
+            geom_version: (u64::MAX, 0, 0),
+            styles: None,
             co_stack: Vec::new(),
             nav: None,
             submit_form: None,

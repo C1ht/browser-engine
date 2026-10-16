@@ -138,6 +138,8 @@ pub struct Document {
     /// Changes since the last MutationObserver delivery, each with the
     /// target's ancestor path at that time (None: nobody observes).
     pub mutations: Option<Vec<(Mutation, Vec<NodeId>)>>,
+    /// Bumped by every DOM change (layout caches compare it).
+    pub version: u64,
     /// Changes since custom element reactions last ran (None: no custom
     /// elements are defined).
     pub ce_log: Option<Vec<Mutation>>,
@@ -178,6 +180,7 @@ impl Document {
             free_sheets: Vec::new(),
             adopted: Vec::new(),
             mutations: None,
+            version: 0,
             ce_log: None,
             shadows: FxHashMap::default(),
             shadow_hosts: FxHashMap::default(),
@@ -206,6 +209,7 @@ impl Document {
 
     #[inline]
     fn log(&mut self, m: Mutation) {
+        self.version += 1;
         if let Some(ce) = &mut self.ce_log {
             ce.push(match &m {
                 Mutation::ChildList { target, added, removed, prev, next } => Mutation::ChildList { target: *target, added: *added, removed: *removed, prev: *prev, next: *next },
@@ -256,6 +260,7 @@ impl Document {
 
     /// Append text, merging with a preceding text node.
     pub fn append_text(&mut self, parent: NodeId, s: &str) {
+        self.version += 1;
         let last = self.nodes[parent as usize].last_child;
         if last != NONE {
             if let Data::Text(t) = &mut self.nodes[last as usize].data {
@@ -408,6 +413,7 @@ impl Document {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: Atom, value: &str) {
+        self.version += 1;
         if (self.mutations.is_some() || self.ce_log.is_some()) && self.elem(id).is_some() {
             let old = self.attr(id, name).map(str::to_owned);
             self.log(Mutation::Attr { target: id, name, old });
@@ -433,6 +439,7 @@ impl Document {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: Atom) {
+        self.version += 1;
         if self.mutations.is_some() || self.ce_log.is_some() {
             if let Some(old) = self.attr(id, name).map(str::to_owned) {
                 self.log(Mutation::Attr { target: id, name, old: Some(old) });

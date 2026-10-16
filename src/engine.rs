@@ -300,6 +300,29 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
     Ok(Loaded { url, html, css, doc, scripts, fetch_ms: fetch_html + ms(t), parse_ms })
 }
 
+/// Style and layout for scripts that read geometry: from cached stylesheets
+/// only (no network, images unloaded). Returns element rects, scroll
+/// metrics and computed styles.
+#[allow(clippy::type_complexity)]
+pub fn script_layout(doc: &Document, src: &js::LayoutSrc, vw: f32, vh: f32) -> (FxHashMap<NodeId, [f32; 4]>, FxHashMap<NodeId, [f32; 4]>, Vec<Style>) {
+    let mut missing = Vec::new();
+    let sheets = collect_sheets(doc, &src.base, &src.css, &mut missing);
+    let cas = style::build_cascade(&sheets, &Media { vw, vh }, doc.quirks);
+    css::set_base(&src.base);
+    let styles = style::compute(doc, &cas, vw, vh);
+    let mut res = Resources::default();
+    let tree = layout::layout(doc, &styles, vw, vh, &mut res);
+    let mut metrics = FxHashMap::default();
+    for b in &tree.boxes {
+        if b.anon || metrics.contains_key(&b.node) {
+            continue;
+        }
+        let (cw, ch) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
+        metrics.insert(b.node, [cw.max(b.scroll_w + b.p[1] + b.p[3]), ch.max(b.scroll_h + b.p[0] + b.p[2]), cw, ch]);
+    }
+    (tree.node_rects(), metrics, styles)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum ScriptKind {
     Classic,
@@ -361,7 +384,7 @@ const SCRIPT_BUDGET: f64 = 3000.0;
 const NET_WAIT: f64 = 1500.0;
 
 /// Run a page's scripts (in document order), load events and zero-delay timers.
-fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, base: &str, vw: f32, vh: f32) -> (Document, Option<Box<js::Interp>>, f64) {
+fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashMap<String, String>, url: &str, base: &str, vw: f32, vh: f32) -> (Document, Option<Box<js::Interp>>, f64) {
     let has_handlers = doc.nodes.iter().any(|n| match &n.data {
         Data::Element(e) => e.attrs.iter().any(|(a, _)| crate::atom::name(*a).starts_with("on")),
         _ => false,
@@ -373,6 +396,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, ba
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
     it.deadline = Some(t0 + std::time::Duration::from_millis(SCRIPT_BUDGET as u64));
+    it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: css.clone(), base: base.to_owned() }));
     // Parser-blocking classic scripts run in order; `defer` and module
     // scripts after them (in order), then `async` ones.
     let (mut deferred, mut later) = (Vec::new(), Vec::new());
@@ -627,7 +651,7 @@ impl Page {
     pub fn new(l: Loaded, vw: f32, vh: f32) -> Page {
         let mut t = Timings { fetch: l.fetch_ms, parse: l.parse_ms, ..Default::default() };
         let base = base_of(&l.doc, &l.url);
-        let (doc, js, script_ms) = run_scripts(l.doc, &l.scripts, &l.url, &base, vw, vh);
+        let (doc, js, script_ms) = run_scripts(l.doc, &l.scripts, &l.css, &l.url, &base, vw, vh);
         let mut res = Resources::default();
         Self::collect_img_src(&doc, &base, &mut res);
         let mut css = l.css;
@@ -678,6 +702,10 @@ impl Page {
                 it.scroll_metrics.insert(b.node, [sw, sh, cw, ch]);
             }
             it.elem_scroll = self.elem_scroll.clone();
+            it.geom_version = (self.doc.version, self.vw.to_bits(), self.vh.to_bits());
+            if it.layout_src.as_ref().is_none_or(|s| s.css.len() != self.css.len()) {
+                it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: self.css.clone(), base: self.base.clone() }));
+            }
             self.geo_dirty = true;
         }
     }
@@ -1449,6 +1477,25 @@ mod tests {
         assert_eq!(p.title(), "host got it true");
         let text: String = p.tree.text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(text.contains("TitleinnerBody"), "{text}");
+    }
+
+    #[test]
+    fn script_geometry_and_computed_style() {
+        let p = page_from(
+            r#"<!doctype html><style>body { margin: 0 } #a { width: 120px; padding: 5px; color: rgb(1, 2, 3); display: flex }
+               .wide { width: 300px !important } #a::after { content: "x" }</style>
+               <div id=a>a</div>
+               <script>
+                 const a = document.getElementById('a');
+                 const before = a.offsetWidth;
+                 a.classList.add('wide');
+                 const after = a.getBoundingClientRect().width;
+                 const cs = getComputedStyle(a);
+                 const d = document.createElement('div'); d.style.height = '42px'; document.body.appendChild(d);
+                 document.title = [before, after, cs.display, cs.color, cs.getPropertyValue('padding-left'), cs.width, d.offsetHeight, getComputedStyle(a, '::after').content].join('|');
+               </script>"#,
+        );
+        assert_eq!(p.title(), r#"130|310|flex|rgb(1, 2, 3)|5px|300px|42|"x""#);
     }
 
     #[test]
