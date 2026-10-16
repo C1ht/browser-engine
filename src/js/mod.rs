@@ -4,7 +4,9 @@
 
 pub mod binary;
 pub mod builtins;
+pub mod coro;
 pub mod dombind;
+pub mod generator;
 pub mod lexer;
 pub mod parser;
 pub mod regex;
@@ -197,16 +199,37 @@ pub enum Kind {
     Pairs(web::PairKind, Vec<(Rc<str>, Rc<str>)>),
 }
 
-/// A generator. Its body runs to completion on the first `next()` (with a
-/// cap on yields, so infinite generators can still be partially consumed);
-/// the yielded values are then handed out one by one. `x = yield v`
-/// therefore always receives `undefined`.
+/// A generator (or the hidden state of an async function call).
+///
+/// Normally the body runs on a coroutine (`gen.rs`). Where coroutines are
+/// unsupported, the body runs to completion on the first `next()` (with a cap
+/// on yields) and the yielded values are handed out one by one.
+#[derive(Default)]
 pub struct Gen {
+    /// Coroutine-backed (the fields below `is_async` apply).
+    pub coro: bool,
+    pub is_async: bool,
+    pub co: Option<coro::Co>,
+    pub state: generator::GenState,
+    /// JS call depth inside the body while it is suspended.
+    pub depth: u32,
+    /// Value passed to `return()`, delivered when the body finishes.
+    pub ret_val: Value,
+    /// An async function call's result promise.
+    pub promise: Option<ObjRef>,
+    /// Async generator requests waiting for the body.
+    pub queue: VecDeque<(generator::Req, Value, ObjRef)>,
+    // Eager fallback:
     pub start: Option<GenStart>,
     pub buf: VecDeque<Value>,
     pub ret: Option<Value>,
     pub err: Option<Value>,
-    pub is_async: bool,
+}
+
+impl Default for generator::GenState {
+    fn default() -> Self {
+        generator::GenState::Fresh
+    }
 }
 
 pub struct GenStart {
@@ -217,6 +240,9 @@ pub struct GenStart {
     pub args: Vec<Value>,
     pub fobj: ObjRef,
 }
+
+/// Maximum JS call depth on the main stack.
+const MAX_DEPTH: u32 = 7000;
 
 /// Thrown internally to stop a generator that yielded too many values.
 const GEN_CAP_MARKER: &str = "@@generator-cap";
@@ -323,6 +349,10 @@ pub struct Interp {
     pub deadline: Option<std::time::Instant>,
     /// Values yielded by the generators currently running.
     gen_sinks: Vec<Vec<Value>>,
+    /// Nesting depth of JS function calls (per coroutine).
+    pub depth: u32,
+    /// Generators / async calls whose coroutines are running, innermost last.
+    pub co_stack: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
     pub nav: Option<crate::forms::Nav>,
     /// A form a script submitted, to be serialized by the page.
@@ -338,10 +368,12 @@ pub fn type_error(msg: impl Into<String>) -> Value {
 }
 
 impl Interp {
-    pub fn new(doc: Document, url: &str, vw: f32, vh: f32) -> Interp {
+    /// A new interpreter. Boxed: suspended coroutines keep pointers to it,
+    /// so it must not move.
+    pub fn new(doc: Document, url: &str, vw: f32, vh: f32) -> Box<Interp> {
         let global = Rc::new(RefCell::new(Obj { props: Props::default(), proto: None, kind: Kind::Plain }));
         let genv = new_scope(None, Some(Value::Obj(global.clone())), None, true);
-        let mut it = Interp {
+        let mut it = Box::new(Interp {
             global,
             genv,
             p: Protos::default(),
@@ -371,10 +403,12 @@ impl Interp {
             label: None,
             deadline: None,
             gen_sinks: Vec::new(),
+            depth: 0,
+            co_stack: Vec::new(),
             nav: None,
             submit_form: None,
             requests: Vec::new(),
-        };
+        });
         builtins::install(&mut it);
         binary::install(&mut it);
         dombind::install(&mut it);
@@ -804,13 +838,18 @@ impl Interp {
             }
             C::Class => Err(type_error("Class constructor cannot be invoked without 'new'")),
             C::Closure(def, env, arrow_this, home) => {
+                if (def.is_gen || def.is_async) && coro::supported() {
+                    let st = GenStart { def: def.clone(), env: env.clone(), home: home.clone(), this: this.clone(), args: args.to_vec(), fobj: fo.clone() };
+                    let v = if def.is_gen { self.new_coro_gen(st, def.is_async) } else { self.start_async(st) };
+                    if let Some(v) = v {
+                        return Ok(v);
+                    }
+                }
                 if def.is_gen {
                     let g = Gen {
                         start: Some(GenStart { def: def.clone(), env, home, this, args: args.to_vec(), fobj: fo.clone() }),
-                        buf: VecDeque::new(),
-                        ret: None,
-                        err: None,
                         is_async: def.is_async,
+                        ..Gen::default()
                     };
                     let _ = arrow_this;
                     return Ok(Value::Obj(self.new_obj(self.p.generator.clone(), Kind::Generator(Box::new(g)))));
@@ -830,6 +869,18 @@ impl Interp {
 
     #[allow(clippy::too_many_arguments)]
     fn call_closure(&mut self, def: &Rc<FuncDef>, env: Env, arrow_this: Option<Value>, home: Option<ObjRef>, this: Value, args: &[Value], fobj: Option<ObjRef>) -> R<Value> {
+        let limit = if self.co_stack.is_empty() { MAX_DEPTH } else { coro::MAX_DEPTH };
+        if self.depth >= limit {
+            return Err(builtins::make_error_value("RangeError", "Maximum call stack size exceeded"));
+        }
+        self.depth += 1;
+        let r = self.call_closure_inner(def, env, arrow_this, home, this, args, fobj);
+        self.depth -= 1;
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_closure_inner(&mut self, def: &Rc<FuncDef>, env: Env, arrow_this: Option<Value>, home: Option<ObjRef>, this: Value, args: &[Value], fobj: Option<ObjRef>) -> R<Value> {
         let scope = if def.arrow {
             let _ = arrow_this;
             new_scope(Some(env), None, None, true)
@@ -1239,6 +1290,43 @@ impl Interp {
             Stmt::ForOf(init, obj, body) => {
                 let my = self.label.take();
                 let o = self.eval(obj, env)?;
+                if let Some((iter, next)) = self.lazy_iterator(&o)? {
+                    // Pull values one at a time (generators may be infinite).
+                    loop {
+                        let mut r = self.call(&next, iter.clone(), &[])?;
+                        if matches!(&r, Value::Obj(p) if matches!(p.borrow().kind, Kind::Promise(_))) {
+                            r = builtins::await_value(self, r)?;
+                        }
+                        if self.get(&r, "done")?.truthy() {
+                            break;
+                        }
+                        let v = self.get(&r, "value")?;
+                        let scope = new_scope(Some(env.clone()), None, None, false);
+                        let flow = self.for_bind(init, v, &scope).and_then(|_| self.exec(body, &scope));
+                        let stop = match flow {
+                            Ok(Flow::Cont(None) | Flow::Normal) => None,
+                            Ok(Flow::Cont(Some(l))) if my.as_ref() == Some(&l) => None,
+                            Ok(Flow::Brk(None)) => Some(Ok(Flow::Normal)),
+                            Ok(Flow::Brk(Some(l))) if my.as_ref() == Some(&l) => Some(Ok(Flow::Normal)),
+                            other => Some(other),
+                        };
+                        if let Some(res) = stop {
+                            // IteratorClose: let the iterator clean up.
+                            let ret = self.get(&iter, "return")?;
+                            if Self::is_callable(&ret) {
+                                let closed = self.call(&ret, iter.clone(), &[]);
+                                if res.is_ok() {
+                                    closed?;
+                                }
+                            }
+                            match res? {
+                                Flow::Normal => break,
+                                f => return Ok(f),
+                            }
+                        }
+                    }
+                    return Ok(Flow::Normal);
+                }
                 let items = self.iterate(&o)?;
                 for v in items {
                     let scope = new_scope(Some(env.clone()), None, None, false);
@@ -1288,7 +1376,7 @@ impl Interp {
             Stmt::Try(block, catch, finally) => {
                 let r = self.block(block, env);
                 let r = match (r, catch) {
-                    (Err(e), Some((param, cb))) => {
+                    (Err(e), Some((param, cb))) if !generator::is_return_marker(&e) => {
                         let scope = new_scope(Some(env.clone()), None, None, false);
                         if let Some(p) = param {
                             self.bind(p, e, &scope, Some(VarKind::Let))?;
@@ -1369,6 +1457,22 @@ impl Interp {
             }
         }
         keys
+    }
+
+    /// For user-defined iterables (generators, objects with `@@iterator`):
+    /// the iterator and its `next` method. None for built-in collections.
+    fn lazy_iterator(&mut self, v: &Value) -> R<Option<(Value, Value)>> {
+        let Value::Obj(o) = v else { return Ok(None) };
+        if matches!(o.borrow().kind, Kind::Array(_) | Kind::Set(_) | Kind::Map(_) | Kind::Typed(_)) {
+            return Ok(None);
+        }
+        let f = self.get(v, "@@iterator")?;
+        if !Self::is_callable(&f) {
+            return Ok(None);
+        }
+        let iter = self.call(&f, v.clone(), &[])?;
+        let next = self.get(&iter, "next")?;
+        Ok(Some((iter, next)))
     }
 
     /// Materialize an iterable into a Vec.
@@ -1747,6 +1851,9 @@ impl Interp {
                     Some(a) => self.eval(a, env)?,
                     None => Value::Undef,
                 };
+                if let Some(r) = self.co_yield(v.clone(), *delegate) {
+                    return r;
+                }
                 let items = if *delegate { self.iterate(&v)? } else { vec![v] };
                 let Some(sink) = self.gen_sinks.last_mut() else { return Ok(Value::Undef) };
                 sink.extend(items);
@@ -2264,6 +2371,56 @@ mod tests {
     }
 
     #[test]
+    fn suspending_generators_and_async() {
+        let out = run(r#"
+            function* g() { var x = yield 1; console.log('got ' + x); try { yield 2; } finally { console.log('fin'); } return 3; }
+            var it = g();
+            console.log(JSON.stringify(it.next()), JSON.stringify(it.next('a')), JSON.stringify(it.return(9)), JSON.stringify(it.next()));
+            function* nat() { var i = 0; while (true) yield i++; }
+            var s = 0; for (var n of nat()) { if (n > 5) break; s += n; } console.log('sum ' + s);
+            function* inner() { var r = yield 'i1'; return 'ret ' + r; }
+            function* outer() { var v = yield* inner(); yield v; }
+            var o = outer(); o.next(); console.log(o.next('X').value);
+            async function f() {
+                console.log('a1'); await null; console.log('a2');
+                var v = await new Promise(r => setTimeout(() => r(42), 10));
+                console.log('a3 ' + v); return v + 1;
+            }
+            f().then(v => console.log('done ' + v));
+            async function t() { try { await Promise.reject(new Error('boom')); } catch (e) { console.log('caught ' + e.message); } }
+            t();
+            async function* ag() { yield 1; await null; yield 2; }
+            (async () => { for await (const x of ag()) console.log('ag ' + x); })();
+            async function deep(n) { return n ? deep(n - 1) : 'bottom'; }
+            async function rec(n) { await null; return n ? 1 + await rec(n - 1) : 0; }
+            rec(200).then(v => console.log('rec ' + v));
+            function boom(n) { return boom(n + 1); }
+            (async () => { await null; try { boom(0); } catch (e) { console.log(e.name); } })();
+            console.log('sync end');
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "got a",
+                "fin",
+                r#"{"value":1,"done":false} {"value":2,"done":false} {"value":9,"done":true} {"done":true}"#,
+                "sum 15",
+                "ret X",
+                "a1",
+                "sync end",
+                "a2",
+                "caught boom",
+                "RangeError",
+                "ag 1",
+                "ag 2",
+                "rec 200",
+                "a3 42",
+                "done 43",
+            ]
+        );
+    }
+
+    #[test]
     fn basics() {
         assert_eq!(eval1("1 + 2 * 3"), "7");
         assert_eq!(eval1("'a' + 1 + 2"), "a12");
@@ -2397,7 +2554,7 @@ mod tests {
         // aggregate promise of Promise.all only resolves in the second.
         assert_eq!(out[0], "caught nope");
         assert_eq!(out[1], "all 1,2");
-        assert_eq!(out[2], "sync then1 micro async43 then2 timeout");
+        assert_eq!(out[2], "sync then1 micro then2 async43 timeout");
     }
 
     #[test]

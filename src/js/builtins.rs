@@ -2400,6 +2400,11 @@ pub fn settle(it: &mut Interp, p: &ObjRef, ok: bool, v: Value) {
     }
 }
 
+/// React to `p` settling by calling `ok(value)` or `err(reason)`.
+pub fn subscribe(it: &mut Interp, p: &ObjRef, ok: Value, err: Value) {
+    let _ = promise_then(it, Value::Obj(p.clone()), &[ok, err]);
+}
+
 /// Resolve `p` with `v`, adopting the state of promises.
 pub fn resolve_with(it: &mut Interp, p: &ObjRef, v: Value) {
     if let Some(inner) = is_promise(&v) {
@@ -2427,7 +2432,7 @@ pub fn resolve_with(it: &mut Interp, p: &ObjRef, v: Value) {
     settle(it, p, true, v);
 }
 
-fn bound_native(it: &Interp, f: NativeFn, this: Value) -> Value {
+pub(crate) fn bound_native(it: &Interp, f: NativeFn, this: Value) -> Value {
     let nf = it.native(f, "");
     Value::Obj(it.new_obj(it.p.function.clone(), Kind::Func(Func::Bound(nf, this, Vec::new()))))
 }
@@ -2519,8 +2524,12 @@ pub fn promise_rejected(it: &mut Interp, e: Value) -> Value {
     Value::Obj(p)
 }
 
-/// `await`: drain microtasks until the promise settles.
+/// `await`: suspend the running async body until the promise settles; outside
+/// a coroutine, drain microtasks until it does.
 pub fn await_value(it: &mut Interp, v: Value) -> R<Value> {
+    if let Some(r) = it.co_await(v.clone()) {
+        return r;
+    }
     let Some(p) = is_promise(&v) else {
         if let Value::Obj(_) = &v {
             let then = it.get(&v, "then")?;
@@ -2681,7 +2690,7 @@ fn gen_obj(t: &Value) -> R<ObjRef> {
         _ => Err(type_error("not a generator")),
     }
 }
-fn iter_result(it: &mut Interp, value: Value, done: bool) -> Value {
+pub fn iter_result(it: &mut Interp, value: Value, done: bool) -> Value {
     let r = it.plain();
     Interp::set_prop(&r, "value", value);
     Interp::set_prop(&r, "done", Value::Bool(done));
@@ -2697,8 +2706,32 @@ fn gen_finish(it: &mut Interp, o: &ObjRef, r: R<Value>) -> R<Value> {
         Err(e) => promise_rejected(it, e),
     })
 }
-fn gen_next(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+/// next / throw / return on a coroutine-backed generator.
+fn coro_gen_call(it: &mut Interp, o: &ObjRef, req: crate::js::generator::Req, v: Value) -> Option<R<Value>> {
+    use crate::js::coro::Resume;
+    use crate::js::generator::Req;
+    let (coro, is_async) = match &o.borrow().kind {
+        Kind::Generator(g) => (g.coro, g.is_async),
+        _ => return None,
+    };
+    if !coro {
+        return None;
+    }
+    if is_async {
+        return Some(Ok(it.agen_request(o, req, v)));
+    }
+    let r = match req {
+        Req::Next => Resume::Next(v),
+        Req::Throw => Resume::Throw(v),
+        Req::Return => Resume::Return(v),
+    };
+    Some(it.gen_resume(o, r).map(|(v, done)| iter_result(it, v, done)))
+}
+fn gen_next(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let o = gen_obj(&t)?;
+    if let Some(r) = coro_gen_call(it, &o, crate::js::generator::Req::Next, arg(a, 0)) {
+        return r;
+    }
     it.gen_run(&o);
     let step = match &mut o.borrow_mut().kind {
         Kind::Generator(g) => match g.buf.pop_front() {
@@ -2715,6 +2748,9 @@ fn gen_next(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
 }
 fn gen_return(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let o = gen_obj(&t)?;
+    if let Some(r) = coro_gen_call(it, &o, crate::js::generator::Req::Return, arg(a, 0)) {
+        return r;
+    }
     if let Kind::Generator(g) = &mut o.borrow_mut().kind {
         g.start = None;
         g.buf.clear();
@@ -2726,6 +2762,9 @@ fn gen_return(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 }
 fn gen_throw(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let o = gen_obj(&t)?;
+    if let Some(r) = coro_gen_call(it, &o, crate::js::generator::Req::Throw, arg(a, 0)) {
+        return r;
+    }
     if let Kind::Generator(g) = &mut o.borrow_mut().kind {
         g.start = None;
         g.buf.clear();

@@ -204,7 +204,7 @@ const SCRIPT_BUDGET: f64 = 3000.0;
 const NET_WAIT: f64 = 1500.0;
 
 /// Run a page's scripts (in document order), load events and zero-delay timers.
-fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, base: &str, vw: f32, vh: f32) -> (Document, Option<js::Interp>, f64) {
+fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, base: &str, vw: f32, vh: f32) -> (Document, Option<Box<js::Interp>>, f64) {
     let has_handlers = doc.nodes.iter().any(|n| match &n.data {
         Data::Element(e) => e.attrs.iter().any(|(a, _)| crate::atom::name(*a).starts_with("on")),
         _ => false,
@@ -338,7 +338,7 @@ pub struct Page {
     pub tree: LayoutTree,
     pub dl: DisplayList,
     pub res: Resources,
-    pub js: Option<js::Interp>,
+    pub js: Option<Box<js::Interp>>,
     pub t: Timings,
     /// Time spent running scripts at load.
     pub script_ms: f64,
