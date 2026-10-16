@@ -49,7 +49,7 @@ static_atoms! {
     sub = "sub", sup = "sup", var_ = "var", m_i = "mi", m_o = "mo", m_n = "mn", m_s = "ms",
     m_text = "mtext", mglyph = "mglyph", malignmark = "malignmark",
     annotation_xml = "annotation-xml", foreignobject = "foreignobject", desc = "desc",
-    encoding = "encoding", charset = "charset",
+    encoding = "encoding", charset = "charset", slot = "slot",
     // attributes
     id = "id", class = "class", href = "href", src = "src", alt = "alt", width = "width",
     height = "height", rel = "rel", type_ = "type", value = "value",

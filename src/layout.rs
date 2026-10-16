@@ -448,16 +448,13 @@ impl<'a> Engine<'a> {
 
     fn compute_contains_block(&mut self) {
         let doc = self.doc;
-        // Reverse tree order visits descendants before their ancestors.
-        for id in doc.preorder().into_iter().rev().map(|n| n as usize) {
-            if doc.elem(id as NodeId).is_none() {
+        // Reverse (flat) tree order visits descendants before their ancestors.
+        for (id, p, _) in doc.flat_preorder().into_iter().rev() {
+            if doc.elem(id).is_none() {
                 continue;
             }
-            if self.blockish(id as NodeId) {
-                let p = doc.nodes[id].parent;
-                if p != NONE {
-                    self.contains_block[p as usize] = true;
-                }
+            if self.blockish(id) && p != NONE {
+                self.contains_block[p as usize] = true;
             }
         }
     }
@@ -622,7 +619,7 @@ impl<'a> Engine<'a> {
             match crate::forms::display_text(self.doc, node) {
                 Some(t) => self.push_text(&t, node, bx, link, 0),
                 None => {
-                    for c in self.doc.children(node) {
+                    for c in self.doc.flat_children(node) {
                         self.collect_inline(c, bx, link, 0);
                     }
                 }
@@ -635,7 +632,7 @@ impl<'a> Engine<'a> {
         }
         let mut anon: Option<u32> = None;
         let mut ordinal = self.doc.attr(node, k::start).and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(1);
-        for c in self.doc.children(node) {
+        for c in self.doc.flat_children(node) {
             if self.blockish(c) {
                 if let Some(a) = anon.take() {
                     self.finish_anon(bx, a);
@@ -674,7 +671,7 @@ impl<'a> Engine<'a> {
     fn build_items(&mut self, node: NodeId, bx: u32, link: u32) {
         let saved = self.ws_space;
         let doc = self.doc;
-        for c in doc.children(node) {
+        for c in doc.flat_children(node) {
             match &doc.nodes[c as usize].data {
                 Data::Text(t) => {
                     if t.bytes().all(|b| b.is_ascii_whitespace()) {
@@ -726,7 +723,7 @@ impl<'a> Engine<'a> {
     }
 
     fn collect_rows(&mut self, node: NodeId, t: u32, link: u32, anon_row: &mut Option<u32>) {
-        for c in self.doc.children(node) {
+        for c in self.doc.flat_children(node) {
             if self.doc.elem(c).is_none() {
                 continue;
             }
@@ -762,7 +759,7 @@ impl<'a> Engine<'a> {
     }
 
     fn collect_cells(&mut self, row: NodeId, r: u32, link: u32) {
-        for c in self.doc.children(row) {
+        for c in self.doc.flat_children(row) {
             if self.doc.elem(c).is_none() {
                 continue;
             }
@@ -850,7 +847,7 @@ impl<'a> Engine<'a> {
                     self.push_text(&t, c, bx, link, bg);
                     return;
                 }
-                for cc in doc.children(c) {
+                for cc in doc.flat_children(c) {
                     self.collect_inline(cc, bx, link, bg);
                 }
             }

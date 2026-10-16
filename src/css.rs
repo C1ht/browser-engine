@@ -293,6 +293,10 @@ pub enum Pseudo {
     PlaceholderShown,
     Not(Vec<Compound>),
     Is(Vec<Compound>),
+    /// `:host` / `:host(<compound>)` (an empty list matches any host).
+    Host(Vec<Compound>),
+    /// `::slotted(<compound>)`.
+    Slotted(Vec<Compound>),
     Never,
 }
 
@@ -2741,7 +2745,10 @@ fn parse_compound(s: &str, mut i: usize) -> Option<(Compound, usize)> {
                 }
                 let name = name.to_ascii_lowercase();
                 let p = if element {
-                    Pseudo::Never
+                    match name.as_str() {
+                        "slotted" => parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Slotted),
+                        _ => Pseudo::Never,
+                    }
                 } else {
                     match name.as_str() {
                         "first-child" => Pseudo::FirstChild,
@@ -2763,6 +2770,8 @@ fn parse_compound(s: &str, mut i: usize) -> Option<(Compound, usize)> {
                         "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => {
                             parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Is)
                         }
+                        "host" | "host-context" if arg.trim().is_empty() => Pseudo::Host(Vec::new()),
+                        "host" | "host-context" => parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Host),
                         "enabled" | "defined" => continue,
                         _ => Pseudo::Never,
                     }

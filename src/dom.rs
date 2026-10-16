@@ -138,6 +138,14 @@ pub struct Document {
     /// Changes since the last MutationObserver delivery, each with the
     /// target's ancestor path at that time (None: nobody observes).
     pub mutations: Option<Vec<(Mutation, Vec<NodeId>)>>,
+    /// Changes since custom element reactions last ran (None: no custom
+    /// elements are defined).
+    pub ce_log: Option<Vec<Mutation>>,
+    /// Shadow host -> its shadow root (a Fragment node), and back.
+    pub shadows: FxHashMap<NodeId, NodeId>,
+    pub shadow_hosts: FxHashMap<NodeId, NodeId>,
+    /// Shadow root -> its adoptedStyleSheets (indices into `free_sheets`).
+    pub shadow_adopted: FxHashMap<NodeId, Vec<usize>>,
     /// <script> elements in document order.
     pub scripts: Vec<NodeId>,
     /// No <!doctype html>: render in quirks mode.
@@ -165,6 +173,10 @@ impl Document {
             free_sheets: Vec::new(),
             adopted: Vec::new(),
             mutations: None,
+            ce_log: None,
+            shadows: FxHashMap::default(),
+            shadow_hosts: FxHashMap::default(),
+            shadow_adopted: FxHashMap::default(),
             scripts: Vec::new(),
             quirks: true,
             focus: NONE,
@@ -186,6 +198,13 @@ impl Document {
 
     #[inline]
     fn log(&mut self, m: Mutation) {
+        if let Some(ce) = &mut self.ce_log {
+            ce.push(match &m {
+                Mutation::ChildList { target, added, removed, prev, next } => Mutation::ChildList { target: *target, added: *added, removed: *removed, prev: *prev, next: *next },
+                Mutation::Attr { target, name, old } => Mutation::Attr { target: *target, name: *name, old: old.clone() },
+                Mutation::Text { target, old } => Mutation::Text { target: *target, old: old.clone() },
+            });
+        }
         if self.mutations.is_none() {
             return;
         }
@@ -381,7 +400,7 @@ impl Document {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: Atom, value: &str) {
-        if self.mutations.is_some() && self.elem(id).is_some() {
+        if (self.mutations.is_some() || self.ce_log.is_some()) && self.elem(id).is_some() {
             let old = self.attr(id, name).map(str::to_owned);
             self.log(Mutation::Attr { target: id, name, old });
         }
@@ -406,7 +425,7 @@ impl Document {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: Atom) {
-        if self.mutations.is_some() {
+        if self.mutations.is_some() || self.ce_log.is_some() {
             if let Some(old) = self.attr(id, name).map(str::to_owned) {
                 self.log(Mutation::Attr { target: id, name, old: Some(old) });
             }
@@ -461,15 +480,138 @@ impl Document {
         c
     }
 
-    /// Is the node in the document tree (reachable from the root)?
+    /// Is the node in the document (counting shadow trees of connected hosts)?
     pub fn connected(&self, mut n: NodeId) -> bool {
         while n != NONE {
             if n == 0 {
                 return true;
             }
-            n = self.nodes[n as usize].parent;
+            let p = self.nodes[n as usize].parent;
+            n = if p == NONE { self.shadow_hosts.get(&n).copied().unwrap_or(NONE) } else { p };
         }
         false
+    }
+
+    /// The root of the tree `n` is in: 0 (the document), a shadow root, or
+    /// the top of a detached subtree.
+    pub fn tree_root(&self, mut n: NodeId) -> NodeId {
+        loop {
+            let p = self.nodes[n as usize].parent;
+            if p == NONE {
+                return n;
+            }
+            n = p;
+        }
+    }
+
+    /// The shadow root `n` is in, or NONE.
+    pub fn shadow_root_of(&self, n: NodeId) -> NodeId {
+        let r = self.tree_root(n);
+        if self.shadow_hosts.contains_key(&r) { r } else { NONE }
+    }
+
+    fn slot_name(&self, n: NodeId) -> &str {
+        self.attr(n, k::name).map_or("", str::trim)
+    }
+
+    /// The light-DOM nodes assigned to a `<slot>` in a shadow tree.
+    pub fn assigned_nodes(&self, slot: NodeId) -> Vec<NodeId> {
+        let root = self.shadow_root_of(slot);
+        let Some(&host) = self.shadow_hosts.get(&root) else { return Vec::new() };
+        let name = self.slot_name(slot);
+        // Only the first slot with a given name gets nodes.
+        let first = self.find_in(root, |d, n| d.tag(n) == Some(k::slot) && d.slot_name(n) == name);
+        if first != slot {
+            return Vec::new();
+        }
+        self.children(host)
+            .filter(|&c| match &self.nodes[c as usize].data {
+                Data::Element(e) => e.attr(k::slot).map_or("", str::trim) == name,
+                Data::Text(_) => name.is_empty(),
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// The slot a light-DOM node is assigned to, or NONE.
+    pub fn assigned_slot(&self, n: NodeId) -> NodeId {
+        let host = self.nodes[n as usize].parent;
+        let Some(&root) = self.shadows.get(&host) else { return NONE };
+        let name = match &self.nodes[n as usize].data {
+            Data::Element(e) => e.attr(k::slot).map_or("", str::trim),
+            Data::Text(_) => "",
+            _ => return NONE,
+        };
+        self.find_in(root, |d, s| d.tag(s) == Some(k::slot) && d.slot_name(s) == name)
+    }
+
+    /// First node in `root`'s subtree (tree order, not entering shadow
+    /// trees) matching `f`.
+    fn find_in(&self, root: NodeId, f: impl Fn(&Document, NodeId) -> bool) -> NodeId {
+        let mut stack = vec![root];
+        while let Some(n) = stack.pop() {
+            if f(self, n) {
+                return n;
+            }
+            let mut c = self.nodes[n as usize].last_child;
+            while c != NONE {
+                stack.push(c);
+                c = self.nodes[c as usize].prev;
+            }
+        }
+        NONE
+    }
+
+    /// Children in the flat (composed) tree: a shadow host shows its shadow
+    /// root's children; a slot shows its assigned nodes (or its fallback
+    /// content).
+    pub fn flat_children(&self, n: NodeId) -> Vec<NodeId> {
+        if let Some(&sr) = self.shadows.get(&n) {
+            return self.children(sr).collect();
+        }
+        if self.tag(n) == Some(k::slot) && !self.shadow_hosts.is_empty() {
+            let a = self.assigned_nodes(n);
+            if !a.is_empty() {
+                return a;
+            }
+        }
+        self.children(n).collect()
+    }
+
+    /// The flat tree in preorder: (node, flat parent, tree root).
+    pub fn flat_preorder(&self) -> Vec<(NodeId, NodeId, NodeId)> {
+        let mut out = Vec::with_capacity(self.nodes.len());
+        if self.shadows.is_empty() {
+            let mut stack = vec![0 as NodeId];
+            while let Some(n) = stack.pop() {
+                out.push((n, self.nodes[n as usize].parent, 0));
+                let mut c = self.nodes[n as usize].last_child;
+                while c != NONE {
+                    stack.push(c);
+                    c = self.nodes[c as usize].prev;
+                }
+            }
+            return out;
+        }
+        let mut stack = vec![(0 as NodeId, NONE, 0 as NodeId)];
+        while let Some((n, fp, root)) = stack.pop() {
+            out.push((n, fp, root));
+            let kids = self.flat_children(n);
+            let kid_root = |c: NodeId| {
+                if let Some(&sr) = self.shadows.get(&n) {
+                    sr
+                } else if self.nodes[c as usize].parent == n {
+                    root
+                } else {
+                    let r = self.tree_root(c);
+                    if self.shadow_hosts.contains_key(&r) { r } else { 0 }
+                }
+            };
+            for &c in kids.iter().rev() {
+                stack.push((c, n, kid_root(c)));
+            }
+        }
+        out
     }
 
     /// First element in tree order matching `f`.

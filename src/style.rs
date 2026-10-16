@@ -1082,6 +1082,7 @@ fieldset, details, summary, optgroup { display: block }
 head, script, style, link, meta, title, template, area, base, param, datalist, noembed,
 noframes, noscript, rp, option, col, colgroup, [hidden], input[type=hidden], dialog:not([open]) { display: none }
 li { display: list-item }
+slot { display: contents }
 table { display: table; border-spacing: 2px; box-sizing: border-box }
 caption { display: table-caption; text-align: center }
 tr { display: table-row }
@@ -1151,6 +1152,10 @@ struct CRule {
     important: bool,
     /// Can affect font-size (needed in the font pass).
     font: bool,
+    /// The subject is `:host...` (applies to the shadow host).
+    host: bool,
+    /// The subject is `::slotted(...)` (applies to slotted light-DOM nodes).
+    slotted: bool,
 }
 
 pub const LEVEL_UA: u8 = 0;
@@ -1196,7 +1201,9 @@ impl Cascade {
             let custom = ds.iter().any(|d| d.prop == Prop::Custom);
             let important = ds.iter().any(|d| d.important);
             let font = ds.iter().any(|d| matches!(d.prop, Prop::FontSize | Prop::Unresolved));
-            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom, important, font });
+            let host = r.sel.comps[0].pseudos.iter().any(|p| matches!(p, Pseudo::Host(_)));
+            let slotted = r.sel.comps[0].pseudos.iter().any(|p| matches!(p, Pseudo::Slotted(_)));
+            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom, important, font, host, slotted });
         }
     }
 
@@ -1328,6 +1335,8 @@ fn match_compound(c: &Compound, doc: &Document, id: NodeId) -> bool {
             Pseudo::PlaceholderShown => crate::forms::placeholder_shown(doc, id),
             Pseudo::Not(list) => !list.iter().any(|c| match_compound(c, doc, id)),
             Pseudo::Is(list) => list.iter().any(|c| match_compound(c, doc, id)),
+            Pseudo::Host(list) => doc.shadows.contains_key(&id) && (list.is_empty() || list.iter().any(|c| match_compound(c, doc, id))),
+            Pseudo::Slotted(list) => doc.shadows.contains_key(&doc.parent(id)) && list.iter().any(|c| match_compound(c, doc, id)),
             Pseudo::Never => false,
         };
         if !ok {
@@ -1342,6 +1351,70 @@ pub fn selector_matches(sel: &Selector, doc: &Document, id: NodeId) -> bool {
     doc.elem(id).is_some() && match_from(sel, 0, doc, id)
 }
 
+/// The parent for ancestor combinators: a shadow root leads to its host when
+/// the next compound is `:host...`.
+fn up(doc: &Document, n: NodeId, next: &Compound) -> NodeId {
+    let p = doc.parent(n);
+    if p != NONE && doc.elem(p).is_none() {
+        if let Some(&h) = doc.shadow_hosts.get(&p) {
+            if next.pseudos.iter().any(|x| matches!(x, Pseudo::Host(_))) {
+                return h;
+            }
+        }
+    }
+    p
+}
+
+thread_local! {
+    /// Shadow-tree cascades by (stylesheet text hash, viewport).
+    static SHADOW_CASCADES: std::cell::RefCell<FxHashMap<(u64, u32, u32), Rc<Cascade>>> = std::cell::RefCell::new(FxHashMap::default());
+}
+
+/// The cascade for a shadow tree: its `<style>` elements and adopted sheets.
+fn shadow_cascade(doc: &Document, root: NodeId, media: &Media) -> Rc<Cascade> {
+    use std::hash::{Hash, Hasher};
+    let mut text = String::new();
+    let mut stack = vec![root];
+    while let Some(n) = stack.pop() {
+        if doc.tag(n) == Some(k::style) {
+            let mut s = String::new();
+            doc.text_content(n, &mut s);
+            match doc.cssom.get(&n) {
+                Some(d) if d.init && d.base == s => text.push_str(&d.rules.join("\n")),
+                _ => text.push_str(&s),
+            }
+            text.push('\n');
+            continue;
+        }
+        let mut c = doc.nodes[n as usize].last_child;
+        while c != NONE {
+            stack.push(c);
+            c = doc.nodes[c as usize].prev;
+        }
+    }
+    for &i in doc.shadow_adopted.get(&root).into_iter().flatten() {
+        if let Some(r) = doc.free_sheets.get(i) {
+            text.push_str(&r.join("\n"));
+            text.push('\n');
+        }
+    }
+    let mut h = crate::fx::FxHasher::default();
+    text.hash(&mut h);
+    let key = (h.finish(), media.vw.to_bits(), media.vh.to_bits());
+    SHADOW_CASCADES.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(cas) = c.get(&key) {
+            return cas.clone();
+        }
+        if c.len() > 512 {
+            c.clear();
+        }
+        let cas = Rc::new(build_cascade(&[(text, String::new())], media, false));
+        c.insert(key, cas.clone());
+        cas
+    })
+}
+
 fn match_from(sel: &Selector, idx: usize, doc: &Document, id: NodeId) -> bool {
     if !match_compound(&sel.comps[idx], doc, id) {
         return false;
@@ -1351,16 +1424,16 @@ fn match_from(sel: &Selector, idx: usize, doc: &Document, id: NodeId) -> bool {
     }
     match sel.combs[idx] {
         Comb::Child => {
-            let p = doc.parent(id);
+            let p = up(doc, id, &sel.comps[idx + 1]);
             p != NONE && match_from(sel, idx + 1, doc, p)
         }
         Comb::Descendant => {
-            let mut p = doc.parent(id);
+            let mut p = up(doc, id, &sel.comps[idx + 1]);
             while p != NONE && doc.elem(p).is_some() {
                 if match_from(sel, idx + 1, doc, p) {
                     return true;
                 }
-                p = doc.parent(p);
+                p = up(doc, p, &sel.comps[idx + 1]);
             }
             false
         }
@@ -1533,14 +1606,24 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
     let mut scratch = VarCache::default();
     let mut ctx = Ctx { root_fs: 16.0, vw, vh };
 
-    // Tree order: parents before children (scripts may have moved nodes, so
-    // arena order isn't enough).
-    for id in doc.preorder().into_iter().skip(1).map(|n| n as usize) {
+    // Shadow trees are styled by their own cascades.
+    let media = Media { vw, vh };
+    let scoped: FxHashMap<NodeId, Rc<Cascade>> = doc.shadows.values().map(|&sr| (sr, shadow_cascade(doc, sr, &media))).collect();
+    let doc_cas = cas;
+
+    // Flat tree order: parents (and slots) before children; scripts may
+    // have moved nodes, so arena order isn't enough.
+    for (id, fparent, tree) in doc.flat_preorder() {
+        let id = id as usize;
         let Data::Element(el) = &doc.nodes[id].data else { continue };
-        let parent = doc.nodes[id].parent as usize;
+        let cas: &Cascade = if tree == 0 { doc_cas } else { scoped.get(&tree).map_or(doc_cas, |c| &**c) };
+        // Selectors see the DOM parent; inheritance follows the flat tree.
+        let dom_parent = doc.nodes[id].parent;
+        let parent = if fparent == NONE { 0 } else { fparent as usize };
+        let bp = if dom_parent == NONE || dom_parent as usize >= blooms.len() { 0 } else { dom_parent as usize };
 
         // Bloom filter of this element's ancestors-or-self.
-        let mut bloom = blooms[parent];
+        let mut bloom = if dom_parent == NONE { [0; 8] } else { blooms[bp] };
         bloom_add(&mut bloom, el.tag);
         if let Some(i) = el.id {
             bloom_add(&mut bloom, i);
@@ -1549,7 +1632,7 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
             bloom_add(&mut bloom, c);
         }
         blooms[id] = bloom;
-        let pb = &blooms[parent];
+        let pb = &blooms[bp];
 
         // Collect matching rules from the relevant buckets.
         matched.clear();
@@ -1582,6 +1665,31 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
             (r.level, r.sel.spec, r.order)
         });
 
+        // `:host` rules of this element's shadow tree and `::slotted` rules
+        // of the tree it is slotted into apply before the author's rules.
+        let mut extra: Vec<(&Cascade, u32)> = Vec::new();
+        if let Some(sc) = doc.shadows.get(&(id as NodeId)).and_then(|sr| scoped.get(sr)) {
+            for (ri, r) in sc.rules.iter().enumerate() {
+                if r.host && match_from(&r.sel, 0, doc, id as NodeId) {
+                    extra.push((sc, ri as u32));
+                }
+            }
+        }
+        if dom_parent != NONE && doc.shadows.contains_key(&dom_parent) {
+            let slot = doc.assigned_slot(id as NodeId);
+            if let Some(sc) = (slot != NONE).then(|| doc.shadow_root_of(slot)).and_then(|sr| scoped.get(&sr)) {
+                for (ri, r) in sc.rules.iter().enumerate() {
+                    if r.slotted && match_from(&r.sel, 0, doc, id as NodeId) {
+                        extra.push((sc, ri as u32));
+                    }
+                }
+            }
+        }
+        extra.sort_by_key(|(c, ri)| {
+            let r = &c.rules[*ri as usize];
+            (r.sel.spec, r.order)
+        });
+
         hints(doc, id as NodeId, el, &mut hint_decls);
         inline_decls.clear();
         inline_raws.clear();
@@ -1595,6 +1703,7 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
 
         // Custom properties get their own first pass, so var() can see them.
         let has_custom = matched.iter().any(|&ri| cas.rules[ri as usize].custom)
+            || extra.iter().any(|(c, ri)| c.rules[*ri as usize].custom)
             || inline_decls.iter().any(|d| d.prop == Prop::Custom);
         let passes: &[Pass] = if has_custom { &[Pass::Custom, Pass::Font, Pass::Rest] } else { &[Pass::Font, Pass::Rest] };
         let raws = &cas.raws[..];
@@ -1610,6 +1719,15 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
             }
             for d in &hint_decls {
                 apply_decl(s, ps, d, &ctx, pass, &[], true, &mut scratch);
+            }
+            for (c, ri) in &extra {
+                let r = &c.rules[*ri as usize];
+                if font_pass && !r.font {
+                    continue;
+                }
+                for d in c.decls[r.start as usize..r.end as usize].iter().filter(|d| !d.important) {
+                    apply_decl(s, ps, d, &ctx, pass, &c.raws, false, &mut scratch);
+                }
             }
             for (_, ds) in rules().map(decls).filter(|(l, _)| *l != LEVEL_UA) {
                 for d in ds.iter().filter(|d| !d.important) {

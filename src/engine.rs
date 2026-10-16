@@ -1201,6 +1201,45 @@ mod tests {
     }
 
     #[test]
+    fn shadow_dom_renders() {
+        let p = page_from(
+            r#"<!doctype html><style>b { color: rgb(255, 0, 0) } .in { color: rgb(9, 9, 9) }</style>
+               <x-card id=card><b id=light slot=title>Title</b><i id=body>Body</i></x-card>
+               <script>
+                 customElements.define('x-card', class extends HTMLElement {
+                   constructor() {
+                     super();
+                     const r = this.attachShadow({ mode: 'open' });
+                     r.innerHTML = `<style>:host { display: block; color: rgb(0, 0, 255) }
+                       .in { font-weight: bold } ::slotted(i) { color: rgb(0, 128, 0) }</style>
+                       <h2><slot name=title>no title</slot></h2><p class=in id=inner>inner <slot></slot></p>`;
+                   }
+                 });
+                 const c = document.getElementById('card');
+                 c.shadowRoot.getElementById('inner').addEventListener('click', () => {}, false);
+                 c.addEventListener('ping', () => { document.title = 'host got it'; });
+                 c.shadowRoot.getElementById('inner').dispatchEvent(new CustomEvent('ping', { bubbles: true }));
+                 document.title += ' ' + (c.shadowRoot.getElementById('inner').getRootNode() === c.shadowRoot);
+               </script>"#,
+        );
+        let inner = {
+            let root = p.doc.shadows[&node_by_id(&p, "card")];
+            (0..p.doc.nodes.len() as u32).find(|&n| p.doc.tree_root(n) == root && p.doc.elem(n).is_some_and(|e| e.id == crate::atom::lookup("inner"))).unwrap()
+        };
+        let color = |n: NodeId| p.styles[n as usize].color & 0xFFFFFF;
+        // :host styles the host; shadow styles don't leak out, document styles don't leak in.
+        assert_eq!(color(node_by_id(&p, "card")), 0x0000FF);
+        assert_eq!(color(inner), 0x0000FF);
+        assert!(p.styles[inner as usize].bold);
+        // Light DOM keeps document styles; ::slotted applies.
+        assert_eq!(color(node_by_id(&p, "light")), 0xFF0000);
+        assert_eq!(color(node_by_id(&p, "body")), 0x008000);
+        assert_eq!(p.title(), "host got it true");
+        let text: String = p.tree.text.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(text.contains("TitleinnerBody"), "{text}");
+    }
+
+    #[test]
     fn script_styles_apply() {
         let p = page_from(
             r#"<!doctype html><style id=s>#a { color: rgb(0, 0, 255) }</style>

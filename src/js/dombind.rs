@@ -366,7 +366,28 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "style" => Value::Obj(it.new_obj(it.p.style.clone(), Kind::Style(id))),
         "dataset" => Value::Obj(it.new_obj(it.p.object.clone(), Kind::Dataset(id))),
         "ownerDocument" => node_obj(it, 0),
-        "isConnected" => Value::Bool(it.doc.contains(0, id)),
+        "isConnected" => Value::Bool(it.doc.connected(id)),
+        "shadowRoot" => match it.doc.shadows.get(&id).copied() {
+            Some(r) => {
+                let ro = node_obj(it, r);
+                let closed = matches!(&ro, Value::Obj(o) if matches!(o.borrow().props.get("@@mode").map(|p| p.v.clone()), Some(Value::Str(m)) if &*m == "closed"));
+                if closed { Value::Null } else { ro }
+            }
+            None => Value::Null,
+        },
+        "host" if it.doc.shadow_hosts.contains_key(&id) => {
+            let h = it.doc.shadow_hosts[&id];
+            node_obj(it, h)
+        }
+        "mode" if it.doc.shadow_hosts.contains_key(&id) => o.borrow().props.get("@@mode").map(|p| p.v.clone()).unwrap_or(Value::str("open")),
+        "adoptedStyleSheets" if it.doc.shadow_hosts.contains_key(&id) => {
+            let list: Vec<Value> = it.doc.shadow_adopted.get(&id).cloned().unwrap_or_default().into_iter().map(|i| crate::js::cssom::sheet_obj(it, crate::dom::SheetRef::Free(i))).collect();
+            it.array(list)
+        }
+        "assignedSlot" => {
+            let s = it.doc.assigned_slot(id);
+            node_obj(it, s)
+        }
         "value" if !doc_node => match it.doc.tag(id) {
             Some(k::textarea | k::select) => Value::str(&crate::forms::value(&it.doc, id)),
             _ => Value::str(it.doc.attr(id, k::value).unwrap_or("")),
@@ -565,6 +586,18 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
             it.doc.set_title(&t);
         }
         "adoptedStyleSheets" if id == 0 => crate::js::cssom::set_adopted(it, v)?,
+        "adoptedStyleSheets" if it.doc.shadow_hosts.contains_key(&id) => {
+            let mut list = Vec::new();
+            for s in it.iterate(v)? {
+                if let Value::Obj(o) = &s {
+                    if let Kind::Sheet(crate::dom::SheetRef::Free(i)) = o.borrow().kind {
+                        list.push(i);
+                    }
+                }
+            }
+            it.doc.shadow_adopted.insert(id, list);
+            it.dirty = true;
+        }
         "cookie" if id == 0 => {
             let c = it.to_str(v)?;
             let pair = c.split(';').next().unwrap_or("").trim().to_owned();
@@ -1026,7 +1059,9 @@ fn dispatch_obj(it: &mut Interp, target: u32, ty: &str, ev: Value) -> R<bool> {
         let mut n = target;
         while n != NONE {
             path.push(n);
-            n = it.doc.parent(n);
+            let p = it.doc.parent(n);
+            // Events in a shadow tree propagate on to its host.
+            n = if p == NONE { it.doc.shadow_hosts.get(&n).copied().unwrap_or(NONE) } else { p };
         }
     }
     path.push(WINDOW);
@@ -1095,15 +1130,59 @@ fn event_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
 
 // ------------------------------------------------------------- document
 
-fn d_get_by_id(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+fn d_get_by_id(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let s = it.to_str(&arg(a, 0))?;
     let Some(want) = atom::lookup(&s) else { return Ok(Value::Null) };
-    let found = descendants(it, 0).into_iter().find(|&n| it.doc.elem(n).is_some_and(|e| e.id == Some(want)));
+    // document or a shadow root / fragment
+    let root = node_id(&t).unwrap_or(0);
+    let found = descendants(it, root).into_iter().find(|&n| it.doc.elem(n).is_some_and(|e| e.id == Some(want)));
     Ok(node_obj(it, found.unwrap_or(NONE)))
+}
+fn n_attach_shadow(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let host = this_node(&t)?;
+    if it.doc.shadows.contains_key(&host) {
+        return Err(super::builtins::make_error_value("NotSupportedError", "Failed to execute 'attachShadow': Shadow root cannot be created on a host which already hosts a shadow tree."));
+    }
+    let opts = arg(a, 0);
+    let mode = if matches!(opts, Value::Obj(_)) { it.get(&opts, "mode")? } else { Value::Undef };
+    let mode = if let Value::Str(m) = mode { m.to_string() } else { "open".into() };
+    let root = it.doc.add(Data::Fragment);
+    it.doc.shadows.insert(host, root);
+    it.doc.shadow_hosts.insert(root, host);
+    let ro = node_obj(it, root);
+    if let Value::Obj(o) = &ro {
+        Interp::set_hidden(o, "@@mode", Value::str(&mode));
+    }
+    it.dirty = true;
+    Ok(ro)
+}
+fn n_assigned_nodes(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    let nodes = it.doc.assigned_nodes(n);
+    let vals = nodes.into_iter().map(|c| node_obj(it, c)).collect();
+    Ok(it.array(vals))
+}
+fn n_assigned_elements(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    let nodes: Vec<NodeId> = it.doc.assigned_nodes(n).into_iter().filter(|&c| it.doc.elem(c).is_some()).collect();
+    let vals = nodes.into_iter().map(|c| node_obj(it, c)).collect();
+    Ok(it.array(vals))
+}
+fn n_get_root_node(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let mut n = this_node(&t)?;
+    let composed = matches!(arg(a, 0), Value::Obj(_)) && it.get(&arg(a, 0), "composed")?.truthy();
+    loop {
+        let r = it.doc.tree_root(n);
+        match it.doc.shadow_hosts.get(&r) {
+            Some(&h) if composed => n = h,
+            _ => return Ok(node_obj(it, r)),
+        }
+    }
 }
 fn d_create_element(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let tag = it.to_str(&arg(a, 0))?;
     let id = it.doc.add(Data::Element(Element::new(atom::intern_lower(&tag), Ns::Html, Vec::new())));
+    it.ce_created(id);
     Ok(node_obj(it, id))
 }
 fn d_create_element_ns(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
@@ -1562,7 +1641,10 @@ pub fn install(it: &mut Interp) {
         ("scrollBy", noop),
         ("setPointerCapture", noop),
         ("releasePointerCapture", noop),
-        ("attachShadow", |_, t, _| Ok(t)),
+        ("attachShadow", n_attach_shadow),
+        ("assignedNodes", n_assigned_nodes),
+        ("assignedElements", n_assigned_elements),
+        ("getRootNode", n_get_root_node),
         ("getElementById", d_get_by_id),
         ("createElement", d_create_element),
         ("createElementNS", d_create_element_ns),
@@ -1623,7 +1705,7 @@ pub fn install(it: &mut Interp) {
         "HTMLHtmlElement", "HTMLParagraphElement", "HTMLHeadingElement", "HTMLUListElement", "HTMLLIElement",
         "HTMLTableElement", "HTMLSlotElement", "HTMLUnknownElement", "ShadowRoot",
     ] {
-        ctor(it, n, w_unsupported_ctor, Some(np.clone()));
+        ctor(it, n, crate::js::custom::html_element_ctor, Some(np.clone()));
     }
     // Node type and document-position constants.
     let consts = [
@@ -1742,9 +1824,4 @@ pub fn install(it: &mut Interp) {
     ] {
         it.def_method(&g, n, f);
     }
-    let ce = it.plain();
-    it.def_method(&ce, "define", noop);
-    it.def_method(&ce, "get", |_, _, _| Ok(Value::Undef));
-    it.def_method(&ce, "whenDefined", |it, _, _| Ok(super::builtins::promise_resolved(it, Value::Undef)));
-    Interp::set_hidden(&g, "customElements", Value::Obj(ce));
 }

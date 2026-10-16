@@ -6,6 +6,7 @@ pub mod binary;
 pub mod builtins;
 pub mod coro;
 pub mod cssom;
+pub mod custom;
 pub mod dombind;
 pub mod generator;
 pub mod iter;
@@ -393,6 +394,14 @@ pub struct Interp {
     pub geo_regs: Vec<observe::GeoReg>,
     /// A geometry observer was added (check at the next opportunity).
     pub geo_pending: bool,
+    pub ce_defs: Vec<custom::CeDef>,
+    /// Custom elements that have been constructed (-> definition index).
+    pub ce_upgraded: FxHashMap<NodeId, usize>,
+    /// Elements whose upgrade constructor is running (innermost last).
+    pub ce_upgrading: Vec<NodeId>,
+    /// `this` of a class constructor calling a native parent via `super()`.
+    pub ce_this: Option<Value>,
+    pub ce_when: Vec<(Rc<str>, ObjRef)>,
     /// The page's vertical scroll offset.
     pub scroll_y: f32,
     /// A scroll position requested by a script (`scrollTo`, ...).
@@ -463,6 +472,11 @@ impl Interp {
             mut_queue: Vec::new(),
             geo_regs: Vec::new(),
             geo_pending: false,
+            ce_defs: Vec::new(),
+            ce_upgraded: FxHashMap::default(),
+            ce_upgrading: Vec::new(),
+            ce_this: None,
+            ce_when: Vec::new(),
             scroll_y: 0.0,
             scroll_request: None,
             co_stack: Vec::new(),
@@ -477,6 +491,7 @@ impl Interp {
         binary::install(&mut it);
         dombind::install(&mut it);
         observe::install(&mut it);
+        custom::install(&mut it);
         web::install(&mut it);
         if let Err(e) = it.run_script(include_str!("prelude.js")) {
             eprintln!("js prelude: {e}");
@@ -778,6 +793,9 @@ impl Interp {
         }
         let special = matches!(o.borrow().kind, Kind::Node(_) | Kind::Style(_) | Kind::ClassList(_) | Kind::Dataset(_));
         if special && dombind::set(self, o, key, &v)? {
+            if self.doc.ce_log.as_ref().is_some_and(|l| !l.is_empty()) {
+                self.ce_process();
+            }
             return Ok(());
         }
         // Setter on the prototype chain?
@@ -914,6 +932,10 @@ impl Interp {
                 let saved = std::mem::replace(&mut self.constructing, false);
                 let r = n(self, this, args);
                 self.constructing = saved;
+                // Custom element reactions for DOM changes the call made.
+                if self.doc.ce_log.as_ref().is_some_and(|l| !l.is_empty()) {
+                    self.ce_process();
+                }
                 r
             }
             C::Bound(t, th, mut a) => {
@@ -1076,18 +1098,32 @@ impl Interp {
                 self.call(parent, this.clone(), args)?;
             }
             2 => {
-                // Native parents (Error, Map, ...): build an instance and adopt its state.
-                let inst = self.construct(parent, args)?;
+                // Native parents (Error, Map, HTMLElement...): build an
+                // instance and adopt its state.
+                self.ce_this = Some(this.clone());
+                let inst = self.construct(parent, args);
+                self.ce_this = None;
+                let inst = inst?;
                 if let (Value::Obj(src), Value::Obj(dst)) = (&inst, this) {
+                    if Rc::ptr_eq(src, dst) {
+                        return Ok(()); // a custom element upgrade: already `this`
+                    }
                     let (props, kind) = {
                         let mut s = src.borrow_mut();
                         (std::mem::take(&mut s.props), std::mem::replace(&mut s.kind, Kind::Plain))
                     };
-                    let mut d = dst.borrow_mut();
-                    for (k, p) in props.list {
-                        d.props.insert(k, p);
+                    let node = if let Kind::Node(n) = kind { Some(n) } else { None };
+                    {
+                        let mut d = dst.borrow_mut();
+                        for (k, p) in props.list {
+                            d.props.insert(k, p);
+                        }
+                        d.kind = kind;
                     }
-                    d.kind = kind;
+                    if let Some(n) = node {
+                        // `this` is now the element's wrapper.
+                        self.node_objs.insert(n, dst.clone());
+                    }
                 }
             }
             _ => {}
@@ -2566,6 +2602,50 @@ mod tests {
                 "2 0 false",
                 "1,9,3 3,4,3,4 1,3",
                 "10,20,30 1,2 function",
+            ]
+        );
+    }
+
+    #[test]
+    fn custom_elements() {
+        let out = run(r#"
+            const root = document.createElement('div');
+            document.appendChild(root);
+            root.innerHTML = '<x-early a="1">e</x-early>';
+            class XEl extends HTMLElement {
+                static get observedAttributes() { return ['a']; }
+                constructor() { super(); this.made = true; console.log('ctor', this.tagName); }
+                connectedCallback() { console.log('connected', this.tagName, this.isConnected !== false); }
+                disconnectedCallback() { console.log('disconnected', this.tagName); }
+                attributeChangedCallback(n, o, v) { console.log('attr', n, o, v); }
+                hello() { return 'hi ' + this.getAttribute('a'); }
+            }
+            customElements.define('x-early', XEl);
+            const e = root.firstChild;
+            console.log(e.made, e.hello(), e instanceof XEl, e instanceof HTMLElement);
+            e.setAttribute('a', '2');
+            e.setAttribute('b', '3');
+            customElements.whenDefined('x-new').then(c => console.log('defined', c.name));
+            class XNew extends HTMLElement { connectedCallback() { this.textContent = 'rendered'; } }
+            customElements.define('x-new', XNew);
+            const n = new XNew();
+            console.log(n.tagName, n instanceof XNew);
+            root.appendChild(n);
+            console.log(n.textContent, document.createElement('x-new') instanceof XNew, customElements.get('x-new') === XNew);
+            root.removeChild(e);
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "ctor X-EARLY",
+                "attr a null 1",
+                "connected X-EARLY true",
+                "true hi 1 true true",
+                "attr a 1 2",
+                "X-NEW true",
+                "rendered true true",
+                "disconnected X-EARLY",
+                "defined XNew",
             ]
         );
     }
