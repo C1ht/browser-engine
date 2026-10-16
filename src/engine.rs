@@ -1240,6 +1240,28 @@ mod tests {
     }
 
     #[test]
+    fn pseudo_elements() {
+        let p = page_from(
+            r#"<!doctype html><style>
+                 .q::before { content: open-quote "Hi " attr(data-n) } .q::after { content: '\21' close-quote }
+                 .box { position: relative; height: 50px } .box::after { content: ''; position: absolute; left: 0; top: 0; width: 20px; height: 10px; background: red }
+                 .blk::before { content: 'B'; display: block } .icon::before { content: "\2713" }
+               </style><p class=q data-n=Bob id=q>x</p><div class=box id=box></div><div class=blk>after</div><span class=icon></span>"#,
+        );
+        let text: String = p.tree.text.chars().collect();
+        assert!(text.contains("\u{201c}Hi Bob") && text.contains("x!\u{201d}"), "{text}");
+        assert!(text.contains('\u{2713}'), "{text}");
+        // The absolutely positioned overlay is a 20x10 box owned by #box.
+        let bx = node_by_id(&p, "box");
+        let owned: Vec<_> = p.tree.boxes.iter().filter(|b| p.tree.pseudo_owner.get(&b.node) == Some(&bx)).collect();
+        assert_eq!(owned.len(), 1);
+        assert_eq!((owned[0].w, owned[0].h), (20.0, 10.0));
+        // Hit-testing a pseudo box gives its owner.
+        let r = p.tree.node_rects()[&node_by_id(&p, "q")];
+        assert_eq!(p.tree.node_at(r[0] + 2.0, r[1] + r[3] / 2.0), Some(node_by_id(&p, "q")));
+    }
+
+    #[test]
     fn script_styles_apply() {
         let p = page_from(
             r#"<!doctype html><style id=s>#a { color: rgb(0, 0, 255) }</style>

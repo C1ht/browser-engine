@@ -36,6 +36,8 @@ pub enum Value {
     Span(i16),
     /// background-image: index into the image table.
     Image(u32),
+    /// `content`: index into the content table.
+    Content(u32),
     /// grid-template-areas: index into the areas table.
     Areas(u32),
     /// An identifier (interned), e.g. a grid area name.
@@ -219,6 +221,7 @@ pub enum Prop {
     GridTemplateAreas,
     GridArea,
     BackgroundImage,
+    Content,
     BgSizeX,
     BgSizeY,
     BgPosX,
@@ -293,6 +296,9 @@ pub enum Pseudo {
     PlaceholderShown,
     Not(Vec<Compound>),
     Is(Vec<Compound>),
+    /// `::before` / `::after`: the rule styles that pseudo-element.
+    Before,
+    After,
     /// `:host` / `:host(<compound>)` (an empty list matches any host).
     Host(Vec<Compound>),
     /// `::slotted(<compound>)`.
@@ -873,6 +879,12 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
         "initial" | "unset" | "revert" | "revert-layer" => Some(Value::Initial),
         _ => None,
     };
+    if global.is_none() && name == "content" {
+        if let Some(c) = content_value(value) {
+            push!(Content, c);
+        }
+        return;
+    }
     if let Some(g) = global {
         let props: &[Prop] = match name {
             "margin" => &MARGIN,
@@ -1222,6 +1234,7 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "grid-template-rows" => GridTemplateRows,
         "grid-auto-rows" => GridAutoRows,
         "background-image" => BackgroundImage,
+        "content" => Content,
         "background-repeat" => BgRepeat,
         "object-fit" => ObjectFit,
         _ => return None,
@@ -2148,6 +2161,116 @@ pub enum BgImage {
     Gradient(Rc<Gradient>),
 }
 
+/// One part of a `content` value.
+#[derive(Clone, Debug)]
+pub enum ContentItem {
+    Str(Rc<str>),
+    Attr(Atom),
+    OpenQuote,
+    CloseQuote,
+    /// counter() / counters(): rendered empty for now.
+    Counter,
+    /// url(): images aren't rendered yet.
+    Url,
+}
+
+thread_local! {
+    static CONTENTS: RefCell<Vec<Rc<[ContentItem]>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn content(i: u32) -> Rc<[ContentItem]> {
+    CONTENTS.with(|t| t.borrow()[i as usize].clone())
+}
+
+/// Decode CSS string escapes (`\f101`, `\"`, `\\`).
+fn css_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let mut hex = String::new();
+        while hex.len() < 6 && it.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+            hex.push(it.next().unwrap());
+        }
+        if hex.is_empty() {
+            match it.next() {
+                Some('\n') | None => {}
+                Some(c) => out.push(c),
+            }
+        } else {
+            if it.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+                it.next();
+            }
+            out.push(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32).filter(|&c| c != '\0').unwrap_or('\u{fffd}'));
+        }
+    }
+    out
+}
+
+/// Parse a `content` value (original case). None/normal give Kw(None).
+fn content_value(v: &str) -> Option<Value> {
+    let v = v.trim();
+    // Alternative text after '/' is ignored.
+    let mut items = Vec::new();
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' | b'\t' | b'\n' => i += 1,
+            b'/' => break,
+            q @ (b'"' | b'\'') => {
+                let mut j = i + 1;
+                while j < b.len() && b[j] != q {
+                    if b[j] == b'\\' {
+                        j += 1;
+                    }
+                    j += 1;
+                }
+                items.push(ContentItem::Str(css_unescape(&v[i + 1..j.min(b.len())]).into()));
+                i = j + 1;
+            }
+            _ => {
+                let start = i;
+                let mut depth = 0;
+                while i < b.len() && (depth > 0 || !matches!(b[i], b' ' | b'\t' | b'\n')) {
+                    match b[i] {
+                        b'(' => depth += 1,
+                        b')' => depth -= 1,
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let tok = &v[start..i];
+                let lower = tok.to_ascii_lowercase();
+                match lower.as_str() {
+                    "none" | "normal" => return Some(Value::Kw(Kw::None)),
+                    "open-quote" => items.push(ContentItem::OpenQuote),
+                    "close-quote" => items.push(ContentItem::CloseQuote),
+                    "no-open-quote" | "no-close-quote" => {}
+                    _ if lower.starts_with("attr(") => {
+                        let name = tok[5..tok.len().saturating_sub(1)].split_whitespace().next().unwrap_or("");
+                        items.push(ContentItem::Attr(intern_lower(name)));
+                    }
+                    _ if lower.starts_with("counter") => items.push(ContentItem::Counter),
+                    _ if lower.starts_with("url(") => {
+                        items.push(ContentItem::Url);
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+    let i = CONTENTS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push(items.into());
+        t.len() as u32 - 1
+    });
+    Some(Value::Content(i))
+}
+
 pub fn bg_image(i: u32) -> BgImage {
     IMAGES.with(|t| t.borrow().0[i as usize].clone())
 }
@@ -2747,6 +2870,8 @@ fn parse_compound(s: &str, mut i: usize) -> Option<(Compound, usize)> {
                 let p = if element {
                     match name.as_str() {
                         "slotted" => parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Slotted),
+                        "before" => Pseudo::Before,
+                        "after" => Pseudo::After,
                         _ => Pseudo::Never,
                     }
                 } else {
@@ -2770,6 +2895,8 @@ fn parse_compound(s: &str, mut i: usize) -> Option<(Compound, usize)> {
                         "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => {
                             parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Is)
                         }
+                        "before" => Pseudo::Before,
+                        "after" => Pseudo::After,
                         "host" | "host-context" if arg.trim().is_empty() => Pseudo::Host(Vec::new()),
                         "host" | "host-context" => parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Host),
                         "enabled" | "defined" => continue,

@@ -327,6 +327,14 @@ pub struct Style {
     pub bg_repeat: (bool, bool),
     /// object-fit: 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down
     pub object_fit: u8,
+    /// `content` (None = normal / none).
+    pub content: Option<Rc<[css::ContentItem]>>,
+    /// Indices (into the styles vector) of this element's ::before / ::after
+    /// styles; 0 = none. Pseudo-element styles follow the node styles.
+    pub before: u32,
+    pub after: u32,
+    /// For a pseudo-element style: the element it belongs to.
+    pub owner: u32,
 }
 
 pub const INITIAL: Style = Style {
@@ -400,6 +408,10 @@ pub const INITIAL: Style = Style {
     bg_pos: [Len::Pct(0.0); 2],
     bg_repeat: (true, true),
     object_fit: 0,
+    content: None,
+    before: 0,
+    after: 0,
+    owner: u32::MAX,
 };
 
 impl Style {
@@ -485,6 +497,7 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         GridTemplateAreas => d.grid_areas = s.grid_areas.clone(),
         GridArea => d.garea = s.garea,
         BackgroundImage => d.bg_image = s.bg_image,
+        Content => d.content = s.content.clone(),
         BgSizeX | BgSizeY => {
             d.bg_size = s.bg_size;
             d.bg_fit = s.bg_fit
@@ -814,6 +827,12 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
         BackgroundImage => {
             s.bg_image = match v {
                 Value::Image(i) => Some(i),
+                _ => None,
+            }
+        }
+        Content => {
+            s.content = match v {
+                Value::Content(i) => Some(css::content(i)),
                 _ => None,
             }
         }
@@ -1156,6 +1175,8 @@ struct CRule {
     host: bool,
     /// The subject is `::slotted(...)` (applies to slotted light-DOM nodes).
     slotted: bool,
+    /// Pseudo-element the rule styles: 0 none, 1 ::before, 2 ::after.
+    pe: u8,
 }
 
 pub const LEVEL_UA: u8 = 0;
@@ -1203,7 +1224,12 @@ impl Cascade {
             let font = ds.iter().any(|d| matches!(d.prop, Prop::FontSize | Prop::Unresolved));
             let host = r.sel.comps[0].pseudos.iter().any(|p| matches!(p, Pseudo::Host(_)));
             let slotted = r.sel.comps[0].pseudos.iter().any(|p| matches!(p, Pseudo::Slotted(_)));
-            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom, important, font, host, slotted });
+            let pe = r.sel.comps[0].pseudos.iter().find_map(|p| match p {
+                Pseudo::Before => Some(1),
+                Pseudo::After => Some(2),
+                _ => None,
+            });
+            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom, important, font, host, slotted, pe: pe.unwrap_or(0) });
         }
     }
 
@@ -1335,6 +1361,7 @@ fn match_compound(c: &Compound, doc: &Document, id: NodeId) -> bool {
             Pseudo::PlaceholderShown => crate::forms::placeholder_shown(doc, id),
             Pseudo::Not(list) => !list.iter().any(|c| match_compound(c, doc, id)),
             Pseudo::Is(list) => list.iter().any(|c| match_compound(c, doc, id)),
+            Pseudo::Before | Pseudo::After => true,
             Pseudo::Host(list) => doc.shadows.contains_key(&id) && (list.is_empty() || list.iter().any(|c| match_compound(c, doc, id))),
             Pseudo::Slotted(list) => doc.shadows.contains_key(&doc.parent(id)) && list.iter().any(|c| match_compound(c, doc, id)),
             Pseudo::Never => false,
@@ -1595,9 +1622,43 @@ fn css_family(v: &str) -> Value {
 
 // ---------------------------------------------------------------- compute
 
+/// Apply matched rules (sorted) to a pseudo-element style.
+fn apply_matched(s: &mut Style, ps: &Style, cas: &Cascade, matched: &[u32], ctx: &Ctx, scratch: &mut VarCache) {
+    let has_custom = matched.iter().any(|&ri| cas.rules[ri as usize].custom);
+    let passes: &[Pass] = if has_custom { &[Pass::Custom, Pass::Font, Pass::Rest] } else { &[Pass::Font, Pass::Rest] };
+    for &pass in passes {
+        let font_pass = pass == Pass::Font;
+        for important in [false, true] {
+            for &ri in matched {
+                let r = &cas.rules[ri as usize];
+                if font_pass && !r.font {
+                    continue;
+                }
+                for d in cas.decls[r.start as usize..r.end as usize].iter().filter(|d| d.important == important) {
+                    apply_decl(s, ps, d, ctx, pass, &cas.raws, false, scratch);
+                }
+            }
+        }
+    }
+    for i in 0..4 {
+        if !s.bs[i] {
+            s.bw[i] = 0.0;
+        }
+        if s.bc[i] == CURRENT_COLOR {
+            s.bc[i] = s.color;
+        }
+    }
+    if s.bg == CURRENT_COLOR {
+        s.bg = s.color;
+    }
+}
+
 pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
     let n = doc.nodes.len();
     let mut styles: Vec<Style> = vec![INITIAL; n];
+    // ::before / ::after styles, appended after the node styles.
+    let mut pseudo_styles: Vec<Style> = Vec::new();
+    let mut pe_matched: Vec<(u8, u32)> = Vec::new();
     let mut blooms: Vec<Bloom> = vec![[0; 8]; n];
     let mut matched: Vec<u32> = Vec::with_capacity(64);
     let mut hint_decls: Vec<Decl> = Vec::new();
@@ -1636,13 +1697,18 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
 
         // Collect matching rules from the relevant buckets.
         matched.clear();
+        pe_matched.clear();
         let mut consider = |list: &[u32]| {
             for &ri in list {
                 let r = &cas.rules[ri as usize];
                 if r.sel.ancestor_atoms.iter().all(|&a| bloom_has(pb, a))
                     && match_from(&r.sel, 0, doc, id as NodeId)
                 {
-                    matched.push(ri);
+                    if r.pe == 0 {
+                        matched.push(ri);
+                    } else {
+                        pe_matched.push((r.pe, ri));
+                    }
                 }
             }
         };
@@ -1764,7 +1830,34 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
             ctx.root_fs = s.font_size;
         }
         styles[id] = own;
+
+        // ::before / ::after
+        for pe in [1u8, 2] {
+            let mut list: Vec<u32> = pe_matched.iter().filter(|(p, _)| *p == pe).map(|(_, r)| *r).collect();
+            if list.is_empty() {
+                continue;
+            }
+            list.sort_unstable_by_key(|&ri| {
+                let r = &cas.rules[ri as usize];
+                (r.level, r.sel.spec, r.order)
+            });
+            let parent = styles[id].clone();
+            let mut ps = Style::inherit(&parent);
+            apply_matched(&mut ps, &parent, cas, &list, &ctx, &mut scratch);
+            if ps.content.is_none() || ps.display == Display::None {
+                continue;
+            }
+            ps.owner = id as u32;
+            pseudo_styles.push(ps);
+            let idx = (n + pseudo_styles.len() - 1) as u32;
+            if pe == 1 {
+                styles[id].before = idx;
+            } else {
+                styles[id].after = idx;
+            }
+        }
     }
+    styles.extend(pseudo_styles);
     styles
 }
 

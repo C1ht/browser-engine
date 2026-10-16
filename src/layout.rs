@@ -153,7 +153,7 @@ impl LayoutTree {
             }
         }, &mut |n, r| texts.push((n, r)));
         for (n, r) in boxes.into_iter().chain(texts) {
-            add(n, r);
+            add(self.pseudo_owner.get(&n).copied().unwrap_or(n), r);
         }
         m
     }
@@ -194,7 +194,7 @@ impl LayoutTree {
         if let Some(t) = last_text {
             hit = Some(t);
         }
-        hit.or(last_box)
+        hit.or(last_box).map(|n| self.pseudo_owner.get(&n).copied().unwrap_or(n))
     }
 }
 
@@ -231,6 +231,8 @@ pub struct LayoutTree {
     pub links: Vec<String>,
     pub root: u32,
     pub height: f32,
+    /// ::before / ::after box ids -> the element they belong to.
+    pub pseudo_owner: crate::fx::FxHashMap<NodeId, NodeId>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -440,7 +442,8 @@ pub fn layout(doc: &Document, styles: &[Style], vw: f32, vh: f32, res: &Resource
             height = height.max(ry + b.y + b.border_h());
         }
     }
-    LayoutTree { boxes: e.boxes, text: e.ltext, links: e.links, root, height }
+    let pseudo_owner = (doc.nodes.len()..styles.len()).map(|p| (p as NodeId, styles[p].owner)).collect();
+    LayoutTree { boxes: e.boxes, text: e.ltext, links: e.links, root, height, pseudo_owner }
 }
 
 impl<'a> Engine<'a> {
@@ -456,12 +459,69 @@ impl<'a> Engine<'a> {
             if self.blockish(id) && p != NONE {
                 self.contains_block[p as usize] = true;
             }
+            // A block-level ::before / ::after also makes its owner a block container.
+            let st = &self.styles[id as usize];
+            if [st.before, st.after].iter().any(|&ps| ps != 0 && self.blockish(ps)) {
+                self.contains_block[id as usize] = true;
+            }
         }
+    }
+
+    #[inline]
+    fn is_pseudo(&self, c: NodeId) -> bool {
+        c as usize >= self.doc.nodes.len()
+    }
+
+    /// Flat-tree children plus the ::before / ::after boxes.
+    fn kids(&self, n: NodeId) -> Vec<NodeId> {
+        let mut v = self.doc.flat_children(n);
+        let st = &self.styles[n as usize];
+        if st.before != 0 {
+            v.insert(0, st.before);
+        }
+        if st.after != 0 {
+            v.push(st.after);
+        }
+        v
+    }
+
+    /// The text a ::before / ::after generates.
+    fn pseudo_text(&self, p: NodeId) -> String {
+        let st = &self.styles[p as usize];
+        let mut out = String::new();
+        for item in st.content.iter().flat_map(|c| c.iter()) {
+            match item {
+                css::ContentItem::Str(s) => out.push_str(s),
+                css::ContentItem::Attr(a) => out.push_str(self.doc.attr(st.owner, *a).unwrap_or("")),
+                css::ContentItem::OpenQuote => out.push('\u{201c}'),
+                css::ContentItem::CloseQuote => out.push('\u{201d}'),
+                css::ContentItem::Counter | css::ContentItem::Url => {}
+            }
+        }
+        out
+    }
+
+    /// The box for a non-inline ::before / ::after.
+    fn build_pseudo_box(&mut self, p: NodeId, link: u32) -> u32 {
+        let bx = self.new_box(Kind::Block, p, false);
+        self.boxes[bx as usize].link = link;
+        let t = self.pseudo_text(p);
+        if !t.is_empty() {
+            let saved = self.ws_space;
+            self.ws_space = true;
+            self.push_text(&t, p, bx, link, 0);
+            self.ws_space = saved;
+        }
+        bx
     }
 
     /// Does this child force its parent into block context?
     #[inline]
     fn blockish(&self, c: NodeId) -> bool {
+        if self.is_pseudo(c) {
+            let st = &self.styles[c as usize];
+            return !out_of_flow(st) && is_block_level(st.display);
+        }
         let Some(el) = self.doc.elem(c) else { return false };
         let st = &self.styles[c as usize];
         if out_of_flow(st) {
@@ -542,6 +602,9 @@ impl<'a> Engine<'a> {
 
     /// Build the box for element `c` (blockified) and its contents.
     fn build_box(&mut self, c: NodeId, link: u32, ordinal: i32) -> u32 {
+        if self.is_pseudo(c) {
+            return self.build_pseudo_box(c, link);
+        }
         let styles = self.styles;
         let st = &styles[c as usize];
         let link = self.link_for(c, link);
@@ -619,7 +682,7 @@ impl<'a> Engine<'a> {
             match crate::forms::display_text(self.doc, node) {
                 Some(t) => self.push_text(&t, node, bx, link, 0),
                 None => {
-                    for c in self.doc.flat_children(node) {
+                    for c in self.kids(node) {
                         self.collect_inline(c, bx, link, 0);
                     }
                 }
@@ -632,7 +695,7 @@ impl<'a> Engine<'a> {
         }
         let mut anon: Option<u32> = None;
         let mut ordinal = self.doc.attr(node, k::start).and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(1);
-        for c in self.doc.flat_children(node) {
+        for c in self.kids(node) {
             if self.blockish(c) {
                 if let Some(a) = anon.take() {
                     self.finish_anon(bx, a);
@@ -647,7 +710,7 @@ impl<'a> Engine<'a> {
                 self.boxes[bx as usize].children.push(cb);
             } else {
                 if anon.is_none() {
-                    if let Data::Text(t) = &self.doc.nodes[c as usize].data {
+                    if let Some(Data::Text(t)) = self.doc.nodes.get(c as usize).map(|n| &n.data) {
                         if !self.styles[node as usize].ws.preserves() && t.bytes().all(|b| b.is_ascii_whitespace()) {
                             continue;
                         }
@@ -671,7 +734,13 @@ impl<'a> Engine<'a> {
     fn build_items(&mut self, node: NodeId, bx: u32, link: u32) {
         let saved = self.ws_space;
         let doc = self.doc;
-        for c in doc.flat_children(node) {
+        for c in self.kids(node) {
+            if self.is_pseudo(c) {
+                let st = &self.styles[c as usize];
+                let id = if matches!(st.position, Pos::Absolute | Pos::Fixed) { self.build_oof(c, link).0 } else { self.build_box(c, link, 0) };
+                self.boxes[bx as usize].children.push(id);
+                continue;
+            }
             match &doc.nodes[c as usize].data {
                 Data::Text(t) => {
                     if t.bytes().all(|b| b.is_ascii_whitespace()) {
@@ -792,6 +861,26 @@ impl<'a> Engine<'a> {
     fn collect_inline(&mut self, c: NodeId, bx: u32, link: u32, bg: u32) {
         let doc = self.doc;
         let styles = self.styles;
+        if self.is_pseudo(c) {
+            let st = &styles[c as usize];
+            if out_of_flow(st) {
+                let (id, is_float) = self.build_oof(c, link);
+                self.boxes[bx as usize].items.push(if is_float { Item::Float(id) } else { Item::Anchor(id) });
+            } else if matches!(st.display, Display::Inline | Display::Contents) {
+                let t = self.pseudo_text(c);
+                let bg = if st.bg >> 24 != 0 { st.bg } else { bg };
+                if !t.is_empty() {
+                    self.push_text(&t, c, bx, link, bg);
+                }
+            } else {
+                let saved = self.ws_space;
+                let id = self.build_box(c, link, 0);
+                self.ws_space = saved;
+                self.boxes[bx as usize].items.push(Item::Atomic(id));
+                self.ws_space = false;
+            }
+            return;
+        }
         match &doc.nodes[c as usize].data {
             Data::Text(t) => {
                 let parent = doc.nodes[c as usize].parent;
@@ -847,7 +936,7 @@ impl<'a> Engine<'a> {
                     self.push_text(&t, c, bx, link, bg);
                     return;
                 }
-                for cc in doc.flat_children(c) {
+                for cc in self.kids(c) {
                     self.collect_inline(cc, bx, link, bg);
                 }
             }
