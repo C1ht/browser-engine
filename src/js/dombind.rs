@@ -324,6 +324,9 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             let c = it.doc.children(id).filter(|&c| is_elem(it, c)).last().unwrap_or(NONE);
             node_obj(it, c)
         }
+        "sheet" if crate::js::cssom::has_sheet(it, id) => crate::js::cssom::sheet_obj(it, crate::dom::SheetRef::Node(id)),
+        "styleSheets" if doc_node => crate::js::cssom::document_sheets(it),
+        "adoptedStyleSheets" if doc_node => crate::js::cssom::adopted(it),
         "content" if it.doc.tag(id) == Some(k::template) => {
             let c = it.doc.template_content(id);
             node_obj(it, c)
@@ -560,6 +563,7 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
             let t = it.to_str(v)?;
             it.doc.set_title(&t);
         }
+        "adoptedStyleSheets" if id == 0 => crate::js::cssom::set_adopted(it, v)?,
         "cookie" if id == 0 => {
             let c = it.to_str(v)?;
             let pair = c.split(';').next().unwrap_or("").trim().to_owned();

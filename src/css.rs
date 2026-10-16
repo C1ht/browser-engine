@@ -2045,6 +2045,59 @@ fn parse_more(name: &str, v: &str, orig: &str, important: bool, out: &mut Vec<De
 // ------------------------------------------------------------- stylesheet
 
 /// Parse a stylesheet; `url()`s resolve against `base`.
+/// Split CSS source into its top-level rules (CSSOM `cssRules`).
+pub fn split_rules(src: &str) -> Vec<String> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let (mut start, mut depth, mut i) = (0, 0usize, 0);
+    let mut push = |s: &str| {
+        let t = s.trim();
+        if !t.is_empty() {
+            out.push(t.to_owned());
+        }
+    };
+    while i < b.len() {
+        match b[i] {
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                let end = src[i + 2..].find("*/").map_or(b.len(), |p| i + 2 + p + 2);
+                if depth == 0 && src[start..i].trim().is_empty() {
+                    start = end;
+                }
+                i = end;
+                continue;
+            }
+            q @ (b'"' | b'\'') => {
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            b'\\' => i += 1,
+            b'{' => depth += 1,
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    push(&src[start..=i]);
+                    start = i + 1;
+                }
+            }
+            b';' if depth == 0 => {
+                push(&src[start..=i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth > 0 {
+        push(&src[start.min(src.len())..]);
+    }
+    out
+}
+
 pub fn parse_stylesheet(src: &str, media: &Media, base: &str) -> Stylesheet {
     let saved = BASE.with(|b| std::mem::replace(&mut *b.borrow_mut(), base.to_owned()));
     let mut sheet = Stylesheet::default();

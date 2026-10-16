@@ -5,6 +5,7 @@
 pub mod binary;
 pub mod builtins;
 pub mod coro;
+pub mod cssom;
 pub mod dombind;
 pub mod generator;
 pub mod iter;
@@ -196,6 +197,8 @@ pub enum Kind {
     /// A built-in iterator (array / map / set / string iteration).
     Iter(Box<iter::IterState>),
     Proxy(Box<proxy::ProxyData>),
+    /// A CSSStyleSheet.
+    Sheet(crate::dom::SheetRef),
     /// ArrayBuffer contents.
     Buffer(Vec<u8>),
     /// A typed array view onto an ArrayBuffer.
@@ -453,6 +456,7 @@ impl Interp {
         builtins::install(&mut it);
         iter::install(&mut it);
         proxy::install(&mut it);
+        cssom::install(&mut it);
         binary::install(&mut it);
         dombind::install(&mut it);
         web::install(&mut it);

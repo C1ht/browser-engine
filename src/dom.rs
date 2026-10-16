@@ -82,6 +82,22 @@ impl Data {
     }
 }
 
+/// A CSSOM stylesheet: of a `<style>` / `<link>` element, or constructed
+/// (`new CSSStyleSheet()`, index into `Document::free_sheets`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SheetRef {
+    Node(NodeId),
+    Free(usize),
+}
+
+/// CSSOM rules of an element's sheet. `base` is the element text they were
+/// derived from; when the text changes, the rules are re-derived.
+pub struct SheetData {
+    pub base: String,
+    pub rules: Vec<String>,
+    pub init: bool,
+}
+
 /// A doctype node's name and identifiers.
 #[derive(Clone)]
 pub struct DocType {
@@ -106,6 +122,12 @@ pub struct Document {
     pub body: NodeId,
     /// `<template>` element -> its content fragment.
     pub templates: FxHashMap<NodeId, NodeId>,
+    /// CSSOM-modified sheets of `<style>` / `<link>` elements.
+    pub cssom: FxHashMap<NodeId, SheetData>,
+    /// Constructed stylesheets' rules.
+    pub free_sheets: Vec<Vec<String>>,
+    /// `document.adoptedStyleSheets` (indices into `free_sheets`).
+    pub adopted: Vec<usize>,
     /// <script> elements in document order.
     pub scripts: Vec<NodeId>,
     /// No <!doctype html>: render in quirks mode.
@@ -129,6 +151,9 @@ impl Document {
             head: NONE,
             body: NONE,
             templates: FxHashMap::default(),
+            cssom: FxHashMap::default(),
+            free_sheets: Vec::new(),
+            adopted: Vec::new(),
             scripts: Vec::new(),
             quirks: true,
             focus: NONE,

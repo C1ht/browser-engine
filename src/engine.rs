@@ -111,13 +111,20 @@ fn collect_sheets(doc: &Document, base: &str, css: &FxHashMap<String, String>, m
                 if !print_only(e.attr(k::media)) && e.attr(k::type_).is_none_or(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("text/css")) {
                     let mut s = String::new();
                     doc.text_content(n, &mut s);
-                    out.push((s, base.to_owned()));
+                    // Rules inserted through the CSSOM (insertRule) replace the text.
+                    match doc.cssom.get(&n) {
+                        Some(d) if d.init && d.base == s => out.push((d.rules.join("\n"), base.to_owned())),
+                        _ => out.push((s, base.to_owned())),
+                    }
                 }
             } else if e.tag == k::link {
                 if let Some(u) = stylesheet_link(e, base) {
                     match css.get(&u) {
-                        Some(t) => out.push((t.clone(), u)),
-                        None => missing.push(u),
+                        Some(t) => out.push((t.clone(), u.clone())),
+                        None => missing.push(u.clone()),
+                    }
+                    if let Some(d) = doc.cssom.get(&n) {
+                        out.push((d.rules.join("\n"), u));
                     }
                 }
             }
@@ -126,6 +133,11 @@ fn collect_sheets(doc: &Document, base: &str, css: &FxHashMap<String, String>, m
         while c != NONE {
             stack.push(c);
             c = doc.nodes[c as usize].prev;
+        }
+    }
+    for &i in &doc.adopted {
+        if let Some(rules) = doc.free_sheets.get(i) {
+            out.push((rules.join("\n"), base.to_owned()));
         }
     }
     out
@@ -1105,6 +1117,31 @@ mod tests {
         let doc = html::parse(html);
         let l = Loaded { url: "https://example.com/start".into(), html: html.into(), css: FxHashMap::default(), doc, scripts: FxHashMap::default(), fetch_ms: 0.0, parse_ms: 0.0 };
         Page::new(l, 800.0, 600.0)
+    }
+
+    fn node_by_id(p: &Page, id: &str) -> NodeId {
+        let a = crate::atom::lookup(id).unwrap();
+        (0..p.doc.nodes.len() as u32).find(|&n| p.doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap()
+    }
+
+    #[test]
+    fn script_styles_apply() {
+        let p = page_from(
+            r#"<!doctype html><style id=s>#a { color: rgb(0, 0, 255) }</style>
+               <div id=a>a</div><div id=b>b</div><div id=c>c</div><div id=d>d</div>
+               <script>
+                 const s = document.getElementById('s').sheet;
+                 s.insertRule('#b { color: rgb(255, 0, 0) }', s.cssRules.length);
+                 const st = document.createElement('style'); st.textContent = '#c { color: rgb(0, 128, 0) }';
+                 document.head.appendChild(st);
+                 const c = new CSSStyleSheet(); c.replaceSync('#d { color: rgb(1, 2, 3) }');
+                 document.adoptedStyleSheets = [c];
+                 document.title = s.cssRules.length + ' ' + document.styleSheets.length + ' ' + s.cssRules[1].selectorText;
+               </script>"#,
+        );
+        let color = |id: &str| p.styles[node_by_id(&p, id) as usize].color & 0xFFFFFF;
+        assert_eq!((color("a"), color("b"), color("c"), color("d")), (0x0000FF, 0xFF0000, 0x008000, 0x010203));
+        assert_eq!(p.title(), "2 2 #b");
     }
 
     #[test]
