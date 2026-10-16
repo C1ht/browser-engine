@@ -350,6 +350,8 @@ pub struct Page {
     pub nav: Option<Nav>,
     /// The focused field's value when it gained focus (for `change` events).
     focus_value: String,
+    url_events: Vec<js::UrlEvent>,
+    history_go: Option<i32>,
     vw: f32,
     vh: f32,
 }
@@ -452,7 +454,7 @@ impl Page {
         let mut css = l.css;
         let sheets = sheets_for(&doc, &base, &mut css);
         let (styles, tree, dl) = render(&doc, &sheets, &base, &mut res, vw, vh, &mut t);
-        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), vw, vh };
+        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, vw, vh };
         page.sync_js_geometry();
         page.script_requests();
         page
@@ -526,17 +528,38 @@ impl Page {
         if let Some(form) = it.submit_form.take() {
             self.nav = forms::submission(&self.doc, form, NONE, &self.base).or(self.nav.take());
         }
-        let global = js::Value::Obj(it.global.clone());
-        if let Ok(js::Value::Obj(loc)) = it.get(&global, "location") {
-            let lv = js::Value::Obj(loc.clone());
-            if let Ok(href) = it.get(&lv, "href").and_then(|h| it.to_str(&h)) {
-                if *href != *it.url {
-                    let url = net::resolve(&it.url, &href);
-                    js::Interp::set_prop(&loc, "href", js::Value::str(&it.url));
-                    self.nav = Some(Nav { url, post: None });
-                }
+        // pushState / replaceState / fragment changes: the document's URL
+        // changes without a navigation.
+        self.url_events.append(&mut it.url_events);
+        if self.url != it.url {
+            self.url = it.url.clone();
+            if self.doc.base_href().is_none() {
+                self.base = self.url.clone();
             }
         }
+        if let Some(n) = it.history_go.take() {
+            self.history_go = Some(n);
+        }
+    }
+
+    /// Same-document URL changes since the last call (for session history).
+    pub fn take_url_events(&mut self) -> Vec<js::UrlEvent> {
+        std::mem::take(&mut self.url_events)
+    }
+
+    /// This document's current session history position.
+    pub fn hist_pos(&self) -> usize {
+        self.js.as_ref().map_or(0, |it| it.hist_pos)
+    }
+
+    /// `history.go(n)` requested by a script.
+    pub fn take_history_go(&mut self) -> Option<i32> {
+        self.history_go.take()
+    }
+
+    /// Back / forward to this document's session history entry `pos`.
+    pub fn pop_state(&mut self, pos: usize) {
+        self.with_js(|it| js::dombind::pop_state(it, pos));
     }
 
     /// Take a pending navigation request.

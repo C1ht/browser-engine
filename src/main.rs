@@ -288,6 +288,15 @@ impl minifb::InputCallback for CharSink {
     }
 }
 
+/// A session history entry. `generation` / `pos` identify the document and
+/// its own (pushState) history position, for same-document back / forward.
+struct HistEntry {
+    url: String,
+    scroll: f32,
+    generation: u64,
+    pos: usize,
+}
+
 struct Browser {
     window: Window,
     page: Option<Page>,
@@ -296,8 +305,8 @@ struct Browser {
     url_input: String,
     editing: bool,
     select_all: bool,
-    history: Vec<(String, f32)>,
-    forward: Vec<(String, f32)>,
+    history: Vec<HistEntry>,
+    forward: Vec<HistEntry>,
     glyphs: GlyphCache,
     buf: Vec<u32>,
     w: usize,
@@ -380,8 +389,8 @@ impl Browser {
             }
         }
         if push_history {
-            if let Some(p) = &self.page {
-                self.history.push((p.url.clone(), self.scroll));
+            if let Some(e) = self.current_entry() {
+                self.history.push(e);
                 self.forward.clear();
             }
         }
@@ -576,25 +585,64 @@ impl Browser {
         }
     }
 
-    fn go_back(&mut self) {
-        if let Some((u, s)) = self.history.pop() {
-            if let Some(p) = &self.page {
-                self.forward.push((p.url.clone(), self.scroll));
+    /// A history entry for where we are now.
+    fn current_entry(&self) -> Option<HistEntry> {
+        let p = self.page.as_ref()?;
+        Some(HistEntry { url: p.url.clone(), scroll: self.scroll, generation: self.generation, pos: p.hist_pos() })
+    }
+
+    /// Go to a history entry: within the current document (pushState
+    /// entries) fire popstate; otherwise load it.
+    fn restore(&mut self, e: HistEntry) {
+        if e.generation == self.generation && self.page.is_some() {
+            if let Some(p) = self.page.as_mut() {
+                p.pop_state(e.pos);
+                self.url_input = p.url.clone();
             }
-            self.navigate(&u, false);
-            self.scroll = s;
-            self.repaint();
+        } else {
+            self.navigate(&e.url, false);
+        }
+        self.scroll = e.scroll;
+        self.repaint();
+    }
+
+    fn go_back(&mut self) {
+        if let Some(e) = self.history.pop() {
+            if let Some(cur) = self.current_entry() {
+                self.forward.push(cur);
+            }
+            self.restore(e);
         }
     }
 
     fn go_forward(&mut self) {
-        if let Some((u, s)) = self.forward.pop() {
-            if let Some(p) = &self.page {
-                self.history.push((p.url.clone(), self.scroll));
+        if let Some(e) = self.forward.pop() {
+            if let Some(cur) = self.current_entry() {
+                self.history.push(cur);
             }
-            self.navigate(&u, false);
-            self.scroll = s;
-            self.repaint();
+            self.restore(e);
+        }
+    }
+
+    /// Apply pushState / replaceState / history.go() requests from the page.
+    fn page_history(&mut self) {
+        let Some(p) = self.page.as_mut() else { return };
+        let events = p.take_url_events();
+        let go = p.take_history_go();
+        let url = p.url.clone();
+        for ev in events {
+            if ev.push {
+                self.history.push(HistEntry { url: ev.prev_url, scroll: self.scroll, generation: self.generation, pos: ev.prev_pos });
+                self.forward.clear();
+            }
+        }
+        if !self.editing {
+            self.url_input = url;
+        }
+        match go {
+            Some(n) if n < 0 => (0..-n).for_each(|_| self.go_back()),
+            Some(n) if n > 0 => (0..n).for_each(|_| self.go_forward()),
+            _ => {}
         }
     }
 
@@ -609,6 +657,7 @@ impl Browser {
             if self.page.as_mut().is_some_and(|p| p.tick(now)) {
                 dirty = true;
             }
+            self.page_history();
             if let Some(n) = self.page.as_mut().and_then(|p| p.take_nav()) {
                 self.navigate_to(n, true);
                 continue;

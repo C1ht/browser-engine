@@ -250,7 +250,7 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         }
         _ => {}
     }
-    let doc_node = id == 0;
+    let doc_node = matches!(it.doc.nodes[id as usize].data, Data::Document);
     let v = match key {
         "nodeType" => Value::Num(match &it.doc.nodes[id as usize].data {
             Data::Element(_) => 1.0,
@@ -370,6 +370,26 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "scrollTop" | "scrollLeft" | "clientTop" | "clientLeft" => Value::Num(0.0),
         "offsetParent" => node_obj(it, it.doc.body),
         // document-only
+        "body" | "head" | "documentElement" | "scrollingElement" if doc_node && id != 0 => {
+            // A document from document.implementation.
+            let html = it.doc.children(id).find(|&c| it.doc.tag(c) == Some(k::html)).unwrap_or(NONE);
+            let n = match key {
+                "body" | "head" if html != NONE => {
+                    let want = if key == "body" { k::body } else { k::head };
+                    it.doc.children(html).find(|&c| it.doc.tag(c) == Some(want)).unwrap_or(NONE)
+                }
+                "body" | "head" => NONE,
+                _ => html,
+            };
+            node_obj(it, n)
+        }
+        "implementation" if doc_node => {
+            let o = it.plain();
+            it.def_method(&o, "createHTMLDocument", d_create_html_document);
+            it.def_method(&o, "createDocument", d_create_html_document);
+            it.def_method(&o, "hasFeature", |_, _, _| Ok(Value::Bool(true)));
+            Value::Obj(o)
+        }
         "body" if doc_node => node_obj(it, it.doc.body),
         "head" if doc_node => node_obj(it, it.doc.head),
         "documentElement" | "scrollingElement" if doc_node => node_obj(it, it.doc.html),
@@ -1038,6 +1058,22 @@ fn d_create_element_ns(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let id = it.doc.add(Data::Element(Element::new(atom::intern_lower(local), ns, Vec::new())));
     Ok(node_obj(it, id))
 }
+/// `document.implementation.createHTMLDocument(title)`: a detached document
+/// (sharing this document's node arena).
+fn d_create_html_document(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let d = it.doc.add(Data::Document);
+    let mk = |it: &mut Interp, tag| it.doc.add(Data::Element(Element::new(tag, Ns::Html, Vec::new())));
+    let (html, head, body) = (mk(it, k::html), mk(it, k::head), mk(it, k::body));
+    it.doc.append(d, html);
+    it.doc.append(html, head);
+    it.doc.append(html, body);
+    if let Value::Str(t) = arg(a, 0) {
+        let title = mk(it, k::title);
+        it.doc.append(head, title);
+        it.doc.append_text(title, &t);
+    }
+    Ok(node_obj(it, d))
+}
 fn d_create_text(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let s = it.to_str(&arg(a, 0))?;
     let id = it.doc.add(Data::Text(s.to_string()));
@@ -1249,10 +1285,169 @@ fn storage_clear(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
     it.storage.clear();
     Ok(Value::Undef)
 }
-fn history_push(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
-    if let Value::Str(u) = arg(a, 2) {
-        it.url = crate::net::resolve(&it.url, &u);
+fn history_state_change(it: &mut Interp, a: &[Value], push: bool) -> R<Value> {
+    let url = match arg(a, 2) {
+        v if v.is_nullish() => it.url.clone(),
+        v => {
+            let u = it.to_str(&v)?;
+            crate::net::resolve(&it.url, &u)
+        }
+    };
+    let (prev_pos, prev_url) = (it.hist_pos, it.url.clone());
+    let state = arg(a, 0);
+    if push {
+        it.hist.truncate(it.hist_pos + 1);
+        it.hist.push((url.clone(), state));
+        it.hist_pos = it.hist.len() - 1;
+    } else if let Some(e) = it.hist.get_mut(it.hist_pos) {
+        *e = (url.clone(), state);
     }
+    it.url = url.clone();
+    it.url_events.push(crate::js::UrlEvent { push, prev_pos, prev_url });
+    Ok(Value::Undef)
+}
+fn history_push(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    history_state_change(it, a, true)
+}
+fn history_replace(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    history_state_change(it, a, false)
+}
+fn history_go(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let n = it.to_num(&arg(a, 0))?;
+    if n == 0.0 || n.is_nan() {
+        it.nav = Some(crate::forms::Nav { url: it.url.clone(), post: None });
+    } else {
+        it.history_go = Some(n as i32);
+    }
+    Ok(Value::Undef)
+}
+fn history_back(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    it.history_go = Some(-1);
+    Ok(Value::Undef)
+}
+fn history_forward(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    it.history_go = Some(1);
+    Ok(Value::Undef)
+}
+fn history_length(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Ok(Value::Num(it.hist.len() as f64))
+}
+fn history_state(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Ok(it.hist.get(it.hist_pos).map(|e| e.1.clone()).unwrap_or(Value::Null))
+}
+
+/// Move to session history entry `pos` of this document (back / forward
+/// across pushState entries): update the URL and fire `popstate`.
+pub fn pop_state(it: &mut Interp, pos: usize) {
+    let Some((url, state)) = it.hist.get(pos).cloned() else { return };
+    let old = std::mem::replace(&mut it.url, url.clone());
+    it.hist_pos = pos;
+    dispatch(it, WINDOW, "popstate", |it, ev| {
+        let _ = it.put(ev, "state", state);
+    });
+    let strip = |u: &str| u.split('#').next().unwrap_or("").to_owned();
+    if strip(&old) == strip(&url) && old != url {
+        fire_hashchange(it, &old, &url);
+    }
+}
+
+fn fire_hashchange(it: &mut Interp, old: &str, new: &str) {
+    let (old, new) = (old.to_owned(), new.to_owned());
+    dispatch(it, WINDOW, "hashchange", |it, ev| {
+        let _ = it.put(ev, "oldURL", Value::str(&old));
+        let _ = it.put(ev, "newURL", Value::str(&new));
+    });
+}
+
+// ---------------------------------------------------------------- location
+
+fn loc_parts(it: &Interp) -> crate::js::web::Parsed {
+    crate::js::web::parse_url(&it.url).unwrap_or(crate::js::web::Parsed {
+        protocol: "about:".into(),
+        username: String::new(),
+        password: String::new(),
+        hostname: String::new(),
+        port: String::new(),
+        pathname: it.url.split_once(':').map_or("", |x| x.1).to_owned(),
+        search: String::new(),
+        hash: String::new(),
+    })
+}
+
+fn loc_host(p: &crate::js::web::Parsed) -> String {
+    if p.port.is_empty() { p.hostname.clone() } else { format!("{}:{}", p.hostname, p.port) }
+}
+
+fn loc_origin(p: &crate::js::web::Parsed) -> String {
+    if p.hostname.is_empty() { "null".into() } else { format!("{}//{}", p.protocol, loc_host(p)) }
+}
+
+fn loc_href_of(p: &crate::js::web::Parsed) -> String {
+    let auth = if p.hostname.is_empty() && p.protocol != "file:" { String::new() } else { format!("//{}", loc_host(p)) };
+    format!("{}{}{}{}{}", p.protocol, auth, p.pathname, p.search, p.hash)
+}
+
+/// Go to `url` from script: a fragment-only change stays in the document.
+fn loc_navigate(it: &mut Interp, url: String) {
+    let strip = |u: &str| u.split('#').next().unwrap_or("").to_owned();
+    if url.contains('#') && strip(&url) == strip(&it.url) {
+        if url != it.url {
+            let old = std::mem::replace(&mut it.url, url.clone());
+            it.hist.truncate(it.hist_pos + 1);
+            it.hist.push((url.clone(), Value::Null));
+            let prev_pos = it.hist_pos;
+            it.hist_pos = it.hist.len() - 1;
+            it.url_events.push(crate::js::UrlEvent { push: true, prev_pos, prev_url: old.clone() });
+            fire_hashchange(it, &old, &url);
+        }
+        return;
+    }
+    it.nav = Some(crate::forms::Nav { url, post: None });
+}
+
+macro_rules! loc_props {
+    ($($name:literal: $get:ident = $g:expr, $set:ident = $s:expr;)*) => {
+        $(
+            fn $get(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+                let p = loc_parts(it);
+                let f: fn(&Interp, &crate::js::web::Parsed) -> String = $g;
+                Ok(Value::str(&f(it, &p)))
+            }
+            fn $set(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+                let v = it.to_str(&arg(a, 0))?.to_string();
+                let mut p = loc_parts(it);
+                let f: fn(&Interp, &mut crate::js::web::Parsed, String) -> Option<String> = $s;
+                if let Some(url) = f(it, &mut p, v) {
+                    loc_navigate(it, url);
+                }
+                Ok(Value::Undef)
+            }
+        )*
+        const LOCATION_PROPS: &[(&str, NativeFn, NativeFn)] = &[$(($name, $get as NativeFn, $set as NativeFn)),*];
+    };
+}
+
+loc_props! {
+    "href": loc_get_href = |it, _| it.url.clone(), loc_set_href = |it, _, v| Some(crate::net::resolve(&it.url, &v));
+    "protocol": loc_get_protocol = |_, p| p.protocol.clone(), loc_set_protocol = |_, p, v| { p.protocol = format!("{}:", v.trim_end_matches(':')); Some(loc_href_of(p)) };
+    "host": loc_get_host = |_, p| loc_host(p), loc_set_host = |_, p, v| { let (h, port) = v.split_once(':').unwrap_or((&v, "")); p.hostname = h.into(); p.port = port.into(); Some(loc_href_of(p)) };
+    "hostname": loc_get_hostname = |_, p| p.hostname.clone(), loc_set_hostname = |_, p, v| { p.hostname = v; Some(loc_href_of(p)) };
+    "port": loc_get_port = |_, p| p.port.clone(), loc_set_port = |_, p, v| { p.port = v; Some(loc_href_of(p)) };
+    "pathname": loc_get_pathname = |_, p| p.pathname.clone(), loc_set_pathname = |_, p, v| { p.pathname = if v.starts_with('/') { v } else { format!("/{v}") }; p.hash.clear(); Some(loc_href_of(p)) };
+    "search": loc_get_search = |_, p| if p.search == "?" { String::new() } else { p.search.clone() }, loc_set_search = |_, p, v| { let v = v.trim_start_matches('?'); p.search = if v.is_empty() { String::new() } else { format!("?{v}") }; p.hash.clear(); Some(loc_href_of(p)) };
+    "hash": loc_get_hash = |_, p| if p.hash == "#" { String::new() } else { p.hash.clone() }, loc_set_hash = |_, p, v| { p.hash = format!("#{}", v.trim_start_matches('#')); Some(loc_href_of(p)) };
+    "origin": loc_get_origin = |_, p| loc_origin(p), loc_set_origin = |_, _, _| None;
+}
+
+fn loc_reload(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    it.nav = Some(crate::forms::Nav { url: it.url.clone(), post: None });
+    Ok(Value::Undef)
+}
+
+fn loc_assign(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let u = it.to_str(&arg(a, 0))?;
+    let url = crate::net::resolve(&it.url, &u);
+    loc_navigate(it, url);
     Ok(Value::Undef)
 }
 
@@ -1371,6 +1566,22 @@ pub fn install(it: &mut Interp) {
     ] {
         ctor(it, n, w_unsupported_ctor, Some(np.clone()));
     }
+    // Node type and document-position constants.
+    let consts = [
+        ("ELEMENT_NODE", 1.0), ("ATTRIBUTE_NODE", 2.0), ("TEXT_NODE", 3.0), ("CDATA_SECTION_NODE", 4.0),
+        ("PROCESSING_INSTRUCTION_NODE", 7.0), ("COMMENT_NODE", 8.0), ("DOCUMENT_NODE", 9.0),
+        ("DOCUMENT_TYPE_NODE", 10.0), ("DOCUMENT_FRAGMENT_NODE", 11.0),
+        ("DOCUMENT_POSITION_DISCONNECTED", 1.0), ("DOCUMENT_POSITION_PRECEDING", 2.0), ("DOCUMENT_POSITION_FOLLOWING", 4.0),
+        ("DOCUMENT_POSITION_CONTAINS", 8.0), ("DOCUMENT_POSITION_CONTAINED_BY", 16.0),
+    ];
+    let node_ctor = it.get(&Value::Obj(g.clone()), "Node").unwrap_or_default();
+    for (name, v) in consts {
+        Interp::set_hidden(&np, name, Value::Num(v));
+        if let Value::Obj(c) = &node_ctor {
+            Interp::set_hidden(c, name, Value::Num(v));
+        }
+    }
+    Interp::set_hidden(&np, "constructor", node_ctor);
     for n in ["MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"] {
         ctor(it, n, observer_ctor, None);
     }
@@ -1388,37 +1599,14 @@ pub fn install(it: &mut Interp) {
     Interp::set_hidden(&g, "console", Value::Obj(console));
 
     let loc = it.plain();
-    let url = it.url.clone();
-    let (proto, rest) = url.split_once("://").unwrap_or(("about", &url));
-    let (host, path) = match rest.find('/') {
-        Some(p) => (&rest[..p], &rest[p..]),
-        None => (rest, "/"),
-    };
-    let (path_q, hash) = path.split_once('#').map_or((path, String::new()), |(a, b)| (a, format!("#{b}")));
-    let (pathname, search) = path_q.split_once('?').map_or((path_q, String::new()), |(a, b)| (a, format!("?{b}")));
-    for (k, v) in [
-        ("href", url.as_str()),
-        ("protocol", &format!("{proto}:")),
-        ("host", host),
-        ("hostname", host.split(':').next().unwrap_or("")),
-        ("pathname", pathname),
-        ("search", &search),
-        ("hash", &hash),
-        ("origin", &format!("{proto}://{host}")),
-        ("port", ""),
-    ] {
-        Interp::set_prop(&loc, k, Value::str(v));
+    for (name, get, set) in LOCATION_PROPS {
+        let (g, s) = (it.native(*get, name), it.native(*set, name));
+        loc.borrow_mut().props.insert(Rc::from(*name), crate::js::Prop { v: Value::Undef, get: Some(g), set: Some(s), enumerable: true });
     }
-    it.def_method(&loc, "reload", noop);
-    for n in ["assign", "replace"] {
-        it.def_method(&loc, n, |it, _, a| {
-            let u = it.to_str(&arg(a, 0))?;
-            let url = crate::net::resolve(&it.url, &u);
-            it.nav = Some(crate::forms::Nav { url, post: None });
-            Ok(Value::Undef)
-        });
-    }
-    it.def_method(&loc, "toString", |it, t, _| it.get(&t, "href"));
+    it.def_method(&loc, "reload", loc_reload);
+    it.def_method(&loc, "assign", loc_assign);
+    it.def_method(&loc, "replace", loc_assign);
+    it.def_method(&loc, "toString", loc_get_href);
     Interp::set_hidden(&g, "location", Value::Obj(loc));
 
     let nav = it.plain();
@@ -1443,11 +1631,13 @@ pub fn install(it: &mut Interp) {
     }
     let hist = it.plain();
     it.def_method(&hist, "pushState", history_push);
-    it.def_method(&hist, "replaceState", history_push);
-    it.def_method(&hist, "back", noop);
-    it.def_method(&hist, "forward", noop);
-    Interp::set_prop(&hist, "length", Value::Num(1.0));
-    Interp::set_prop(&hist, "state", Value::Null);
+    it.def_method(&hist, "replaceState", history_replace);
+    it.def_method(&hist, "back", history_back);
+    it.def_method(&hist, "forward", history_forward);
+    it.def_method(&hist, "go", history_go);
+    it.def_getter(&hist, "length", history_length);
+    it.def_getter(&hist, "state", history_state);
+    Interp::set_prop(&hist, "scrollRestoration", Value::str("auto"));
     Interp::set_hidden(&g, "history", Value::Obj(hist));
 
     let perf = it.plain();

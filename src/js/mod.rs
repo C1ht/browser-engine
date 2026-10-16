@@ -246,6 +246,14 @@ pub struct GenStart {
     pub fobj: ObjRef,
 }
 
+/// A same-document URL change (`history.pushState` / `replaceState`).
+pub struct UrlEvent {
+    pub push: bool,
+    /// The session history position before the change.
+    pub prev_pos: usize,
+    pub prev_url: String,
+}
+
 /// Maximum JS call depth on the main stack.
 const MAX_DEPTH: u32 = 7000;
 
@@ -360,6 +368,13 @@ pub struct Interp {
     pub depth: u32,
     /// The last member access / call short-circuited an optional chain.
     short: bool,
+    /// Session history of this document: (url, state); see `history`.
+    pub hist: Vec<(String, Value)>,
+    pub hist_pos: usize,
+    /// URL changes made by pushState / replaceState (push?), for the browser.
+    pub url_events: Vec<UrlEvent>,
+    /// history.go(n) requested by a script.
+    pub history_go: Option<i32>,
     /// Generators / async calls whose coroutines are running, innermost last.
     pub co_stack: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
@@ -414,6 +429,10 @@ impl Interp {
             gen_sinks: Vec::new(),
             depth: 0,
             short: false,
+            hist: vec![(url.to_owned(), Value::Null)],
+            hist_pos: 0,
+            url_events: Vec::new(),
+            history_go: None,
             co_stack: Vec::new(),
             nav: None,
             submit_form: None,
@@ -2491,6 +2510,38 @@ mod tests {
                 "2 0 false",
                 "1,9,3 3,4,3,4 1,3",
                 "10,20,30 1,2 function",
+            ]
+        );
+    }
+
+    #[test]
+    fn location_history_and_documents() {
+        let out = run(r#"
+            console.log(location.pathname, location.host, location.origin, location.search === '');
+            addEventListener('hashchange', e => console.log('hash', e.newURL));
+            addEventListener('popstate', e => console.log('pop', JSON.stringify(e.state)));
+            history.pushState({page: 2}, '', '/app/two?x=1');
+            console.log(location.href, location.search, history.length, JSON.stringify(history.state));
+            history.replaceState({page: 3}, '', 'three');
+            console.log(location.pathname, history.length);
+            location.hash = 'sec';
+            console.log(location.hash, history.length);
+            const d = document.implementation.createHTMLDocument('t');
+            const div = d.createElement('div'); d.body.appendChild(div); div.innerHTML = '<b>x</b>';
+            console.log(d.body.innerHTML, d.title === undefined ? 'no title' : 'ok', Node.ELEMENT_NODE, div.nodeType === Node.ELEMENT_NODE);
+            const c = document.createComment('hi');
+            console.log(c.nodeType, c.nodeName, c.data, document.createDocumentFragment().nodeType);
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "/a/b.html example.com https://example.com true",
+                "https://example.com/app/two?x=1 ?x=1 2 {\"page\":2}",
+                "/app/three 2",
+                "hash https://example.com/app/three#sec",
+                "#sec 3",
+                "<div><b>x</b></div> ok 1 true",
+                "8 #comment hi 11",
             ]
         );
     }

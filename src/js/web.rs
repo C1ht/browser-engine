@@ -763,18 +763,18 @@ fn abort_controller_abort(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 
 // -------------------------------------------------------------------- URL
 
-struct Parsed {
-    protocol: String,
-    username: String,
-    password: String,
-    hostname: String,
-    port: String,
-    pathname: String,
-    search: String,
-    hash: String,
+pub(crate) struct Parsed {
+    pub protocol: String,
+    pub username: String,
+    pub password: String,
+    pub hostname: String,
+    pub port: String,
+    pub pathname: String,
+    pub search: String,
+    pub hash: String,
 }
 
-fn parse_url(input: &str) -> Option<Parsed> {
+pub(crate) fn parse_url(input: &str) -> Option<Parsed> {
     let input = input.trim();
     let colon = input.find(':')?;
     let scheme = &input[..colon];
