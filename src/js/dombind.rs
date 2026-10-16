@@ -321,14 +321,14 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "dataset" => Value::Obj(it.new_obj(it.p.object.clone(), Kind::Dataset(id))),
         "ownerDocument" => node_obj(it, 0),
         "isConnected" => Value::Bool(it.doc.contains(0, id)),
-        "value" if !doc_node => {
-            let tag = it.doc.tag(id);
-            if tag == Some(k::textarea) {
-                Value::str(&text_of(it, id))
-            } else {
-                Value::str(it.doc.attr(id, k::value).unwrap_or(""))
-            }
-        }
+        "value" if !doc_node => match it.doc.tag(id) {
+            Some(k::textarea | k::select) => Value::str(&crate::forms::value(&it.doc, id)),
+            _ => Value::str(it.doc.attr(id, k::value).unwrap_or("")),
+        },
+        "form" if !doc_node => match crate::forms::form_of(&it.doc, id) {
+            NONE => Value::Null,
+            f => node_obj(it, f),
+        },
         "checked" | "disabled" | "hidden" | "required" | "readOnly" | "multiple" | "selected" | "open" => Value::Bool(get_attr(it, id, &key.to_ascii_lowercase()).is_some()),
         "href" | "src" | "action" if !doc_node => match get_attr(it, id, key) {
             Some(v) => Value::str(&crate::net::resolve(&it.url, &v)),
@@ -358,7 +358,7 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "compatMode" if doc_node => Value::str(if it.doc.quirks { "BackCompat" } else { "CSS1Compat" }),
         "defaultView" if doc_node => Value::Obj(it.global.clone()),
         "location" if doc_node => it.get(&Value::Obj(it.global.clone()), "location")?,
-        "activeElement" if doc_node => node_obj(it, it.doc.body),
+        "activeElement" if doc_node => node_obj(it, if it.doc.focus != NONE { it.doc.focus } else { it.doc.body }),
         "forms" | "images" | "links" | "scripts" if doc_node => {
             let tag = match key {
                 "forms" => k::form,
@@ -482,15 +482,7 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
         }
         "value" => {
             let val = it.to_str(v)?;
-            if it.doc.tag(id) == Some(k::textarea) {
-                set_text(it, id, &val);
-            } else {
-                it.doc.set_attr(id, k::value, &val);
-                if it.doc.tag(id) == Some(k::input) {
-                    let shown = if val.is_empty() { "\u{a0}".to_owned() } else { val.to_string() };
-                    set_text(it, id, &shown);
-                }
-            }
+            crate::forms::set_value(&mut it.doc, id, &val);
             it.dirty = true;
         }
         "checked" | "disabled" | "hidden" | "required" | "readOnly" | "selected" | "open" => {
@@ -500,6 +492,7 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
             } else {
                 it.doc.remove_attr(id, a);
             }
+            crate::forms::refresh(&mut it.doc, id);
             it.dirty = true;
         }
         "title" if id == 0 => {
@@ -811,6 +804,49 @@ fn n_bounding_rect(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
 fn n_click(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let n = this_node(&t)?;
     dispatch(it, n, "click", |_, _| {});
+    Ok(Value::Undef)
+}
+fn n_focus(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    if it.doc.focus != n && is_elem(it, n) {
+        let old = std::mem::replace(&mut it.doc.focus, n);
+        if old != NONE {
+            dispatch_nobubble(it, old, "blur");
+        }
+        dispatch_nobubble(it, n, "focus");
+        dispatch(it, n, "focusin", |_, _| {});
+        it.dirty = true;
+    }
+    Ok(Value::Undef)
+}
+fn n_blur(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    if it.doc.focus == n {
+        it.doc.focus = NONE;
+        dispatch_nobubble(it, n, "blur");
+        dispatch(it, n, "focusout", |_, _| {});
+        it.dirty = true;
+    }
+    Ok(Value::Undef)
+}
+/// Dispatch an event that doesn't bubble (focus, blur).
+pub fn dispatch_nobubble(it: &mut Interp, target: NodeId, ty: &str) -> bool {
+    dispatch(it, target, ty, |it, e| {
+        let _ = it.put(e, "bubbles", Value::Bool(false));
+    })
+}
+fn n_submit(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    if it.doc.tag(n) == Some(k::form) {
+        it.submit_form = Some(n);
+    }
+    Ok(Value::Undef)
+}
+fn n_request_submit(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    if it.doc.tag(n) == Some(k::form) && !dispatch(it, n, "submit", |_, _| {}) {
+        it.submit_form = Some(n);
+    }
     Ok(Value::Undef)
 }
 fn noop(_: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
@@ -1219,8 +1255,12 @@ pub fn install(it: &mut Interp) {
         ("removeEventListener", remove_listener),
         ("dispatchEvent", dispatch_event_m),
         ("click", n_click),
-        ("focus", noop),
-        ("blur", noop),
+        ("focus", n_focus),
+        ("blur", n_blur),
+        ("submit", n_submit),
+        ("requestSubmit", n_request_submit),
+        ("select", noop),
+        ("setSelectionRange", noop),
         ("scrollIntoView", noop),
         ("scrollTo", noop),
         ("scrollBy", noop),
@@ -1318,8 +1358,14 @@ pub fn install(it: &mut Interp) {
     ] {
         Interp::set_prop(&loc, k, Value::str(v));
     }
-    for n in ["reload", "assign", "replace"] {
-        it.def_method(&loc, n, noop);
+    it.def_method(&loc, "reload", noop);
+    for n in ["assign", "replace"] {
+        it.def_method(&loc, n, |it, _, a| {
+            let u = it.to_str(&arg(a, 0))?;
+            let url = crate::net::resolve(&it.url, &u);
+            it.nav = Some(crate::forms::Nav { url, post: None });
+            Ok(Value::Undef)
+        });
     }
     it.def_method(&loc, "toString", |it, t, _| it.get(&t, "href"));
     Interp::set_hidden(&g, "location", Value::Obj(loc));

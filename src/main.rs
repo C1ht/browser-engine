@@ -14,6 +14,7 @@ mod css;
 mod dom;
 mod engine;
 mod fonts;
+mod forms;
 mod fx;
 mod html;
 mod image;
@@ -25,7 +26,7 @@ mod paint;
 mod png;
 mod style;
 
-use engine::{ms, Page};
+use engine::{ms, Click, Edit, Nav, Page};
 use fonts::{fonts, GlyphCache};
 use minifb::{CursorStyle, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use std::cell::RefCell;
@@ -44,10 +45,12 @@ struct Args {
     width: usize,
     height: usize,
     iters: usize,
+    /// Screenshot mode: focus the first text field and type this.
+    typed: Option<String>,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { url: "about:home".into(), bench: false, js: None, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30 };
+    let mut a = Args { url: "about:home".into(), bench: false, js: None, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30, typed: None };
     let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -58,6 +61,7 @@ fn parse_args() -> Args {
             "--shot" => a.shot = it.next(),
             "--width" => a.width = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.width),
             "--height" => a.height = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
+            "--type" => a.typed = it.next(),
             "--iters" => a.iters = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.iters),
             _ => a.url = net::normalize_input(&s),
         }
@@ -228,14 +232,41 @@ fn screenshot(a: &Args, out: &str) {
     page.load_images_blocking(w as f32, vh);
     eprintln!("[bolt] fetch {fetch_ms:.0}ms | page {page_ms:.0}ms (scripts {:.0}ms) | fonts {fonts_ms:.0}ms | images {:.0}ms", page.script_ms, ms(t_imgs));
     let h = if a.height == 0 { (page.tree.height.ceil() as usize).clamp(1, 16000) } else { a.height };
+    if let Some(text) = &a.typed {
+        let field = page.doc.preorder().into_iter().find(|&n| page.is_text_field_at(n) && page.doc.elem(n).is_some());
+        if let Some(f) = field {
+            page.set_focus(f);
+            page.key(Edit::Insert(text.clone()));
+        }
+    }
     let mut buf = vec![0u32; w * h];
     let mut glyphs = GlyphCache::default();
     let t0 = Instant::now();
     paint::paint(&page.dl, &page.tree.text, &mut glyphs, &mut buf, w, h, 0.0);
+    paint_focus(&page, &mut buf, w, h, 0.0, true);
     let mut t = page.t;
     t.paint = ms(t0);
     std::fs::write(out, png::encode(&buf, w, h)).expect("write png");
     println!("{} -> {out} ({w}x{h})\n{}", page.url, t.summary());
+}
+
+/// Draw the focus ring and caret of the focused form field.
+fn paint_focus(p: &Page, buf: &mut [u32], w: usize, h: usize, scroll: f32, caret: bool) {
+    let Some(n) = p.focused() else { return };
+    if let Some(r) = p.tree.node_rects().get(&n).copied() {
+        let mut s = paint::Surface::new(buf, w, h, 0.0, 0.0);
+        let (x, y, rw, rh) = (r[0] - 1.0, r[1] - scroll - 1.0, r[2] + 2.0, r[3] + 2.0);
+        let c = 0xFF10_5CD8;
+        s.rect(x, y, rw, 2.0, c);
+        s.rect(x, y + rh - 2.0, rw, 2.0, c);
+        s.rect(x, y, 2.0, rh, c);
+        s.rect(x + rw - 2.0, y, 2.0, rh, c);
+    }
+    if caret {
+        if let Some(c) = p.caret_rect() {
+            paint::Surface::new(buf, w, h, 0.0, 0.0).rect(c[0], c[1] - scroll, c[2], c[3], 0xFF00_0000);
+        }
+    }
 }
 
 // --------------------------------------------------------------- browser
@@ -271,6 +302,10 @@ struct Browser {
     img_tx: std::sync::mpsc::Sender<(u64, String, Option<std::sync::Arc<image::Image>>)>,
     generation: u64,
     loaded_at: Instant,
+    /// Caret blink phase start, and whether the caret is drawn.
+    blink: Instant,
+    caret_on: bool,
+    last_mouse: Option<(f32, f32)>,
 }
 
 impl Browser {
@@ -307,6 +342,9 @@ impl Browser {
             img_tx,
             generation: 0,
             loaded_at: Instant::now(),
+            blink: Instant::now(),
+            caret_on: false,
+            last_mouse: None,
         };
         b.navigate(url, true);
         b.event_loop();
@@ -317,9 +355,13 @@ impl Browser {
     }
 
     fn navigate(&mut self, url: &str, push_history: bool) {
-        let url = url.to_owned();
+        self.navigate_to(Nav { url: url.to_owned(), post: None }, push_history);
+    }
+
+    fn navigate_to(&mut self, nav: Nav, push_history: bool) {
+        let Nav { url, post } = nav;
         // Same-document fragment navigation.
-        if let (Some(p), Some(hash)) = (&self.page, url.find('#')) {
+        if let (Some(p), Some(hash), None) = (&self.page, url.find('#'), &post) {
             let cur = p.url.split('#').next().unwrap_or("");
             if &url[..hash] == cur {
                 let frag = &url[hash + 1..];
@@ -340,7 +382,7 @@ impl Browser {
         self.draw_chrome(true);
         let _ = self.window.update_with_buffer(&self.buf, self.w, self.h);
 
-        match engine::load(&url) {
+        match engine::load_req(&url, post.as_deref()) {
             Ok(l) => {
                 let page = Page::new(l, self.w as f32, self.vh() as f32);
                 self.url_input = page.url.clone();
@@ -362,6 +404,10 @@ impl Browser {
             let title = if p.title().is_empty() { p.url.as_str() } else { p.title() };
             self.window.set_title(&format!("{title} — bolt"));
             eprintln!("[bolt] {}\n        fetch {:.1}ms | scripts {:.1}ms | {}", p.url, p.t.fetch, p.script_ms, p.t.summary());
+        }
+        // A script redirect at load (location.href = ...).
+        if let Some(n) = self.page.as_mut().and_then(|p| p.take_nav()) {
+            self.navigate_to(n, false);
         }
     }
 
@@ -456,6 +502,7 @@ impl Browser {
         let t0 = Instant::now();
         if let Some(p) = &self.page {
             paint::paint(&p.dl, &p.tree.text, &mut self.glyphs, &mut self.buf[BAR * w..], w, vh, self.scroll.round());
+            paint_focus(p, &mut self.buf[BAR * w..], w, vh, self.scroll.round(), self.caret_on);
         } else {
             self.buf[BAR * w..].fill(0xFFFF_FFFF);
             if let Some(e) = self.error.clone() {
@@ -552,6 +599,15 @@ impl Browser {
             if self.page.as_mut().is_some_and(|p| p.tick(now)) {
                 dirty = true;
             }
+            if let Some(n) = self.page.as_mut().and_then(|p| p.take_nav()) {
+                self.navigate_to(n, true);
+                continue;
+            }
+            let caret_on = self.page.as_ref().is_some_and(|p| p.focused().is_some()) && (self.blink.elapsed().as_millis() / 530) % 2 == 0;
+            if caret_on != self.caret_on {
+                self.caret_on = caret_on;
+                dirty = true;
+            }
             let (w, h) = self.window.get_size();
             if (w, h) != (self.w, self.h) && w > 0 && h > BAR {
                 let width_changed = w != self.w;
@@ -571,7 +627,53 @@ impl Browser {
             let alt = self.window.is_key_down(Key::LeftAlt) || self.window.is_key_down(Key::RightAlt);
             let typed: Vec<u32> = std::mem::take(&mut *self.chars.borrow_mut());
 
-            if self.editing {
+            let field_focused = !self.editing && self.page.as_ref().is_some_and(|p| p.focused().is_some());
+            if field_focused {
+                let mut edits: Vec<Edit> = Vec::new();
+                let text: String = typed.iter().filter_map(|&c| char::from_u32(c)).filter(|c| !c.is_control()).collect();
+                if !text.is_empty() && !ctrl {
+                    edits.push(Edit::Insert(text));
+                }
+                for k in self.window.get_keys_pressed(KeyRepeat::Yes) {
+                    edits.push(match k {
+                        Key::Backspace if ctrl => Edit::BackspaceWord,
+                        Key::Backspace => Edit::Backspace,
+                        Key::Delete => Edit::Delete,
+                        Key::Left => Edit::Left,
+                        Key::Right => Edit::Right,
+                        Key::Home => Edit::Home,
+                        Key::End => Edit::End,
+                        Key::Enter | Key::NumPadEnter => Edit::Enter,
+                        Key::Tab => Edit::Tab,
+                        Key::Escape => Edit::Escape,
+                        Key::V if ctrl => match clipboard() {
+                            Some(t) => Edit::Insert(t),
+                            None => continue,
+                        },
+                        _ => continue,
+                    });
+                }
+                if (ctrl && self.window.is_key_pressed(Key::L, KeyRepeat::No)) || self.window.is_key_pressed(Key::F6, KeyRepeat::No) {
+                    if let Some(p) = &mut self.page {
+                        p.set_focus(dom::NONE);
+                    }
+                    self.editing = true;
+                    self.select_all = true;
+                    dirty = true;
+                }
+                let mut nav = None;
+                for e in edits {
+                    if let Some(p) = &mut self.page {
+                        nav = p.key(e).or(nav);
+                    }
+                    self.blink = Instant::now();
+                    dirty = true;
+                }
+                if let Some(n) = nav {
+                    self.navigate_to(n, true);
+                    continue;
+                }
+            } else if self.editing {
                 for c in typed {
                     if let Some(ch) = char::from_u32(c) {
                         if !ch.is_control() {
@@ -669,8 +771,24 @@ impl Browser {
                     }
                 }
             }
+            if hover != self.hover || mouse != self.last_mouse {
+                let over_field = match (mouse, &self.page) {
+                    (Some((mx, my)), Some(p)) if hover.is_none() && my as usize >= BAR => {
+                        p.tree.node_at(mx, my - BAR as f32 + self.scroll.round()).is_some_and(|n| p.is_text_field_at(n))
+                    }
+                    _ => false,
+                };
+                let cursor = if hover.is_some() {
+                    CursorStyle::ClosedHand
+                } else if over_field {
+                    CursorStyle::Ibeam
+                } else {
+                    CursorStyle::Arrow
+                };
+                self.window.set_cursor_style(cursor);
+                self.last_mouse = mouse;
+            }
             if hover != self.hover {
-                self.window.set_cursor_style(if hover.is_some() { CursorStyle::ClosedHand } else { CursorStyle::Arrow });
                 self.hover = hover.clone();
                 dirty = true;
             }
@@ -687,8 +805,13 @@ impl Browser {
                     } else {
                         // Scripts see the click first; preventDefault() stops navigation.
                         let py = my - BAR as f32 + self.scroll.round();
-                        let prevented = self.page.as_mut().is_some_and(|p| p.click(mx, py));
-                        if prevented {
+                        let result = self.page.as_mut().map_or(Click::Default, |p| p.click(mx, py));
+                        self.blink = Instant::now();
+                        if let Click::Navigate(n) = result {
+                            self.hover = None;
+                            self.navigate_to(n, true);
+                            continue;
+                        } else if result == Click::Handled {
                             dirty = true;
                         } else if let Some(target) = hover {
                             self.hover = None;
@@ -715,4 +838,18 @@ impl Browser {
             }
         }
     }
+}
+
+/// Text on the system clipboard (for Ctrl+V into form fields).
+fn clipboard() -> Option<String> {
+    let out = if cfg!(windows) {
+        std::process::Command::new("powershell").args(["-NoProfile", "-Command", "Get-Clipboard -Raw"]).output()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("pbpaste").output()
+    } else {
+        std::process::Command::new("xclip").args(["-o", "-selection", "clipboard"]).output()
+    }
+    .ok()?;
+    let t = String::from_utf8_lossy(&out.stdout).trim_end_matches(['\r', '\n']).replace("\r\n", "\n");
+    (!t.is_empty()).then_some(t)
 }

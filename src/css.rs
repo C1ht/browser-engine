@@ -286,6 +286,11 @@ pub enum Pseudo {
     Link,
     Root,
     Empty,
+    Focus,
+    FocusWithin,
+    Checked,
+    Disabled,
+    PlaceholderShown,
     Not(Vec<Compound>),
     Is(Vec<Compound>),
     Never,
@@ -2696,6 +2701,11 @@ fn parse_compound(s: &str, mut i: usize) -> Option<(Compound, usize)> {
                         "link" | "any-link" => Pseudo::Link,
                         "root" => Pseudo::Root,
                         "empty" => Pseudo::Empty,
+                        "focus" | "focus-visible" => Pseudo::Focus,
+                        "focus-within" => Pseudo::FocusWithin,
+                        "checked" => Pseudo::Checked,
+                        "disabled" => Pseudo::Disabled,
+                        "placeholder-shown" => Pseudo::PlaceholderShown,
                         "not" => parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Not),
                         "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => {
                             parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Is)

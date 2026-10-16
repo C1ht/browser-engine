@@ -49,6 +49,8 @@ pub struct Document {
     pub scripts: Vec<NodeId>,
     /// No <!doctype html>: render in quirks mode.
     pub quirks: bool,
+    /// The focused element (for `:focus`), or NONE.
+    pub focus: NodeId,
 }
 
 impl Document {
@@ -70,6 +72,7 @@ impl Document {
             body: NONE,
             scripts: Vec::new(),
             quirks: true,
+            focus: NONE,
         }
     }
 
@@ -117,8 +120,8 @@ impl Document {
 
     #[inline]
     pub fn elem(&self, id: NodeId) -> Option<&Element> {
-        match &self.nodes[id as usize].data {
-            Data::Element(e) => Some(e),
+        match self.nodes.get(id as usize).map(|n| &n.data) {
+            Some(Data::Element(e)) => Some(e),
             _ => None,
         }
     }

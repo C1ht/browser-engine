@@ -302,7 +302,7 @@ impl Parser {
             }
             el.classes = classes;
         }
-        let synth = if tag == k::input { input_text(&el) } else { None };
+        let synth = if tag == k::input { crate::forms::input_text(&el) } else { None };
         let id = self.doc.add(Data::Element(el));
         let parent = self.cur();
         self.doc.append(parent, id);
@@ -450,23 +450,6 @@ fn is_print_only(media: Option<&str>) -> bool {
         }
         None => false,
     }
-}
-
-/// Text shown inside an <input>.
-fn input_text(el: &Element) -> Option<String> {
-    let ty = el.attr(k::type_).unwrap_or("text").to_ascii_lowercase();
-    let value = el.attr(k::value).filter(|v| !v.is_empty());
-    let t = match ty.as_str() {
-        "hidden" | "checkbox" | "radio" | "file" | "range" | "color" => return None,
-        "submit" => value.unwrap_or("Submit").to_owned(),
-        "reset" => value.unwrap_or("Reset").to_owned(),
-        "button" => value.unwrap_or("").to_owned(),
-        "image" => el.attr(k::alt).unwrap_or("").to_owned(),
-        "password" => "\u{2022}".repeat(value.map_or(0, |v| v.chars().count())),
-        _ => value.or(el.attr(k::placeholder)).unwrap_or("").to_owned(),
-    };
-    // A non-breaking space keeps empty fields one line tall.
-    Some(if t.is_empty() { "\u{a0}".to_owned() } else { t })
 }
 
 /// Returns (content_end, index_after_close_tag).

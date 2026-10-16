@@ -308,6 +308,10 @@ pub struct Interp {
     pub deadline: Option<std::time::Instant>,
     /// Values yielded by the generators currently running.
     gen_sinks: Vec<Vec<Value>>,
+    /// Navigation requested by a script (`location.assign`, `form.submit()`).
+    pub nav: Option<crate::forms::Nav>,
+    /// A form a script submitted, to be serialized by the page.
+    pub submit_form: Option<NodeId>,
 }
 
 pub const WINDOW: u32 = u32::MAX - 1;
@@ -350,6 +354,8 @@ impl Interp {
             label: None,
             deadline: None,
             gen_sinks: Vec::new(),
+            nav: None,
+            submit_form: None,
         };
         builtins::install(&mut it);
         dombind::install(&mut it);

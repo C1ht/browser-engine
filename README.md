@@ -17,7 +17,7 @@ bolt about:js                          # JavaScript demo (counter, to-dos, timer
 bolt about:stress                      # 1 MB synthetic page with ~45k nodes
 
 bolt --bench about:stress --iters 30   # time each pipeline phase (median / min)
-bolt --shot out.png <url> [--width 1024] [--height 0 = full page]
+bolt --shot out.png <url> [--width 1024] [--height 0 = full page] [--type "text" = type into the first text field]
 bolt --js script.js                    # run a JavaScript file in the interpreter
 bolt --dump <url>                      # print the DOM tree
 bolt --boxes <url>                     # print the layout box tree
@@ -33,6 +33,8 @@ Keys in the window:
 | `Alt+→` | Forward |
 | `F5` | Reload |
 | `F12` | Print timings |
+| `Tab` / `Esc` (in a form field) | Next field / leave the field |
+| `Ctrl+V` / `Ctrl+Backspace` (in a form field) | Paste / delete a word |
 
 ## Pipeline
 
@@ -61,7 +63,7 @@ On real sites, total load time is dominated by the network, not the engine.
 ## Supported
 
 - **HTML:** implicit `html`/`head`/`body`, auto-closing tags, raw-text elements, character references and quirks mode.
-- **Selectors:** type, class, id, attribute selectors, all combinators, `:nth-child()`, `:not()`, `:is()`, `:where()`, `:first-of-type` and more.
+- **Selectors:** type, class, id, attribute selectors, all combinators, `:nth-child()`, `:not()`, `:is()`, `:where()`, `:first-of-type`, `:focus`, `:checked`, `:placeholder-shown`, `:disabled` and more.
 - **Cascade:**
   - Specificity, `!important` and presentational attributes.
   - `@media`, `@supports`, `@font-face`.
@@ -81,13 +83,15 @@ On real sites, total load time is dominated by the network, not the engine.
   - ES2015+ syntax: classes with private names, destructuring, spread, arrow functions, template literals, optional chaining, `async` / `await`, generators and async generators.
   - Built-ins: Promises, Map / Set, JSON, RegExp, Date.
   - DOM: `querySelector`, `innerHTML`, `classList`, `style`, events with bubbling, timers.
-- **Browser:** links, back / forward history, `#fragment` scrolling, address bar, resizing, clicks dispatched to scripts.
+- **Forms:** typing into inputs and textareas with a caret, checkboxes, radio buttons, labels, `<select>` (a click cycles through the options), and GET / POST submission, including Enter in a field. Scripts see `keydown`, `input`, `change`, `focus`, `blur` and `submit` events, and can call `focus()`, `form.submit()` and `requestSubmit()`.
+- **Browser:** links, back / forward history, `#fragment` scrolling, address bar (plain words search DuckDuckGo), resizing, clicks dispatched to scripts, script navigation via `location`, and cookies kept between runs.
 
 ## Not supported (yet)
 
 - SVG / WebP images. A text run uses one font face, so `unicode-range` subsets other than Latin are skipped.
-- ES modules, `fetch` / XHR and form text editing. Generators run their body eagerly on the first `next()`, so an infinite generator stops after 100,000 values.
+- ES modules and `fetch` / XHR; text selection and drop-down menus for `<select>`. Generators run their body eagerly on the first `next()`, so an infinite generator stops after 100,000 values.
 - Transforms, filters, animations / transitions and right-to-left text.
+- Google search results: Google only serves them after a JavaScript anti-bot challenge that bolt can't pass yet. Forms on Google (search box, cookie consent) work.
 
 ## Tests
 

@@ -1122,7 +1122,13 @@ button, input, select, textarea { display: inline-block; font-size: 13.333px; fo
 button, input[type=submit], input[type=button], input[type=reset] { background-color: #efefef; padding: 1px 6px; text-align: center }
 input { width: 150px; overflow: hidden }
 input[type=submit], input[type=button], input[type=reset], input[type=image] { width: auto }
-input[type=checkbox], input[type=radio] { width: 13px; height: 13px; padding: 0; margin: 3px 3px 0 4px }
+input[type=checkbox], input[type=radio] { width: 13px; height: 13px; padding: 0; margin: 3px 3px 0 4px;
+  box-sizing: border-box; border-radius: 2px; font-size: 11px; line-height: 11px; text-align: center; color: white }
+input[type=radio] { border-radius: 50% }
+input[type=checkbox]:checked { background-color: #0075ff; border-color: #0075ff }
+input[type=radio]:checked { border-color: #0075ff; background-image: radial-gradient(circle, #0075ff 40%, white 50%) }
+input:placeholder-shown, textarea:placeholder-shown { color: #757575 !important }
+input:disabled, button:disabled, select:disabled, textarea:disabled { color: #6d6d6d; border-color: #c6c6c6 }
 textarea { width: 180px; height: 36px; white-space: pre-wrap; font-family: monospace }
 select { padding: 1px 2px }
 fieldset { margin: 0 2px; border: 2px solid #c0c0c0; padding: .35em .75em .625em }
@@ -1311,6 +1317,15 @@ fn match_compound(c: &Compound, doc: &Document, id: NodeId) -> bool {
                 Data::Text(t) => t.is_empty(),
                 _ => false,
             }),
+            Pseudo::Focus => doc.focus == id,
+            Pseudo::FocusWithin => doc.focus != NONE && doc.contains(id, doc.focus),
+            Pseudo::Checked => match el.tag {
+                k::input => el.attr(k::checked).is_some(),
+                k::option => el.attr(k::selected).is_some(),
+                _ => false,
+            },
+            Pseudo::Disabled => matches!(el.tag, k::input | k::button | k::select | k::textarea | k::option | k::fieldset) && el.attr(k::disabled).is_some(),
+            Pseudo::PlaceholderShown => crate::forms::placeholder_shown(doc, id),
             Pseudo::Not(list) => !list.iter().any(|c| match_compound(c, doc, id)),
             Pseudo::Is(list) => list.iter().any(|c| match_compound(c, doc, id)),
             Pseudo::Never => false,

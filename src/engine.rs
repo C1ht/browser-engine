@@ -3,7 +3,9 @@
 
 use crate::atom::k;
 use crate::css::{self, Media};
-use crate::dom::{Data, Document, NodeId};
+use crate::dom::{Data, Document, NodeId, NONE};
+use crate::forms::{self, Activation};
+pub use crate::forms::Nav;
 use crate::fx::FxHashMap;
 use crate::image::{self, Image};
 use crate::layout::{self, LayoutTree};
@@ -82,6 +84,11 @@ fn base_of(doc: &Document, url: &str) -> String {
 
 /// Fetch a document and its stylesheets (in parallel).
 pub fn load(url: &str) -> Result<Loaded, String> {
+    load_req(url, None)
+}
+
+/// Like `load`, POSTing `post` as the request body if given.
+pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
     let t = Instant::now();
     let (url, html) = match url {
         "about:home" | "about:" => (url.to_owned(), HOME.to_owned()),
@@ -90,7 +97,7 @@ pub fn load(url: &str) -> Result<Loaded, String> {
         "about:js" => (url.to_owned(), JS_DEMO.to_owned()),
         "about:stress" => (url.to_owned(), stress_page()),
         _ => {
-            let (u, bytes) = net::fetch(url)?;
+            let (u, bytes) = net::request(url, post)?;
             (u, net::decode(&bytes))
         }
     };
@@ -255,8 +262,42 @@ pub struct Page {
     pub script_ms: f64,
     /// Number of relayouts (used to tell whether a tick changed the page).
     pub layouts: u64,
+    /// Caret position (in chars) within the focused text field.
+    pub caret: usize,
+    /// A navigation the page asked for (form submission or script).
+    pub nav: Option<Nav>,
+    /// The focused field's value when it gained focus (for `change` events).
+    focus_value: String,
     vw: f32,
     vh: f32,
+}
+
+/// An editing key sent to the focused text field.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Edit {
+    Insert(String),
+    Backspace,
+    /// Ctrl+Backspace: delete the previous word.
+    BackspaceWord,
+    Delete,
+    Left,
+    Right,
+    Home,
+    End,
+    Enter,
+    Tab,
+    Escape,
+}
+
+/// What a click on the page did.
+#[derive(Debug, PartialEq)]
+pub enum Click {
+    /// Nothing special: follow a link under the pointer, if any.
+    Default,
+    /// The page handled it (a script, a form control).
+    Handled,
+    /// The page wants to navigate (form submission, script).
+    Navigate(Nav),
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -288,8 +329,9 @@ impl Page {
         let mut res = Resources::default();
         Self::collect_img_src(&doc, &base, &mut res);
         let (styles, tree, dl) = render(&doc, &l.sheets, &base, &res, vw, vh, &mut t);
-        let mut page = Page { url: l.url, base, doc, sheets: l.sheets, styles, tree, dl, res, js, t, script_ms, layouts: 0, vw, vh };
+        let mut page = Page { url: l.url, base, doc, sheets: l.sheets, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), vw, vh };
         page.sync_js_geometry();
+        page.script_requests();
         page
     }
 
@@ -322,29 +364,391 @@ impl Page {
         it.doc = std::mem::take(&mut self.doc);
         // Event handlers and timers get a short leash.
         it.deadline = Some(Instant::now() + std::time::Duration::from_millis(500));
+        let focus_before = it.doc.focus;
         let r = f(it);
         let t0 = Instant::now();
         run_pending(it, &t0);
         self.doc = std::mem::take(&mut it.doc);
+        if self.doc.focus != focus_before {
+            // A script moved focus (el.focus()).
+            self.caret = forms::value(&self.doc, self.doc.focus).chars().count();
+            self.focus_value = forms::value(&self.doc, self.doc.focus);
+        }
         if std::mem::take(&mut it.dirty) {
             Self::collect_img_src(&self.doc, &self.base, &mut self.res);
             self.relayout(self.vw, self.vh);
         }
+        self.script_requests();
         Some(r)
     }
 
-    /// Dispatch a click on the element at a page point. Returns true if a
-    /// handler called preventDefault() (so links shouldn't navigate).
-    pub fn click(&mut self, x: f32, y: f32) -> bool {
-        let Some(node) = self.tree.node_at(x, y) else { return false };
-        self.with_js(|it| {
-            js::dombind::dispatch(it, node, "click", |it, e| {
-                let _ = it.put(e, "clientX", js::Value::Num(x as f64));
-                let _ = it.put(e, "clientY", js::Value::Num(y as f64));
-                let _ = it.put(e, "button", js::Value::Num(0.0));
+    /// The DOM was changed outside scripts: run `f` (event dispatch), then
+    /// restyle and relayout once.
+    fn changed_then_js(&mut self, f: impl FnOnce(&mut js::Interp)) {
+        if let Some(it) = &mut self.js {
+            it.dirty = true;
+        }
+        if self.with_js(f).is_none() {
+            self.relayout(self.vw, self.vh);
+        }
+    }
+
+    /// Collect navigations scripts asked for: `location.assign()`, setting
+    /// `location.href`, `form.submit()`.
+    fn script_requests(&mut self) {
+        let Some(it) = &mut self.js else { return };
+        if let Some(n) = it.nav.take() {
+            self.nav = Some(n);
+        }
+        if let Some(form) = it.submit_form.take() {
+            self.nav = forms::submission(&self.doc, form, NONE, &self.base).or(self.nav.take());
+        }
+        let global = js::Value::Obj(it.global.clone());
+        if let Ok(js::Value::Obj(loc)) = it.get(&global, "location") {
+            let lv = js::Value::Obj(loc.clone());
+            if let Ok(href) = it.get(&lv, "href").and_then(|h| it.to_str(&h)) {
+                if *href != *it.url {
+                    let url = net::resolve(&it.url, &href);
+                    js::Interp::set_prop(&loc, "href", js::Value::str(&it.url));
+                    self.nav = Some(Nav { url, post: None });
+                }
+            }
+        }
+    }
+
+    /// Take a pending navigation request.
+    pub fn take_nav(&mut self) -> Option<Nav> {
+        self.nav.take()
+    }
+
+    /// Is the node (or the control it belongs to) a text field?
+    pub fn is_text_field_at(&self, n: NodeId) -> bool {
+        forms::control_for(&self.doc, n).is_some_and(|c| forms::is_text_field(&self.doc, c))
+    }
+
+    /// The focused element, if any.
+    pub fn focused(&self) -> Option<NodeId> {
+        (self.doc.focus != NONE).then_some(self.doc.focus)
+    }
+
+    /// Move focus (NONE = blur), firing blur/change/focus events.
+    pub fn set_focus(&mut self, n: NodeId) {
+        let old = self.doc.focus;
+        if old == n {
+            return;
+        }
+        let changed = old != NONE && forms::value(&self.doc, old) != self.focus_value;
+        self.doc.focus = n;
+        self.caret = forms::value(&self.doc, n).chars().count();
+        self.focus_value = forms::value(&self.doc, n);
+        self.changed_then_js(|it| {
+            if old != NONE {
+                if changed {
+                    js::dombind::dispatch(it, old, "change", |_, _| {});
+                }
+                js::dombind::dispatch_nobubble(it, old, "blur");
+                js::dombind::dispatch(it, old, "focusout", |_, _| {});
+            }
+            if n != NONE {
+                js::dombind::dispatch_nobubble(it, n, "focus");
+                js::dombind::dispatch(it, n, "focusin", |_, _| {});
+            }
+        });
+    }
+
+    /// Dispatch a click on the element at a page point and run its default
+    /// action (focus a field, toggle a checkbox, submit a form).
+    pub fn click(&mut self, x: f32, y: f32) -> Click {
+        let Some(node) = self.tree.node_at(x, y) else {
+            self.set_focus(NONE);
+            return Click::Default;
+        };
+        // Checkboxes and radios toggle before handlers run (and revert if
+        // the click is cancelled), so handlers see the new state.
+        let control = forms::control_for(&self.doc, node);
+        let checkable = control.filter(|&c| forms::is_checkable(&self.doc, c));
+        let snapshot = checkable.map(|_| forms::checked_snapshot(&self.doc));
+        let early = checkable.map(|c| forms::activate_control(&mut self.doc, c));
+        if early.is_some() {
+            if let Some(it) = &mut self.js {
+                it.dirty = true;
+            }
+        }
+        let prevented = self
+            .with_js(|it| {
+                js::dombind::dispatch(it, node, "click", |it, e| {
+                    let _ = it.put(e, "clientX", js::Value::Num(x as f64));
+                    let _ = it.put(e, "clientY", js::Value::Num(y as f64));
+                    let _ = it.put(e, "button", js::Value::Num(0.0));
+                })
             })
-        })
-        .unwrap_or(false)
+            .unwrap_or(false);
+        if let Some(n) = self.take_nav() {
+            return Click::Navigate(n);
+        }
+        if prevented {
+            if let Some(s) = snapshot {
+                forms::restore_checked(&mut self.doc, &s);
+                self.relayout(self.vw, self.vh);
+            }
+            return Click::Handled;
+        }
+        let act = match early {
+            Some(a) => a,
+            None => control.map_or(Activation::None, |c| forms::activate_control(&mut self.doc, c)),
+        };
+        match act {
+            Activation::Focus(n) => {
+                self.set_focus(n);
+                self.caret = self.caret_at(x, y);
+                Click::Handled
+            }
+            Activation::Toggled(n) => {
+                self.set_focus(NONE);
+                self.changed_then_js(|it| {
+                    js::dombind::dispatch(it, n, "input", |_, _| {});
+                    js::dombind::dispatch(it, n, "change", |_, _| {});
+                });
+                Click::Handled
+            }
+            Activation::Submit(form, submitter) => {
+                self.set_focus(NONE);
+                self.submit(form, submitter).map_or(Click::Handled, Click::Navigate)
+            }
+            Activation::None => {
+                self.set_focus(NONE);
+                Click::Default
+            }
+        }
+    }
+
+    /// Fire `submit` at a form and, unless cancelled, build its request.
+    fn submit(&mut self, form: NodeId, submitter: NodeId) -> Option<Nav> {
+        let prevented = self.with_js(|it| js::dombind::dispatch(it, form, "submit", |_, _| {})).unwrap_or(false);
+        if let Some(n) = self.take_nav() {
+            return Some(n);
+        }
+        if prevented {
+            return None;
+        }
+        forms::submission(&self.doc, form, submitter, &self.base)
+    }
+
+    /// Apply an editing key to the focused field. Returns a navigation if
+    /// it submitted a form.
+    pub fn key(&mut self, e: Edit) -> Option<Nav> {
+        let n = self.focused()?;
+        let name = match &e {
+            Edit::Insert(s) => s.clone(),
+            Edit::Backspace | Edit::BackspaceWord => "Backspace".into(),
+            Edit::Delete => "Delete".into(),
+            Edit::Left => "ArrowLeft".into(),
+            Edit::Right => "ArrowRight".into(),
+            Edit::Home => "Home".into(),
+            Edit::End => "End".into(),
+            Edit::Enter => "Enter".into(),
+            Edit::Tab => "Tab".into(),
+            Edit::Escape => "Escape".into(),
+        };
+        let code = match name.as_str() {
+            "Backspace" => 8,
+            "Tab" => 9,
+            "Enter" => 13,
+            "Escape" => 27,
+            "ArrowLeft" => 37,
+            "ArrowRight" => 39,
+            "Delete" => 46,
+            s => s.chars().next().map_or(0, |c| c.to_ascii_uppercase() as u32),
+        };
+        let prevented = self
+            .with_js(|it| {
+                js::dombind::dispatch(it, n, "keydown", |it, ev| {
+                    let _ = it.put(ev, "key", js::Value::str(&name));
+                    let _ = it.put(ev, "keyCode", js::Value::Num(code as f64));
+                    let _ = it.put(ev, "which", js::Value::Num(code as f64));
+                })
+            })
+            .unwrap_or(false);
+        if let Some(nav) = self.take_nav() {
+            return Some(nav);
+        }
+        if prevented || self.focused() != Some(n) {
+            return None;
+        }
+        let textarea = self.doc.tag(n) == Some(k::textarea);
+        let mut chars: Vec<char> = forms::value(&self.doc, n).chars().collect();
+        let mut caret = self.caret.min(chars.len());
+        let mut edited = false;
+        match e {
+            Edit::Insert(s) => {
+                let s: String = if textarea { s } else { s.chars().filter(|&c| c != '\n' && c != '\r').collect() };
+                for c in s.chars() {
+                    chars.insert(caret, c);
+                    caret += 1;
+                }
+                edited = !s.is_empty();
+            }
+            Edit::Backspace if caret > 0 => {
+                caret -= 1;
+                chars.remove(caret);
+                edited = true;
+            }
+            Edit::BackspaceWord if caret > 0 => {
+                let mut i = caret;
+                while i > 0 && chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                while i > 0 && !chars[i - 1].is_whitespace() {
+                    i -= 1;
+                }
+                chars.drain(i..caret);
+                caret = i;
+                edited = true;
+            }
+            Edit::Delete if caret < chars.len() => {
+                chars.remove(caret);
+                edited = true;
+            }
+            Edit::Left => caret = caret.saturating_sub(1),
+            Edit::Right => caret = (caret + 1).min(chars.len()),
+            Edit::Home => caret = 0,
+            Edit::End => caret = chars.len(),
+            Edit::Enter if textarea => {
+                chars.insert(caret, '\n');
+                caret += 1;
+                edited = true;
+            }
+            Edit::Enter => {
+                // Implicit submission: clicks the form's default button.
+                let form = forms::form_of(&self.doc, n);
+                if form == NONE {
+                    return None;
+                }
+                let button = forms::default_button(&self.doc, form);
+                if button != NONE {
+                    let prevented = self.with_js(|it| js::dombind::dispatch(it, button, "click", |_, _| {})).unwrap_or(false);
+                    if let Some(nav) = self.take_nav() {
+                        return Some(nav);
+                    }
+                    if prevented {
+                        return None;
+                    }
+                }
+                return self.submit(form, button);
+            }
+            Edit::Tab => {
+                let next = self.doc.preorder().into_iter().filter(|&c| forms::is_text_field(&self.doc, c)).skip_while(|&c| c != n).nth(1);
+                self.set_focus(next.unwrap_or(NONE));
+                return None;
+            }
+            Edit::Escape => {
+                self.set_focus(NONE);
+                return None;
+            }
+            _ => {}
+        }
+        self.caret = caret;
+        if edited {
+            let v: String = chars.into_iter().collect();
+            forms::set_value(&mut self.doc, n, &v);
+            self.changed_then_js(|it| {
+                js::dombind::dispatch(it, n, "input", |_, _| {});
+            });
+        }
+        self.take_nav()
+    }
+
+    /// Text shown by the focused control, as typed (password fields show
+    /// one bullet per character).
+    fn shown_value(&self, n: NodeId) -> String {
+        let v = forms::value(&self.doc, n);
+        if self.doc.elem(n).and_then(|e| e.attr(k::type_)).is_some_and(|t| t.eq_ignore_ascii_case("password")) {
+            "\u{2022}".repeat(v.chars().count())
+        } else {
+            v
+        }
+    }
+
+    /// Caret rectangle (page coordinates) in the focused text field.
+    pub fn caret_rect(&self) -> Option<[f32; 4]> {
+        let n = self.focused()?;
+        if !forms::is_text_field(&self.doc, n) {
+            return None;
+        }
+        let st = self.styles.get(n as usize)?;
+        let size = st.font_size;
+        let face = crate::fonts::fonts().pick_style(st);
+        let (content, frags) = self.tree.text_box(n)?;
+        let shown = self.shown_value(n);
+        let caret_byte = shown.char_indices().nth(self.caret).map_or(shown.len(), |(i, _)| i);
+        let (x, base) = if shown.is_empty() || frags.is_empty() {
+            frags.first().map_or((content[0], content[1] + size), |f| (f.0, f.1))
+        } else {
+            // Find the fragment holding the caret by locating each fragment's
+            // text in the value (fragments omit line breaks).
+            let mut pos = 0;
+            let mut hit = None;
+            for &(fx, fy, t) in &frags {
+                let Some(off) = shown[pos..].find(t).map(|o| o + pos) else { continue };
+                if caret_byte >= off && caret_byte <= off + t.len() {
+                    let w = crate::fonts::fonts().measure(face, size, &shown[off..caret_byte]);
+                    hit = Some((fx + w, fy));
+                }
+                pos = off + t.len();
+                if caret_byte < pos {
+                    break;
+                }
+            }
+            hit.or_else(|| {
+                // After a trailing newline: start of the next line.
+                let &(_, fy, _) = frags.last()?;
+                if shown[..caret_byte].ends_with('\n') {
+                    Some((content[0], fy + size * 1.2))
+                } else {
+                    let (lx, ly, lt) = *frags.last()?;
+                    Some((lx + crate::fonts::fonts().measure(face, size, lt), ly))
+                }
+            })?
+        };
+        let x = x.min(content[0] + content[2]);
+        Some([x.round(), base - size * 0.95, 1.0, size * 1.2])
+    }
+
+    /// Caret index nearest to a click at (x, y) in the focused field.
+    fn caret_at(&self, x: f32, y: f32) -> usize {
+        let Some(n) = self.focused() else { return 0 };
+        let shown = self.shown_value(n);
+        let Some(st) = self.styles.get(n as usize) else { return 0 };
+        let (size, face) = (st.font_size, crate::fonts::fonts().pick_style(st));
+        let Some((_, frags)) = self.tree.text_box(n) else { return 0 };
+        if shown.is_empty() {
+            return 0;
+        }
+        // The line under the click, then the nearest character boundary.
+        let line = frags.iter().filter(|f| (f.1 - size..f.1 + size * 0.3).contains(&y)).collect::<Vec<_>>();
+        let pool: Vec<_> = if line.is_empty() { frags.iter().collect() } else { line };
+        let mut pos = 0;
+        let mut best = (f32::MAX, shown.chars().count());
+        for &(fx, fy, t) in &frags {
+            let Some(off) = shown[pos..].find(t).map(|o| o + pos) else { continue };
+            pos = off + t.len();
+            if !pool.iter().any(|p| p.0 == fx && p.1 == fy) {
+                continue;
+            }
+            let mut cx = fx;
+            let base = shown[..off].chars().count();
+            for (i, c) in t.chars().enumerate() {
+                let w = crate::fonts::fonts().measure(face, size, c.encode_utf8(&mut [0; 4]));
+                if (cx - x).abs() < best.0 {
+                    best = ((cx - x).abs(), base + i);
+                }
+                cx += w;
+            }
+            if (cx - x).abs() < best.0 {
+                best = ((cx - x).abs(), base + t.chars().count());
+            }
+        }
+        best.1
     }
 
     /// Run due timers (`now` = ms since load). Returns true if the page changed.
@@ -480,6 +884,124 @@ mod tests {
         let n = (0..p.doc.nodes.len() as u32).find(|&n| p.doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap();
         let r = p.tree.node_rects()[&n];
         (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
+    }
+
+    fn page_from(html: &str) -> Page {
+        let doc = html::parse(html);
+        let l = Loaded { url: "https://example.com/start".into(), html: html.into(), sheets: Vec::new(), doc, scripts: FxHashMap::default(), fetch_ms: 0.0, parse_ms: 0.0 };
+        Page::new(l, 800.0, 600.0)
+    }
+
+    #[test]
+    fn typing_into_forms() {
+        let mut p = page_from(
+            r#"<!doctype html><form action="/search"><input id=q name=q placeholder="Search">
+               <label><input type=checkbox id=c name=c> safe</label><button id=go>Go</button></form>
+               <p id=echo></p><p id=keys></p>
+               <script>
+                 const q = document.getElementById('q');
+                 q.addEventListener('input', () => document.getElementById('echo').textContent = q.value.toUpperCase());
+                 q.addEventListener('keydown', e => { document.getElementById('keys').textContent += e.key; if (e.key === '!') e.preventDefault(); });
+               </script>"#,
+        );
+        let (x, y) = center_of(&p, "q");
+        assert_eq!(p.click(x, y), Click::Handled);
+        let q = p.focused().expect("focused");
+        let caret0 = p.caret_rect().expect("caret")[0];
+        for e in [Edit::Insert("rust".into()), Edit::Insert("!".into()), Edit::Insert(" lang".into()), Edit::Left, Edit::Left, Edit::Left, Edit::Left, Edit::Backspace] {
+            p.key(e);
+        }
+        // '!' was cancelled by the keydown handler; the backspace removed the space.
+        assert_eq!(forms::value(&p.doc, q), "rustlang");
+        assert_eq!(text_of(&p, "echo"), "RUSTLANG");
+        assert!(text_of(&p, "keys").starts_with("rust!"));
+        assert_eq!(p.caret, 4);
+        let caret1 = p.caret_rect().unwrap()[0];
+        assert!(caret1 > caret0 + 10.0, "{caret0} {caret1}");
+        // Clicking the label text toggles the checkbox.
+        let label = p.doc.parent(p.doc.preorder().into_iter().find(|&n| p.doc.elem(n).is_some_and(|e| e.id == crate::atom::lookup("c"))).unwrap());
+        let r = p.tree.node_rects()[&label];
+        assert_eq!(p.click(r[0] + r[2] - 5.0, r[1] + r[3] / 2.0), Click::Handled);
+        assert!(p.focused().is_none());
+        let (x, y) = center_of(&p, "q");
+        p.click(x, y);
+        assert_eq!(p.key(Edit::Enter), Some(Nav { url: "https://example.com/search?q=rustlang&c=on".into(), post: None }));
+    }
+
+    /// Load a page; on Google's EU cookie-consent page, press "accept all"
+    /// (a POST form) like a user would.
+    fn load_past_consent(nav: Nav) -> Page {
+        let p = Page::new(load_req(&nav.url, nav.post.as_deref()).unwrap(), 1100.0, 800.0);
+        if !p.url.contains("consent.google") {
+            return p;
+        }
+        let mut p = p;
+        let accept = p
+            .doc
+            .preorder()
+            .into_iter()
+            .filter(|&n| p.doc.tag(n) == Some(k::input) && p.doc.attr(n, k::type_) == Some("submit"))
+            .find(|&n| p.doc.attr(n, k::value).is_some_and(|v| v.to_lowercase().starts_with("accept")))
+            .expect("accept button");
+        let r = p.tree.node_rects()[&accept];
+        let Click::Navigate(nav) = p.click(r[0] + r[2] / 2.0, r[1] + r[3] / 2.0) else { panic!("consent form did not submit") };
+        eprintln!("consent: {nav:?}");
+        assert!(nav.post.is_some());
+        Page::new(load_req(&nav.url, nav.post.as_deref()).unwrap(), 1100.0, 800.0)
+    }
+
+    /// Search Google like a user: click the box, type, press Enter.
+    /// Needs the network: `cargo test --release -- --ignored live_google`.
+    #[test]
+    #[ignore]
+    fn live_google_search() {
+        let mut p = load_past_consent(Nav { url: "https://www.google.com/".into(), post: None });
+        let q = p.doc.preorder().into_iter().find(|&n| p.doc.attr(n, k::name) == Some("q")).expect("search box");
+        let r = p.tree.node_rects()[&q];
+        assert_eq!(p.click(r[0] + 10.0, r[1] + r[3] / 2.0), Click::Handled);
+        assert_eq!(p.focused(), Some(q));
+        p.key(Edit::Insert("rust programming language".into()));
+        let nav = p.key(Edit::Enter).expect("submits");
+        eprintln!("submitted: {nav:?}");
+        assert!(nav.url.contains("q=rust+programming+language"));
+        // Google gates result pages behind a JavaScript challenge that bolt
+        // can't pass yet, so only the request is checked here.
+        let results = load_past_consent(nav);
+        eprintln!("results: {} ({})", results.title(), results.url);
+    }
+
+    /// DuckDuckGo's HTML version works without JavaScript: type a query
+    /// into its form and check the results. Needs the network.
+    #[test]
+    #[ignore]
+    fn live_duckduckgo_search() {
+        let mut p = Page::new(load("https://html.duckduckgo.com/html/").unwrap(), 1100.0, 800.0);
+        let q = p.doc.preorder().into_iter().find(|&n| p.doc.attr(n, k::name) == Some("q")).expect("search box");
+        let r = p.tree.node_rects()[&q];
+        assert_eq!(p.click(r[0] + 10.0, r[1] + r[3] / 2.0), Click::Handled);
+        p.key(Edit::Insert("rust programming language".into()));
+        let nav = p.key(Edit::Enter).expect("submits");
+        eprintln!("submitted: {nav:?}");
+        let results = Page::new(load_req(&nav.url, nav.post.as_deref()).unwrap(), 1100.0, 800.0);
+        let mut text = String::new();
+        results.doc.text_content(results.doc.body, &mut text);
+        assert!(text.contains("rust-lang.org"), "{}", &text[..text.len().min(800)]);
+        eprintln!("results: {} links", results.tree.links.len());
+    }
+    #[test]
+    fn scripts_can_cancel_or_submit_forms() {
+        let mut p = page_from(
+            r#"<form id=f action="/go"><input name=a value=1><button id=b>Send</button></form>
+               <script>document.getElementById('f').addEventListener('submit', e => e.preventDefault());</script>"#,
+        );
+        let (x, y) = center_of(&p, "b");
+        assert_eq!(p.click(x, y), Click::Handled);
+        let mut p = page_from(r#"<form id=f action="/go"><input name=a value=1></form><button id=b onclick="document.getElementById('f').submit()">x</button>"#);
+        let (x, y) = center_of(&p, "b");
+        assert_eq!(p.click(x, y), Click::Navigate(Nav { url: "https://example.com/go?a=1".into(), post: None }));
+        let mut p = page_from(r#"<button id=b onclick="location.href = '/next'">x</button>"#);
+        let (x, y) = center_of(&p, "b");
+        assert_eq!(p.click(x, y), Click::Navigate(Nav { url: "https://example.com/next".into(), post: None }));
     }
 
     #[test]

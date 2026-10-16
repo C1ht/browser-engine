@@ -47,7 +47,8 @@ static_atoms! {
     bgcolor = "bgcolor", color = "color", cellpadding = "cellpadding",
     cellspacing = "cellspacing", border = "border", start = "start", size = "size",
     face = "face", hidden = "hidden", media = "media", selected = "selected",
-    checked = "checked", nowrap = "nowrap", text = "text",
+    checked = "checked", nowrap = "nowrap", text = "text", name = "name",
+    disabled = "disabled", readonly = "readonly", action = "action", method = "method",
 }
 
 struct Interner {

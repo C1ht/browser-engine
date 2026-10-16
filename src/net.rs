@@ -8,14 +8,33 @@ use std::process::Command;
 
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) bolt/0.1 (like Gecko)";
 
+/// Where cookies persist between requests and runs.
+fn cookie_jar() -> String {
+    std::env::temp_dir().join("bolt-cookies.txt").to_string_lossy().into_owned()
+}
+
 pub fn fetch(url: &str) -> Result<(String, Vec<u8>), String> {
+    request(url, None)
+}
+
+/// Fetch a URL, POSTing `post` (form-urlencoded) if given. Returns the final
+/// URL after redirects and the body. Cookies are read from and saved to the jar.
+pub fn request(url: &str, post: Option<&str>) -> Result<(String, Vec<u8>), String> {
     if url.starts_with("file:") {
         let path = file_url_to_path(url);
         return std::fs::read(&path).map(|b| (url.to_owned(), b)).map_err(|e| format!("{path}: {e}"));
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        let out = Command::new("curl")
-            .args(["-sSL", "--compressed", "--max-time", "20", "-A", UA, "-w", "\n%{url_effective}", url])
+        let jar = cookie_jar();
+        let mut cmd = Command::new("curl");
+        cmd.args(["-sSL", "--compressed", "--max-time", "20", "-A", UA, "-b", &jar, "-c", &jar, "-w", "\n%{url_effective}"]);
+        if let Some(body) = post {
+            // curl sends the form Content-Type itself (setting it by hand
+            // reorders headers, which some sites treat as a bot signal).
+            cmd.args(["--data-binary", body]);
+        }
+        let out = cmd
+            .arg(url)
             .output()
             .map_err(|e| format!("could not run curl: {e}"))?;
         if !out.status.success() {
@@ -64,7 +83,7 @@ pub fn fetch_many(urls: &[String]) -> Vec<Option<Vec<u8>>> {
     let cfg_path = dir.join("batch.cfg");
     if std::fs::write(&cfg_path, cfg).is_ok() {
         let _ = Command::new("curl")
-            .args(["-sSL", "--fail", "--compressed", "--max-time", "30", "--parallel", "--parallel-max", "16", "-A", UA, "-K"])
+            .args(["-sSL", "--fail", "--compressed", "--max-time", "30", "--parallel", "--parallel-max", "16", "-A", UA, "-b", &cookie_jar(), "-K"])
             .arg(&cfg_path)
             .output();
         for &i in &remote {
@@ -145,7 +164,7 @@ pub fn normalize_input(s: &str) -> String {
     if s.contains('.') && !s.contains(' ') {
         return format!("https://{s}");
     }
-    format!("https://duckduckgo.com/html/?q={}", s.replace(' ', "+"))
+    format!("https://html.duckduckgo.com/html/?q={}", crate::forms::urlencode(s))
 }
 
 fn has_scheme(s: &str) -> bool {

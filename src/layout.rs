@@ -156,6 +156,23 @@ impl LayoutTree {
         m
     }
 
+    /// An element's content box (page coordinates) and its own text
+    /// fragments as (x, baseline y, text), for placing a text caret.
+    pub fn text_box(&self, node: NodeId) -> Option<([f32; 4], Vec<(f32, f32, &str)>)> {
+        let mut found = None;
+        self.walk(self.root, 0.0, 0.0, &mut |b, bx, by| {
+            if found.is_none() && b.node == node && !b.anon {
+                let (cx, cy) = (bx + b.b[3] + b.p[3], by + b.b[0] + b.p[0] + b.cell_off);
+                found = Some(([cx, cy, b.w, b.h], b as *const LBox));
+            }
+        }, &mut |_, _| {});
+        let (rect, ptr) = found?;
+        let b = self.boxes.iter().find(|x| std::ptr::eq(*x, ptr))?;
+        let mut frags = Vec::new();
+        collect_text(self, b, rect[0], rect[1], &mut frags);
+        Some((rect, frags))
+    }
+
     /// The element at page point (x, y): the last-painted box or text under it.
     pub fn node_at(&self, x: f32, y: f32) -> Option<NodeId> {
         let mut hit = None;
@@ -176,6 +193,22 @@ impl LayoutTree {
             hit = Some(t);
         }
         hit.or(last_box)
+    }
+}
+
+/// Text fragments of a box and its anonymous wrappers, in order.
+fn collect_text<'a>(t: &'a LayoutTree, b: &LBox, cx: f32, cy: f32, out: &mut Vec<(f32, f32, &'a str)>) {
+    for fr in &b.frags {
+        if let FragKind::Text { start, end, .. } = fr.kind {
+            out.push((cx + fr.x, cy + fr.y, t.text.get(start as usize..end as usize).unwrap_or("")));
+        }
+    }
+    for &c in &b.children {
+        let k = &t.boxes[c as usize];
+        if k.anon {
+            let (x, y) = (cx + k.x + k.b[3] + k.p[3], cy + k.y + k.b[0] + k.p[0]);
+            collect_text(t, k, x, y, out);
+        }
     }
 }
 
