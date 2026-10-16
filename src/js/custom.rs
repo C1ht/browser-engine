@@ -153,6 +153,21 @@ impl Interp {
 
     /// Upgrade a just-created element if its name is defined
     /// (`document.createElement('x-foo')`).
+    /// Upgrade defined custom elements in a freshly cloned / imported tree
+    /// (as browsers do before `cloneNode` / `importNode` return).
+    pub(crate) fn ce_upgrade_tree(&mut self, root: NodeId) {
+        if self.ce_defs.is_empty() {
+            return;
+        }
+        let mut els = Vec::new();
+        self.ce_subtree(root, &mut els);
+        for e in els {
+            if !self.ce_upgraded.contains_key(&e) && self.ce_def_for(e).is_some() {
+                self.ce_upgrade(e);
+            }
+        }
+    }
+
     pub(crate) fn ce_created(&mut self, n: NodeId) {
         if !self.ce_defs.is_empty() && self.ce_def_for(n).is_some() {
             self.ce_upgrade(n);

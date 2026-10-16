@@ -35,6 +35,9 @@ pub type NativeFn = fn(&mut Interp, Value, &[Value]) -> R<Value>;
 pub enum Value {
     #[default]
     Undef,
+    /// An array hole: only inside array storage (reads see `undefined`;
+    /// map / forEach / in / keys skip it). Elsewhere it acts as undefined.
+    Hole,
     Null,
     Bool(bool),
     Num(f64),
@@ -47,7 +50,7 @@ pub enum Value {
 impl std::fmt::Debug for Value {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Value::Undef => write!(f, "undefined"),
+            Value::Undef | Value::Hole => write!(f, "undefined"),
             Value::Null => write!(f, "null"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Num(n) => write!(f, "{}", num_to_str(*n)),
@@ -66,11 +69,16 @@ impl Value {
         if let Value::Obj(o) = self { Some(o) } else { None }
     }
     pub fn is_nullish(&self) -> bool {
-        matches!(self, Value::Undef | Value::Null)
+        matches!(self, Value::Undef | Value::Null | Value::Hole)
+    }
+
+    /// Holes read as undefined.
+    pub fn unhole(self) -> Value {
+        if let Value::Hole = self { Value::Undef } else { self }
     }
     pub fn truthy(&self) -> bool {
         match self {
-            Value::Undef | Value::Null => false,
+            Value::Undef | Value::Null | Value::Hole => false,
             Value::Bool(b) => *b,
             Value::Num(n) => *n != 0.0 && !n.is_nan(),
             Value::BigInt(n) => *n != 0,
@@ -480,6 +488,8 @@ pub struct Interp {
     pub co_stack: Vec<ObjRef>,
     /// Top-level scripts / module bodies being evaluated (JS on the stack).
     pub script_running: u32,
+    /// Promises rejected with no handler yet (reported after microtasks).
+    pub unhandled_rejections: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
     pub nav: Option<crate::forms::Nav>,
     /// A form a script submitted, to be serialized by the page.
@@ -568,6 +578,7 @@ impl Interp {
             styles: None,
             co_stack: Vec::new(),
             script_running: 0,
+            unhandled_rejections: Vec::new(),
             nav: None,
             submit_form: None,
             requests: Vec::new(),
@@ -649,7 +660,7 @@ impl Interp {
 
     pub fn to_str(&mut self, v: &Value) -> R<Rc<str>> {
         Ok(match v {
-            Value::Undef => "undefined".into(),
+            Value::Undef | Value::Hole => "undefined".into(),
             Value::Null => "null".into(),
             Value::Bool(b) => if *b { "true".into() } else { "false".into() },
             Value::Num(n) => num_to_str(*n).into(),
@@ -664,7 +675,7 @@ impl Interp {
 
     pub fn to_num(&mut self, v: &Value) -> R<f64> {
         Ok(match v {
-            Value::Undef => f64::NAN,
+            Value::Undef | Value::Hole => f64::NAN,
             Value::Null => 0.0,
             Value::Bool(b) => *b as u8 as f64,
             Value::Num(n) => *n,
@@ -710,7 +721,7 @@ impl Interp {
 
     pub fn type_of(v: &Value) -> &'static str {
         match v {
-            Value::Undef => "undefined",
+            Value::Undef | Value::Hole => "undefined",
             Value::Null => "object",
             Value::Bool(_) => "boolean",
             Value::Num(_) => "number",
@@ -736,6 +747,13 @@ impl Interp {
     }
 
     pub fn get(&mut self, target: &Value, key: &str) -> R<Value> {
+        if key == "__proto__" {
+            if let Value::Obj(o) = target {
+                if !matches!(o.borrow().kind, Kind::Proxy(_)) {
+                    return Ok(o.borrow().proto.clone().map_or(Value::Null, Value::Obj));
+                }
+            }
+        }
         // Fast paths for arrays and strings.
         match target {
             Value::Undef | Value::Null => {
@@ -761,7 +779,7 @@ impl Interp {
                                 return Ok(Value::Num(a.len() as f64));
                             }
                             if let Some(i) = array_index(key) {
-                                return Ok(a.get(i).cloned().unwrap_or_default());
+                                return Ok(a.get(i).cloned().unwrap_or_default().unhole());
                             }
                         }
                         Kind::Typed(t) => {
@@ -777,7 +795,7 @@ impl Interp {
                     }
                 }
                 let special = matches!(o.borrow().kind, Kind::Node(_) | Kind::Style(_) | Kind::ClassList(_) | Kind::Dataset(_));
-                if special {
+                if special && !self.js_override(o, key) {
                     if let Some(v) = dombind::get(self, o, key)? {
                         return Ok(v);
                     }
@@ -827,7 +845,7 @@ impl Interp {
         if let (Value::Obj(o), Value::Num(n)) = (target, key) {
             match &o.borrow().kind {
                 Kind::Array(a) if *n >= 0.0 && n.fract() == 0.0 => {
-                    return Ok(a.get(*n as usize).cloned().unwrap_or_default());
+                    return Ok(a.get(*n as usize).cloned().unwrap_or_default().unhole());
                 }
                 Kind::Typed(t) if *n >= 0.0 && n.fract() == 0.0 => {
                     return Ok(t.get(*n as usize).map_or(Value::Undef, Value::Num));
@@ -848,6 +866,24 @@ impl Interp {
         };
         if matches!(o.borrow().kind, Kind::Proxy(_)) {
             return proxy::set(self, o, key, v, target);
+        }
+        if key == "__proto__" {
+            // obj.__proto__ = p sets the prototype (ignoring cycles / primitives).
+            match v {
+                Value::Obj(p) => {
+                    let mut cur = Some(p.clone());
+                    while let Some(c) = cur {
+                        if Rc::ptr_eq(&c, o) {
+                            return Err(type_error("Cyclic __proto__ value"));
+                        }
+                        cur = c.borrow().proto.clone();
+                    }
+                    o.borrow_mut().proto = Some(p);
+                }
+                Value::Null => o.borrow_mut().proto = None,
+                _ => {}
+            }
+            return Ok(());
         }
         let typed = match &o.borrow().kind {
             Kind::Typed(t) => Some(t.clone()),
@@ -871,7 +907,7 @@ impl Interp {
                         if i > a.len() + 10_000_000 {
                             return Err(builtins::make_error_value("RangeError", "array too large"));
                         }
-                        a.resize(i + 1, Value::Undef);
+                        a.resize(i + 1, Value::Hole);
                     }
                     a[i] = v;
                     return Ok(());
@@ -880,14 +916,14 @@ impl Interp {
                     drop(ob);
                     let n = self.to_num(&v)? as usize;
                     if let Kind::Array(a) = &mut o.borrow_mut().kind {
-                        a.resize(n, Value::Undef);
+                        a.resize(n, Value::Hole);
                     }
                     return Ok(());
                 }
             }
         }
         let special = matches!(o.borrow().kind, Kind::Node(_) | Kind::Style(_) | Kind::ClassList(_) | Kind::Dataset(_));
-        if special && dombind::set(self, o, key, &v)? {
+        if special && !self.js_override(o, key) && dombind::set(self, o, key, &v)? {
             if self.doc.ce_log.as_ref().is_some_and(|l| !l.is_empty()) {
                 self.ce_process();
             }
@@ -937,7 +973,7 @@ impl Interp {
                 if *n >= 0.0 && n.fract() == 0.0 && (*n as usize) < a.len() + 1000 {
                     let i = *n as usize;
                     if i >= a.len() {
-                        a.resize(i + 1, Value::Undef);
+                        a.resize(i + 1, Value::Hole);
                     }
                     a[i] = v;
                     return Ok(());
@@ -948,6 +984,43 @@ impl Interp {
         self.put(target, &k, v)
     }
 
+    /// Whether script defined `key` on a node object itself or on a
+    /// prototype more derived than the built-in node prototype (a custom
+    /// element class, Shady DOM's ShadyRoot...): such definitions take
+    /// precedence over the native DOM property, as in browsers.
+    fn js_override(&self, o: &ObjRef, key: &str) -> bool {
+        if !matches!(o.borrow().kind, Kind::Node(_)) {
+            return false;
+        }
+        if o.borrow().props.get(key).is_some_and(|p| p.get.is_some() || p.set.is_some()) {
+            return true;
+        }
+        let base = self.p.node.as_ref();
+        let mut derived = true;
+        let mut cur = o.borrow().proto.clone();
+        while let Some(c) = cur {
+            if base.is_some_and(|b| Rc::ptr_eq(b, &c)) {
+                derived = false;
+            }
+            let found = c.borrow().props.get(key).map(|p| (p.get.clone(), p.set.clone()));
+            if let Some((g, st)) = found {
+                if derived {
+                    return true;
+                }
+                // On the built-in prototypes: the native accessors (and plain
+                // data such as methods / constants) defer to the DOM layer;
+                // script-installed accessors (polyfill patches) win.
+                let native = |f: &Option<Value>| match f {
+                    Some(Value::Obj(fo)) => fo.borrow().props.get("@@nativeAccessor").is_some(),
+                    _ => true,
+                };
+                return (g.is_some() || st.is_some()) && !(native(&g) && native(&st));
+            }
+            cur = c.borrow().proto.clone();
+        }
+        false
+    }
+
     pub fn has_prop(&mut self, target: &Value, key: &str) -> bool {
         if let Value::Obj(o) = target {
             if matches!(o.borrow().kind, Kind::Proxy(_)) {
@@ -955,7 +1028,7 @@ impl Interp {
             }
             if let Kind::Array(a) = &o.borrow().kind {
                 if let Some(i) = array_index(key) {
-                    return i < a.len();
+                    return i < a.len() && !matches!(a[i], Value::Hole);
                 }
                 if key == "length" {
                     return true;
@@ -989,7 +1062,7 @@ impl Interp {
                 let ob = o.borrow();
                 let mut out: Vec<Rc<str>> = Vec::new();
                 match &ob.kind {
-                    Kind::Array(a) => out.extend((0..a.len()).map(|i| Rc::from(i.to_string()))),
+                    Kind::Array(a) => out.extend((0..a.len()).filter(|&i| !matches!(a[i], Value::Hole)).map(|i| Rc::from(i.to_string()))),
                     Kind::Typed(t) => out.extend((0..t.len).map(|i| Rc::from(i.to_string()))),
                     _ => {}
                 }
@@ -1078,6 +1151,11 @@ impl Interp {
         self.depth += 1;
         let r = if prof::on() {
             self.call_closure_profiled(def, env, arrow_this, home, this, args, fobj)
+        } else if trace_on() {
+            TRACE_STACK.with(|s| s.borrow_mut().push(def.clone()));
+            let r = self.call_closure_inner(def, env, arrow_this, home, this, args, fobj);
+            TRACE_STACK.with(|s| s.borrow_mut().pop());
+            r
         } else {
             self.call_closure_inner(def, env, arrow_this, home, this, args, fobj)
         };
@@ -1427,6 +1505,29 @@ impl Interp {
         r.map_err(|e| self.describe_error(&e))
     }
 
+    /// Indirect `eval`: run `src` as a global script and return the value of
+    /// its last expression statement.
+    pub fn eval_global(&mut self, src: &str) -> R<Value> {
+        let prog = parse_program(src).map_err(|e| builtins::make_error_value("SyntaxError", &e))?;
+        let env = self.genv.clone();
+        self.script_running += 1;
+        let r = (|| -> R<Value> {
+            self.hoist(&prog, &env)?;
+            let mut last = Value::Undef;
+            for s in &prog {
+                match s {
+                    Stmt::Expr(e) => last = self.eval(e, &env)?,
+                    s => {
+                        self.exec(s, &env)?;
+                    }
+                }
+            }
+            Ok(last)
+        })();
+        self.script_running -= 1;
+        r
+    }
+
     /// Run `src` as a function body (developer aid: `return` a value) and
     /// stringify the result.
     pub fn eval_str(&mut self, src: &str) -> String {
@@ -1752,7 +1853,7 @@ impl Interp {
                     return Ok(iter::drain(self, o));
                 }
                 let kind_items = match &o.borrow().kind {
-                    Kind::Array(a) => Some(a.clone()),
+                    Kind::Array(a) => Some(a.iter().cloned().map(Value::unhole).collect()),
                     Kind::Set(s) => Some(s.keys()),
                     Kind::Typed(t) => Some(t.values().into_iter().map(Value::Num).collect()),
                     Kind::Map(m) => Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).map(|(k, v)| self.array(vec![k, v])).collect()),
@@ -1897,7 +1998,7 @@ impl Interp {
                     let v = self.eval(e, env)?;
                     out.extend(self.iterate(&v)?);
                 }
-                ArrItem::Hole => out.push(Value::Undef),
+                ArrItem::Hole => out.push(Value::Hole),
             }
         }
         Ok(out)
@@ -2076,6 +2177,37 @@ impl Interp {
                 }
             }
             Expr::Assign(op, target, value) => {
+                // Member targets: the object and key are evaluated once,
+                // before the value (`a[i] = ++i`, `a[i++] += 1`).
+                let member = match &**target {
+                    Pattern::Expr(Expr::Member(o, k, _)) if !matches!(**o, Expr::Super) => Some((o, Value::Str(k.clone()), None)),
+                    Pattern::Expr(Expr::Index(o, k, _)) => Some((o, Value::Undef, Some(k))),
+                    _ => None,
+                };
+                if let Some((o, key, key_expr)) = member {
+                    let ov = self.eval(o, env)?;
+                    let kv = match key_expr {
+                        Some(k) => self.eval(k, env)?,
+                        None => key,
+                    };
+                    let v = match *op {
+                        "=" => self.eval(value, env)?,
+                        _ => {
+                            let cur = self.get_v(&ov, &kv)?;
+                            match *op {
+                                "&&=" => if cur.truthy() { self.eval(value, env)? } else { return Ok(cur) },
+                                "||=" => if cur.truthy() { return Ok(cur) } else { self.eval(value, env)? },
+                                "??=" => if cur.is_nullish() { self.eval(value, env)? } else { return Ok(cur) },
+                                _ => {
+                                    let rv = self.eval(value, env)?;
+                                    self.binary(&op[..op.len() - 1], &cur, &rv)?
+                                }
+                            }
+                        }
+                    };
+                    self.put_v(&ov, &kv, v.clone())?;
+                    return Ok(v);
+                }
                 if *op == "=" {
                     let v = self.eval(value, env)?;
                     name_fn(&v, target);
@@ -2115,7 +2247,7 @@ impl Interp {
                     return Ok(self.short_circuit());
                 }
                 if ov.is_nullish() && trace_on() {
-                    self.log(&format!("[trace] {}.{k} on {:?}", expr_name(o), ov));
+                    self.log(&format!("[trace] {}.{k} on {:?}{}", expr_name(o), ov, trace_stack()));
                 }
                 let v = self.get(&ov, k)?;
                 self.short = false;
@@ -2201,7 +2333,7 @@ impl Interp {
                     return Ok(self.short_circuit());
                 }
                 if ov.is_nullish() && trace_on() {
-                    self.log(&format!("[trace] call {}.{k}() on {:?}", expr_name(o), ov));
+                    self.log(&format!("[trace] call {}.{k}() on {:?}{}", expr_name(o), ov, trace_stack()));
                 }
                 let f = if let Expr::Super = **o {
                     let sup = self.eval(o, env)?;
@@ -2212,6 +2344,14 @@ impl Interp {
                 if !Self::is_callable(&f) {
                     if opt && f.is_nullish() {
                         return Ok(self.short_circuit());
+                    }
+                    if trace_on() {
+                        let keys: Vec<String> = match &ov {
+                            Value::Obj(ob) => ob.borrow().props.list.iter().take(12).map(|(k, _)| k.to_string()).collect(),
+                            _ => Vec::new(),
+                        };
+                        let ctor = self.get(&ov, "constructor").ok().and_then(|c| self.get(&c, "name").ok()).unwrap_or_default();
+                        self.log(&format!("[trace] {}.{k} is {:?}; object ({:?}) keys: {}{}", expr_name(o), f, ctor, keys.join(","), trace_stack()));
                     }
                     return Err(type_error(format!("{}.{k} is not a function", expr_name(o))));
                 }
@@ -2278,7 +2418,7 @@ impl Interp {
             if let Kind::Array(a) = &mut b.kind {
                 if let Some(i) = array_index(k) {
                     if i < a.len() {
-                        a[i] = Value::Undef;
+                        a[i] = Value::Hole;
                     }
                     return true;
                 }
@@ -2367,8 +2507,8 @@ impl Interp {
 
     pub fn loose_eq(&mut self, a: &Value, b: &Value) -> R<bool> {
         Ok(match (a, b) {
-            (Value::Undef | Value::Null, Value::Undef | Value::Null) => true,
-            (Value::Undef | Value::Null, _) | (_, Value::Undef | Value::Null) => false,
+            (Value::Undef | Value::Null | Value::Hole, Value::Undef | Value::Null | Value::Hole) => true,
+            (Value::Undef | Value::Null | Value::Hole, _) | (_, Value::Undef | Value::Null | Value::Hole) => false,
             (Value::Obj(x), Value::Obj(y)) => Rc::ptr_eq(x, y),
             (Value::Obj(_), _) => {
                 let p = self.to_primitive(a, false)?;
@@ -2497,6 +2637,14 @@ impl Interp {
                 break;
             }
             n += 1;
+        }
+        for p in std::mem::take(&mut self.unhandled_rejections) {
+            let reason = match &p.borrow().kind {
+                Kind::Promise(PromiseState::Rejected(v)) => v.clone(),
+                _ => continue,
+            };
+            let m = self.describe_error(&reason);
+            self.log(&format!("Uncaught (in promise) {m}"));
         }
     }
 
@@ -2683,8 +2831,33 @@ pub mod prof {
     }
 }
 
-/// `BOLT_JS_TRACE=1`: log the expression behind property reads of
-/// undefined / null (minified code has no other clue).
+// `BOLT_JS_TRACE=1`: log the expression behind property reads of
+// undefined / null (minified code has no other clue).
+thread_local! {
+    /// JS functions being called (only tracked with BOLT_JS_TRACE).
+    static TRACE_STACK: RefCell<Vec<Rc<FuncDef>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The innermost traced JS calls, as `name(params)` with a body snippet.
+fn trace_stack() -> String {
+    TRACE_STACK.with(|s| {
+        s.borrow()
+            .iter()
+            .rev()
+            .take(4)
+            .map(|d| {
+                let params: Vec<String> = d.params.iter().map(|p| match p {
+                    Pattern::Ident(n) => n.to_string(),
+                    _ => "_".into(),
+                }).collect();
+                let body: String = format!("{:?}", d.body).chars().take(90).collect();
+                format!("
+      at {}({}) {body}", d.name.as_deref().unwrap_or("<anon>"), params.join(","))
+            })
+            .collect()
+    })
+}
+
 fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BOLT_JS_TRACE").is_some())
@@ -2723,7 +2896,7 @@ pub fn pat_names(p: &Pattern, out: &mut Vec<Rc<str>>) {
 
 pub fn strict_eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Undef, Value::Undef) | (Value::Null, Value::Null) => true,
+        (Value::Undef | Value::Hole, Value::Undef | Value::Hole) | (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Num(x), Value::Num(y)) => x == y,
         (Value::BigInt(x), Value::BigInt(y)) => x == y,

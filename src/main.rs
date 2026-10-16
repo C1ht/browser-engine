@@ -287,6 +287,22 @@ fn screenshot(a: &Args, out: &str) {
     let t_page = Instant::now();
     let mut page = Page::new(l, w as f32, vh);
     let page_ms = ms(t_page);
+    // Let timers and network responses from the first seconds play out, as
+    // they would in the window (simulated clock, bounded wall time).
+    let t_settle = Instant::now();
+    let mut now = 0.0;
+    // BOLT_SETTLE_MS: how much page time to simulate (default 3000).
+    let settle: f64 = std::env::var("BOLT_SETTLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000.0);
+    while now < settle && ms(t_settle) < 8000.0f64.max(settle * 3.0) {
+        now += 16.0;
+        if page.has_pending_requests() {
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+        page.tick(now);
+        if !page.has_pending_work(now) && now > 500.0 {
+            break;
+        }
+    }
     let t_fonts = Instant::now();
     page.load_fonts_blocking(w as f32, vh);
     let fonts_ms = ms(t_fonts);

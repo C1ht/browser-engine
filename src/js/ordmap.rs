@@ -20,7 +20,7 @@ enum Key {
 
 fn key(v: &Value) -> Key {
     match v {
-        Value::Undef => Key::Undef,
+        Value::Undef | Value::Hole => Key::Undef,
         Value::Null => Key::Null,
         Value::Bool(b) => Key::Bool(*b),
         // -0 and +0 are the same key, as are all NaNs.

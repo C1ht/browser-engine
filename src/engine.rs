@@ -905,8 +905,9 @@ impl Page {
     fn with_js<T>(&mut self, f: impl FnOnce(&mut js::Interp) -> T) -> Option<T> {
         let it = self.js.as_mut()?;
         it.doc = std::mem::take(&mut self.doc);
-        // Event handlers and timers get a short leash.
-        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(500));
+        // Event handlers and timers get a leash; generous, since a killed
+        // task (half-rendered component) is worse than a slow one.
+        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(2500));
         let focus_before = it.doc.focus;
         let r = f(it);
         it.run_microtasks();
@@ -1356,6 +1357,16 @@ impl Page {
         }
         self.check_geometry();
         self.layouts != before
+    }
+
+    /// Whether scripts still have timers or requests outstanding (for
+    /// headless runs deciding when the page has settled).
+    pub fn has_pending_work(&self, _now: f64) -> bool {
+        self.js.as_ref().is_some_and(|it| it.next_timer_at().is_some() || it.has_pending_requests())
+    }
+
+    pub fn has_pending_requests(&self) -> bool {
+        self.js.as_ref().is_some_and(|it| it.has_pending_requests())
     }
 
     /// Re-run style + layout for a new viewport size (media queries may change).

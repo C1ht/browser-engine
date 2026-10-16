@@ -227,12 +227,121 @@
     getAttributeType: function () { return null; }, getPropertyType: function () { return null; }
   };
 
+  // Range: boundary points over the DOM, with the commonly used operations.
+  function nodeLength(n) {
+    return n.nodeType === 3 || n.nodeType === 8 ? n.data.length : n.childNodes.length;
+  }
+  function indexIn(n) { var i = 0; while ((n = n.previousSibling)) i++; return i; }
+  function Range(doc) {
+    var d = doc || document;
+    this.startContainer = d; this.startOffset = 0;
+    this.endContainer = d; this.endOffset = 0;
+  }
+  var R = Range.prototype;
+  Object.defineProperty(R, 'collapsed', { get: function () { return this.startContainer === this.endContainer && this.startOffset === this.endOffset; } });
+  Object.defineProperty(R, 'commonAncestorContainer', { get: function () {
+    var a = this.startContainer;
+    while (a && !(a === this.endContainer || a.contains(this.endContainer))) a = a.parentNode;
+    return a || this.startContainer;
+  } });
+  R.setStart = function (n, o) { this.startContainer = n; this.startOffset = o; if (this.endContainer === n && this.endOffset < o || !this.endContainer) { this.endContainer = n; this.endOffset = o; } };
+  R.setEnd = function (n, o) { this.endContainer = n; this.endOffset = o; };
+  R.setStartBefore = function (n) { this.setStart(n.parentNode, indexIn(n)); };
+  R.setStartAfter = function (n) { this.setStart(n.parentNode, indexIn(n) + 1); };
+  R.setEndBefore = function (n) { this.setEnd(n.parentNode, indexIn(n)); };
+  R.setEndAfter = function (n) { this.setEnd(n.parentNode, indexIn(n) + 1); };
+  R.selectNode = function (n) { this.setStartBefore(n); this.setEndAfter(n); };
+  R.selectNodeContents = function (n) { this.startContainer = n; this.startOffset = 0; this.endContainer = n; this.endOffset = nodeLength(n); };
+  R.collapse = function (toStart) {
+    if (toStart) { this.endContainer = this.startContainer; this.endOffset = this.startOffset; }
+    else { this.startContainer = this.endContainer; this.startOffset = this.endOffset; }
+  };
+  R.cloneRange = function () {
+    var r = new Range();
+    r.startContainer = this.startContainer; r.startOffset = this.startOffset;
+    r.endContainer = this.endContainer; r.endOffset = this.endOffset;
+    return r;
+  };
+  R.detach = function () {};
+  // The top-level nodes fully inside the range when both ends share a parent.
+  R._nodes = function () {
+    if (this.startContainer !== this.endContainer || this.startContainer.nodeType === 3) return null;
+    return Array.prototype.slice.call(this.startContainer.childNodes, this.startOffset, this.endOffset);
+  };
+  R.toString = function () {
+    var s = this.startContainer, e = this.endContainer;
+    if (s === e && (s.nodeType === 3 || s.nodeType === 8)) return s.data.slice(this.startOffset, this.endOffset);
+    var nodes = this._nodes();
+    if (nodes) return nodes.map(function (n) { return n.textContent; }).join('');
+    return (this.commonAncestorContainer.textContent || '');
+  };
+  R.createContextualFragment = function (html) {
+    var t = document.createElement('template');
+    t.innerHTML = html;
+    return document.importNode(t.content, true);
+  };
+  R.deleteContents = function () {
+    var s = this.startContainer;
+    if (s === this.endContainer && s.nodeType === 3) { s.data = s.data.slice(0, this.startOffset) + s.data.slice(this.endOffset); this.collapse(true); return; }
+    var nodes = this._nodes();
+    if (nodes) nodes.forEach(function (n) { n.parentNode.removeChild(n); });
+    this.collapse(true);
+  };
+  R.extractContents = function () {
+    var f = document.createDocumentFragment(), s = this.startContainer;
+    if (s === this.endContainer && s.nodeType === 3) {
+      f.appendChild(document.createTextNode(s.data.slice(this.startOffset, this.endOffset)));
+      this.deleteContents();
+      return f;
+    }
+    var nodes = this._nodes();
+    if (nodes) nodes.forEach(function (n) { f.appendChild(n); });
+    this.collapse(true);
+    return f;
+  };
+  R.cloneContents = function () {
+    var f = document.createDocumentFragment(), s = this.startContainer;
+    if (s === this.endContainer && s.nodeType === 3) { f.appendChild(document.createTextNode(s.data.slice(this.startOffset, this.endOffset))); return f; }
+    var nodes = this._nodes();
+    if (nodes) nodes.forEach(function (n) { f.appendChild(n.cloneNode(true)); });
+    return f;
+  };
+  R.insertNode = function (n) {
+    var c = this.startContainer;
+    if (c.nodeType === 3) {
+      var after = c.splitText ? c.splitText(this.startOffset) : null;
+      c.parentNode.insertBefore(n, after || c.nextSibling);
+    } else {
+      c.insertBefore(n, c.childNodes[this.startOffset] || null);
+    }
+  };
+  R.surroundContents = function (el) { el.appendChild(this.extractContents()); this.insertNode(el); this.selectNode(el); };
+  R.compareBoundaryPoints = function () { return 0; };
+  R.getBoundingClientRect = function () {
+    var c = this.startContainer;
+    var el = c.nodeType === 1 ? c : c.parentNode;
+    var nodes = this._nodes();
+    if (nodes) {
+      var rects = nodes.filter(function (n) { return n.nodeType === 1; }).map(function (n) { return n.getBoundingClientRect(); });
+      if (rects.length) {
+        var l = Math.min.apply(0, rects.map(function (r) { return r.left; })), t = Math.min.apply(0, rects.map(function (r) { return r.top; }));
+        var r_ = Math.max.apply(0, rects.map(function (r) { return r.right; })), b = Math.max.apply(0, rects.map(function (r) { return r.bottom; }));
+        return new DOMRect(l, t, r_ - l, b - t);
+      }
+    }
+    return el && el.getBoundingClientRect ? el.getBoundingClientRect() : new DOMRect();
+  };
+  R.getClientRects = function () { return [this.getBoundingClientRect()]; };
+  Range.START_TO_START = 0; Range.START_TO_END = 1; Range.END_TO_END = 2; Range.END_TO_START = 3;
+  window.Range = Range;
+  Node.prototype.createRange = function () { return new Range(this.nodeType === 9 ? this : this.ownerDocument); };
+
   // Interfaces scripts test with instanceof or patch via .prototype; they
   // can't be constructed directly.
-  ['NodeList', 'HTMLCollection', 'DOMTokenList', 'NamedNodeMap', 'DOMMatrix', 'DOMMatrixReadOnly', 'Window', 'Location',
+  ['NodeList', 'HTMLCollection', 'DOMTokenList', 'NamedNodeMap', 'DOMMatrix', 'DOMMatrixReadOnly', 'Location',
    'History', 'Navigator', 'Screen', 'Storage', 'MutationRecord', 'IntersectionObserverEntry', 'ResizeObserverEntry',
    'StyleSheet', 'CSSStyleDeclaration', 'MediaList', 'MediaQueryList', 'StyleSheetList', 'FontFaceSet',
-   'XMLHttpRequestEventTarget', 'FileList', 'CanvasRenderingContext2D', 'ImageData', 'Range', 'DOMImplementation',
+   'XMLHttpRequestEventTarget', 'FileList', 'CanvasRenderingContext2D', 'ImageData', 'DOMImplementation',
    'Crypto', 'SubtleCrypto', 'CryptoKey', 'CustomElementRegistry', 'ElementInternals', 'VisualViewport',
    'PerformanceEntry', 'PerformanceMark', 'PerformanceMeasure', 'PerformanceNavigationTiming', 'PerformanceResourceTiming',
    'Animation', 'KeyframeEffect', 'AnimationEffect', 'DocumentTimeline', 'AnimationTimeline', 'TrustedHTML',
@@ -456,6 +565,60 @@
       supportedValuesOf: function () { return []; }
     };
   }
+
+  // Cache Storage, in memory for the page's lifetime.
+  if (typeof caches === 'undefined') {
+    var keyOf = function (r) { return typeof r === 'string' ? new URL(r, location.href).href : r && r.url; };
+    function Cache() { this._m = new Map(); }
+    Cache.prototype.match = function (r) { var e = this._m.get(keyOf(r)); return Promise.resolve(e ? e.res.clone() : undefined); };
+    Cache.prototype.matchAll = function (r) {
+      var out = [];
+      this._m.forEach(function (e, k) { if (r === undefined || k === keyOf(r)) out.push(e.res.clone()); });
+      return Promise.resolve(out);
+    };
+    Cache.prototype.put = function (r, res) { this._m.set(keyOf(r), { req: r, res: res }); return Promise.resolve(); };
+    Cache.prototype.add = function (r) { var self = this; return fetch(r).then(function (res) { return self.put(r, res); }); };
+    Cache.prototype.addAll = function (rs) { var self = this; return Promise.all(rs.map(function (r) { return self.add(r); })).then(function () {}); };
+    Cache.prototype['delete'] = function (r) { return Promise.resolve(this._m['delete'](keyOf(r))); };
+    Cache.prototype.keys = function () { var out = []; this._m.forEach(function (e, k) { out.push(new Request(k)); }); return Promise.resolve(out); };
+    function CacheStorage() { this._c = new Map(); }
+    CacheStorage.prototype.open = function (n) { if (!this._c.has(n)) this._c.set(n, new Cache()); return Promise.resolve(this._c.get(n)); };
+    CacheStorage.prototype.has = function (n) { return Promise.resolve(this._c.has(n)); };
+    CacheStorage.prototype['delete'] = function (n) { return Promise.resolve(this._c['delete'](n)); };
+    CacheStorage.prototype.keys = function () { return Promise.resolve(Array.from(this._c.keys())); };
+    CacheStorage.prototype.match = function (r) {
+      var all = Array.from(this._c.values());
+      return all.reduce(function (p, c) { return p.then(function (hit) { return hit || c.match(r); }); }, Promise.resolve(undefined));
+    };
+    window.Cache = Cache;
+    window.CacheStorage = CacheStorage;
+    window.caches = new CacheStorage();
+  }
+
+  // DOM properties as accessors on Node.prototype (as in browsers), so
+  // Object.getOwnPropertyDescriptor finds them; polyfills (Shady DOM) wrap
+  // these. They call into the native DOM layer.
+  (function () {
+    var nget = window['@@nativeGet'], nset = window['@@nativeSet'];
+    var NP = Node.prototype;
+    ['firstChild', 'lastChild', 'nextSibling', 'previousSibling', 'parentNode', 'parentElement', 'childNodes',
+     'children', 'firstElementChild', 'lastElementChild', 'nextElementSibling', 'previousElementSibling',
+     'childElementCount', 'textContent', 'innerHTML', 'outerHTML', 'nodeType', 'nodeName', 'nodeValue',
+     'ownerDocument', 'isConnected', 'baseURI', 'id', 'className', 'classList', 'tagName', 'localName',
+     'namespaceURI', 'attributes', 'shadowRoot', 'slot', 'assignedSlot', 'innerText', 'hidden', 'title',
+     'lang', 'dir', 'style', 'dataset', 'host', 'value', 'checked', 'disabled', 'href', 'src', 'name', 'type',
+     'data', 'tabIndex', 'contentEditable', 'isContentEditable', 'offsetParent', 'offsetWidth', 'offsetHeight',
+     'offsetLeft', 'offsetTop', 'clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight', 'scrollTop',
+     'scrollLeft', 'activeElement'
+    ].forEach(function (k) {
+      if (Object.getOwnPropertyDescriptor(NP, k)) return;
+      var g = function () { return nget(this, k); };
+      var st = function (v) { nset(this, k, v); };
+      Object.defineProperty(g, '@@nativeAccessor', { value: true });
+      Object.defineProperty(st, '@@nativeAccessor', { value: true });
+      Object.defineProperty(NP, k, { get: g, set: st, configurable: true, enumerable: true });
+    });
+  })();
 
   // Objects are never collected while reachable from here, so a WeakRef
   // always derefs and finalizers never run.

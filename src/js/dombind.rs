@@ -225,7 +225,15 @@ fn rect(it: &Interp, id: NodeId) -> [f32; 4] {
 
 pub fn has(it: &mut Interp, o: &ObjRef, key: &str) -> bool {
     let Kind::Node(id) = o.borrow().kind else { return false };
-    matches!(key, "textContent" | "innerHTML" | "id" | "className" | "style" | "children" | "parentNode") || (is_elem(it, id) && get_attr(it, id, key).is_some() && key.starts_with("on"))
+    if matches!(key, "textContent" | "innerHTML" | "id" | "className" | "style" | "children" | "parentNode") || (is_elem(it, id) && get_attr(it, id, key).is_some() && key.starts_with("on")) {
+        return true;
+    }
+    // Geometry: answered without forcing a layout.
+    if matches!(key, "offsetWidth" | "offsetHeight" | "offsetLeft" | "offsetTop" | "clientWidth" | "clientHeight" | "scrollWidth" | "scrollHeight" | "clientTop" | "clientLeft") {
+        return is_elem(it, id);
+    }
+    // Anything else the native DOM layer serves (`"nodeType" in node`).
+    matches!(get(it, o, key), Ok(Some(_)))
 }
 
 pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
@@ -282,6 +290,7 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             Data::Doctype(_) => 10.0,
             Data::Fragment => 11.0,
         }),
+        "attributes" if it.doc.elem(id).is_some() => attributes_map(it, id),
         "nodeName" | "tagName" | "localName" => match &it.doc.nodes[id as usize].data {
             Data::Element(e) => {
                 let n = atom::name(e.tag);
@@ -351,6 +360,10 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         }
         "nextElementSibling" => node_obj(it, it.doc.next_element(id)),
         "previousElementSibling" => node_obj(it, it.doc.prev_element(id)),
+        // `data` / `nodeValue` belong to text and comment nodes; on elements
+        // `data` is an ordinary JS property (custom elements use it).
+        "data" if !is_char_data(it, id) => return Ok(None),
+        "nodeValue" if !is_char_data(it, id) => Value::Null,
         "textContent" | "innerText" | "nodeValue" | "data" | "outerText" => {
             if doc_node && key == "textContent" {
                 Value::Null
@@ -409,6 +422,29 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             Some(v) => Value::str(&crate::net::resolve(&it.url, &v)),
             None => Value::str(""),
         },
+        // URL parts of a link (`a.href = url; a.pathname` is a common parser).
+        "protocol" | "host" | "hostname" | "port" | "pathname" | "search" | "hash" | "origin" | "username" | "password"
+            if matches!(it.doc.tag(id), Some(k::a | k::area)) =>
+        {
+            let href = get_attr(it, id, "href").map(|v| crate::net::resolve(&it.url, &v)).unwrap_or_default();
+            match crate::js::web::parse_url(&href) {
+                Some(p) => Value::str(&match key {
+                    "protocol" => p.protocol.clone(),
+                    "host" if p.port.is_empty() => p.hostname.clone(),
+                    "host" => format!("{}:{}", p.hostname, p.port),
+                    "hostname" => p.hostname.clone(),
+                    "port" => p.port.clone(),
+                    "pathname" => p.pathname.clone(),
+                    "search" => p.search.clone(),
+                    "hash" => p.hash.clone(),
+                    "username" => p.username.clone(),
+                    "password" => p.password.clone(),
+                    _ if p.port.is_empty() => format!("{}//{}", p.protocol, p.hostname),
+                    _ => format!("{}//{}:{}", p.protocol, p.hostname, p.port),
+                }),
+                None => Value::str(""),
+            }
+        }
         "clientWidth" | "scrollWidth" | "clientHeight" | "scrollHeight" if id == it.doc.html || doc_node => Value::Num(match key {
             "clientWidth" | "scrollWidth" => it.vw as f64,
             "clientHeight" => it.vh as f64,
@@ -554,13 +590,16 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
         _ => {}
     }
     match key {
+        "data" if !is_char_data(it, id) => return Ok(false),
+        "nodeValue" if !is_char_data(it, id) => {}
         "textContent" | "innerText" | "nodeValue" | "data" => {
             let t = if v.is_nullish() { Rc::from("") } else { it.to_str(v)? };
             set_text(it, id, &t);
         }
         "innerHTML" => {
             let html = it.to_str(v)?;
-            let target = it.doc.templates.get(&id).copied().unwrap_or(id);
+            // A template's markup goes into its content fragment.
+            let target = if it.doc.tag(id) == Some(k::template) { it.doc.template_content(id) } else { id };
             it.doc.remove_children(target);
             for n in parse_fragment(it, &html, id) {
                 it.doc.append(target, n);
@@ -774,6 +813,7 @@ fn n_replace_with(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 fn n_clone(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let n = this_node(&t)?;
     let c = clone_node(it, n, arg(a, 0).truthy());
+    it.ce_upgrade_tree(c);
     Ok(node_obj(it, c))
 }
 fn n_contains(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
@@ -866,6 +906,72 @@ fn n_query_selector_all(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     add_list_methods(it, &arr);
     Ok(arr)
 }
+/// `element.attributes`: a snapshot NamedNodeMap of Attr-like objects.
+fn attributes_map(it: &mut Interp, id: NodeId) -> Value {
+    let attrs = it.doc.elem(id).map(|e| e.attrs.clone()).unwrap_or_default();
+    let owner = node_obj(it, id);
+    let list: Vec<Value> = attrs
+        .iter()
+        .map(|(a, v)| {
+            let o = it.plain();
+            let name = Value::str(atom::name(*a));
+            for k in ["name", "localName", "nodeName"] {
+                Interp::set_prop(&o, k, name.clone());
+            }
+            for k in ["value", "nodeValue", "textContent"] {
+                Interp::set_prop(&o, k, Value::str(v));
+            }
+            Interp::set_prop(&o, "namespaceURI", Value::Null);
+            Interp::set_prop(&o, "prefix", Value::Null);
+            Interp::set_prop(&o, "specified", Value::Bool(true));
+            Interp::set_prop(&o, "nodeType", Value::Num(2.0));
+            Interp::set_prop(&o, "ownerElement", owner.clone());
+            Value::Obj(o)
+        })
+        .collect();
+    let arr = it.array(list);
+    add_list_methods(it, &arr);
+    if let Value::Obj(o) = &arr {
+        it.def_method(o, "getNamedItem", |it, t, a| {
+            let want = it.to_str(&arg(a, 0))?.to_ascii_lowercase();
+            for x in it.iterate(&t)? {
+                let nm = it.get(&x, "name")?;
+                if it.to_str(&nm)?.eq_ignore_ascii_case(&want) {
+                    return Ok(x);
+                }
+            }
+            Ok(Value::Null)
+        });
+    }
+    arr
+}
+
+fn n_has_attributes(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    Ok(Value::Bool(it.doc.elem(n).is_some_and(|e| !e.attrs.is_empty())))
+}
+
+fn n_get_attribute_node(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    let map = attributes_map(it, n);
+    let f = it.get(&map, "getNamedItem")?;
+    it.call(&f, map, a)
+}
+
+fn d_import_node(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let Some(n) = node_id(&arg(a, 0)) else { return Err(type_error("importNode: not a node")) };
+    let c = clone_node(it, n, arg(a, 1).truthy());
+    it.ce_upgrade_tree(c);
+    Ok(node_obj(it, c))
+}
+
+fn d_adopt_node(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let Some(n) = node_id(&arg(a, 0)) else { return Err(type_error("adoptNode: not a node")) };
+    it.doc.detach(n);
+    it.dirty = true;
+    Ok(node_obj(it, n))
+}
+
 fn add_list_methods(it: &mut Interp, arr: &Value) {
     if let Value::Obj(o) = arr {
         it.def_method(o, "item", |it, t, a| {
@@ -1096,6 +1202,146 @@ fn noop(_: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
 
 // ---------------------------------------------------------------- events
 
+/// `@@nativeGet(node, key)`: the DOM layer's value of a node property.
+fn native_get(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let (Value::Obj(o), key) = (arg(a, 0), it.to_str(&arg(a, 1))?) else { return Ok(Value::Undef) };
+    if !matches!(o.borrow().kind, Kind::Node(_)) {
+        return Ok(Value::Undef);
+    }
+    Ok(get(it, &o, &key)?.unwrap_or_default())
+}
+
+/// `@@nativeSet(node, key, value)`: set through the DOM layer, or as a plain
+/// own property when it isn't a DOM property.
+fn native_set(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let (Value::Obj(o), key, v) = (arg(a, 0), it.to_str(&arg(a, 1))?, arg(a, 2)) else { return Ok(Value::Undef) };
+    if matches!(o.borrow().kind, Kind::Node(_)) && set(it, &o, &key, &v)? {
+        return Ok(Value::Undef);
+    }
+    Interp::set_prop(&o, &key, v);
+    Ok(Value::Undef)
+}
+
+fn is_char_data(it: &Interp, id: NodeId) -> bool {
+    matches!(it.doc.nodes[id as usize].data, Data::Text(_) | Data::Comment(_))
+}
+
+fn illegal_ctor(_: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Err(type_error("Illegal constructor"))
+}
+
+/// `new EventTarget()` (and `class X extends EventTarget`): a plain object
+/// keeping its own listeners.
+fn event_target_ctor(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    if let Some(t) = it.ce_this.take() {
+        return Ok(t);
+    }
+    let etp = it.p.web.get("EventTarget").cloned();
+    Ok(Value::Obj(it.new_obj(etp, Kind::Plain)))
+}
+
+/// An event target that is neither a node nor the window.
+fn is_object_target(t: &Value, it: &Interp) -> bool {
+    match t {
+        Value::Obj(o) => !Rc::ptr_eq(o, &it.global) && node_id(t).is_none(),
+        _ => false,
+    }
+}
+
+/// Listener records of an object target: [type, callback, capture, once].
+fn object_listeners(it: &mut Interp, t: &Value) -> R<ObjRef> {
+    if let Value::Obj(l) = it.get(t, "@@etl")? {
+        return Ok(l);
+    }
+    let l = it.array(Vec::new());
+    match (t, &l) {
+        (Value::Obj(o), Value::Obj(lo)) => {
+            Interp::set_hidden(o, "@@etl", l.clone());
+            Ok(lo.clone())
+        }
+        _ => Err(type_error("not an event target")),
+    }
+}
+
+fn record(v: &Value) -> Vec<Value> {
+    match v.obj() {
+        Some(o) => match &o.borrow().kind {
+            Kind::Array(a) => a.clone(),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    }
+}
+
+fn same_record(r: &[Value], ty: &str, f: &Value, capture: bool) -> bool {
+    r.len() == 4 && matches!(&r[0], Value::Str(s) if &**s == ty) && strict_eq(&r[1], f) && r[2].truthy() == capture
+}
+
+fn object_add_listener(it: &mut Interp, t: &Value, ty: Rc<str>, f: Value, capture: bool, once: bool) -> R<()> {
+    let l = object_listeners(it, t)?;
+    let dup = match &l.borrow().kind {
+        Kind::Array(v) => v.iter().any(|e| same_record(&record(e), &ty, &f, capture)),
+        _ => false,
+    };
+    if !dup {
+        let rec = it.array(vec![Value::Str(ty), f, Value::Bool(capture), Value::Bool(once)]);
+        if let Kind::Array(v) = &mut l.borrow_mut().kind {
+            v.push(rec);
+        }
+    }
+    Ok(())
+}
+
+fn object_remove_listener(it: &mut Interp, t: &Value, ty: &str, f: &Value, capture: bool) -> R<()> {
+    let l = object_listeners(it, t)?;
+    if let Kind::Array(v) = &mut l.borrow_mut().kind {
+        v.retain(|e| !same_record(&record(e), ty, f, capture));
+    }
+    Ok(())
+}
+
+/// Dispatch at an object target: its listeners, then its `on<type>`.
+fn object_dispatch(it: &mut Interp, t: &Value, ty: &str, ev: Value) -> R<bool> {
+    it.put(&ev, "target", t.clone())?;
+    it.put(&ev, "currentTarget", t.clone())?;
+    it.put(&ev, "eventPhase", Value::Num(2.0))?;
+    let l = object_listeners(it, t)?;
+    let recs: Vec<Vec<Value>> = match &l.borrow().kind {
+        Kind::Array(v) => v.iter().map(record).filter(|r| r.len() == 4 && matches!(&r[0], Value::Str(s) if &**s == ty)).collect(),
+        _ => Vec::new(),
+    };
+    let mut fs: Vec<Value> = Vec::new();
+    for r in recs {
+        if r[3].truthy() {
+            object_remove_listener(it, t, ty, &r[1], r[2].truthy())?;
+        }
+        fs.push(r[1].clone());
+    }
+    let prop = it.get(t, &format!("on{ty}")).unwrap_or_default();
+    if Interp::is_callable(&prop) {
+        fs.push(prop);
+    }
+    for f in fs {
+        let r = if Interp::is_callable(&f) {
+            it.call(&f, t.clone(), std::slice::from_ref(&ev))
+        } else {
+            match it.get(&f, "handleEvent") {
+                Ok(h) => it.call(&h, f.clone(), std::slice::from_ref(&ev)),
+                Err(e) => Err(e),
+            }
+        };
+        if let Err(e) = r {
+            let m = it.describe_error(&e);
+            it.log(&format!("Uncaught {m}"));
+        }
+        if it.get(&ev, "@@stopImmediate")?.truthy() {
+            break;
+        }
+    }
+    it.put(&ev, "eventPhase", Value::Num(0.0))?;
+    Ok(it.get(&ev, "defaultPrevented")?.truthy())
+}
+
 fn target_of(t: &Value, it: &Interp) -> u32 {
     match t {
         Value::Obj(o) if Rc::ptr_eq(o, &it.global) => WINDOW,
@@ -1121,6 +1367,10 @@ fn add_listener(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
         return Ok(Value::Undef);
     }
     let (capture, once, passive, signal) = listener_opts(it, &arg(a, 2))?;
+    if is_object_target(&t, it) {
+        object_add_listener(it, &t, ty, f, capture, once)?;
+        return Ok(Value::Undef);
+    }
     if let Some(s) = &signal {
         if it.get(s, "aborted")?.truthy() {
             return Ok(Value::Undef);
@@ -1136,14 +1386,22 @@ fn remove_listener(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let ty = it.to_str(&arg(a, 0))?;
     let f = arg(a, 1);
     let (capture, ..) = listener_opts(it, &arg(a, 2))?;
+    if is_object_target(&t, it) {
+        object_remove_listener(it, &t, &ty, &f, capture)?;
+        return Ok(Value::Undef);
+    }
     it.listeners.retain(|l| !(l.target == target && l.ty == ty && l.capture == capture && strict_eq(&l.f, &f)));
     Ok(Value::Undef)
 }
 fn dispatch_event_m(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let target = target_of(&t, it);
     let ev = arg(a, 0);
     let ty = it.get(&ev, "type")?;
     let ty = it.to_str(&ty)?;
+    if is_object_target(&t, it) {
+        let prevented = object_dispatch(it, &t, &ty, ev)?;
+        return Ok(Value::Bool(!prevented));
+    }
+    let target = target_of(&t, it);
     let prevented = dispatch_obj(it, target, &ty, ev)?;
     Ok(Value::Bool(!prevented))
 }
@@ -1849,7 +2107,13 @@ fn loc_assign(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
 
 pub fn install(it: &mut Interp) {
     let obj_proto = it.p.object.clone();
-    let np = it.new_obj(obj_proto.clone(), Kind::Plain);
+    // EventTarget.prototype: the root of nodes' and the window's chains.
+    let etp = it.new_obj(obj_proto.clone(), Kind::Plain);
+    it.def_method(&etp, "addEventListener", add_listener);
+    it.def_method(&etp, "removeEventListener", remove_listener);
+    it.def_method(&etp, "dispatchEvent", dispatch_event_m);
+    it.p.web.insert("EventTarget", etp.clone());
+    let np = it.new_obj(Some(etp.clone()), Kind::Plain);
     it.p.node = Some(np.clone());
     let methods: &[(&'static str, NativeFn)] = &[
         ("appendChild", n_append_child),
@@ -1863,6 +2127,8 @@ pub fn install(it: &mut Interp) {
         ("after", n_after),
         ("replaceWith", n_replace_with),
         ("cloneNode", n_clone),
+        ("importNode", d_import_node),
+        ("adoptNode", d_adopt_node),
         ("contains", n_contains),
         ("hasChildNodes", n_has_child_nodes),
         ("getAttribute", n_get_attribute),
@@ -1870,6 +2136,8 @@ pub fn install(it: &mut Interp) {
         ("setAttributeNS", |it, t, a| n_set_attribute(it, t, &a[1.min(a.len())..])),
         ("removeAttribute", n_remove_attribute),
         ("hasAttribute", n_has_attribute),
+        ("hasAttributes", n_has_attributes),
+        ("getAttributeNode", n_get_attribute_node),
         ("toggleAttribute", n_toggle_attribute),
         ("getAttributeNames", n_attribute_names),
         ("querySelector", n_query_selector),
@@ -1881,9 +2149,6 @@ pub fn install(it: &mut Interp) {
         ("matches", n_matches),
         ("insertAdjacentHTML", n_insert_adjacent_html),
         ("getBoundingClientRect", n_bounding_rect),
-        ("addEventListener", add_listener),
-        ("removeEventListener", remove_listener),
-        ("dispatchEvent", dispatch_event_m),
         ("click", n_click),
         ("getContext", |_, _, _| Ok(Value::Null)),
         ("toDataURL", |_, _, _| Ok(Value::str("data:,"))),
@@ -1940,10 +2205,27 @@ pub fn install(it: &mut Interp) {
     let g = it.global.clone();
     let doc = node_obj(it, 0);
     Interp::set_hidden(&g, "document", doc);
-    for n in ["addEventListener", "removeEventListener", "dispatchEvent"] {
-        let f = it.get(&Value::Obj(np.clone()), n).unwrap_or_default();
-        Interp::set_hidden(&g, n, f);
+    // Helpers behind the DOM accessors the prelude installs on Node.prototype.
+    let ng = it.native(native_get, "get");
+    Interp::set_hidden(&g, "@@nativeGet", ng);
+    let ns = it.native(native_set, "set");
+    Interp::set_hidden(&g, "@@nativeSet", ns);
+    // window -> Window.prototype -> EventTarget.prototype -> Object.prototype
+    let etp = it.p.web.get("EventTarget").cloned().expect("EventTarget.prototype");
+    let wp = it.new_obj(Some(etp.clone()), Kind::Plain);
+    g.borrow_mut().proto = Some(wp.clone());
+    let wc = it.native(illegal_ctor, "Window");
+    if let Value::Obj(c) = &wc {
+        Interp::set_hidden(c, "prototype", Value::Obj(wp.clone()));
     }
+    Interp::set_hidden(&wp, "constructor", wc.clone());
+    Interp::set_hidden(&g, "Window", wc);
+    let ec = it.native(event_target_ctor, "EventTarget");
+    if let Value::Obj(c) = &ec {
+        Interp::set_hidden(c, "prototype", Value::Obj(etp.clone()));
+    }
+    Interp::set_hidden(&etp, "constructor", ec.clone());
+    Interp::set_hidden(&g, "EventTarget", ec);
     let ctor = |it: &mut Interp, name: &'static str, f: NativeFn, proto: Option<ObjRef>| {
         let c = it.native(f, name);
         if let (Value::Obj(co), Some(p)) = (&c, proto) {
@@ -1966,13 +2248,13 @@ pub fn install(it: &mut Interp) {
     for n in [
         "Node", "Element", "HTMLElement", "HTMLDivElement", "HTMLSpanElement", "HTMLInputElement", "HTMLAnchorElement",
         "HTMLImageElement", "HTMLDocument", "Document", "DocumentFragment", "Text", "Comment", "CharacterData",
-        "EventTarget", "SVGElement", "SVGSVGElement", "HTMLTemplateElement", "HTMLScriptElement", "HTMLStyleElement",
+        "SVGElement", "SVGSVGElement", "HTMLTemplateElement", "HTMLScriptElement", "HTMLStyleElement",
         "HTMLLinkElement", "HTMLMetaElement", "HTMLButtonElement", "HTMLFormElement", "HTMLSelectElement",
         "HTMLOptionElement", "HTMLTextAreaElement", "HTMLLabelElement", "HTMLIFrameElement", "HTMLCanvasElement",
         "HTMLVideoElement", "HTMLAudioElement", "HTMLMediaElement", "HTMLBodyElement", "HTMLHeadElement",
         "HTMLHtmlElement", "HTMLParagraphElement", "HTMLHeadingElement", "HTMLUListElement", "HTMLLIElement",
         "HTMLTableElement", "HTMLSlotElement", "HTMLUnknownElement", "ShadowRoot",
-        "Attr", "XMLDocument", "MathMLElement", "SVGGraphicsElement", "SVGGeometryElement", "SVGPathElement",
+        "Attr", "CDATASection", "ProcessingInstruction", "DocumentType", "XMLDocument", "MathMLElement", "SVGGraphicsElement", "SVGGeometryElement", "SVGPathElement",
         "SVGGElement", "SVGUseElement", "SVGSymbolElement", "SVGRectElement", "SVGCircleElement", "SVGTextElement",
         "SVGImageElement", "SVGDefsElement", "SVGStopElement", "SVGLinearGradientElement", "SVGForeignObjectElement",
         "HTMLDialogElement", "HTMLTitleElement", "HTMLDetailsElement", "HTMLPictureElement", "HTMLSourceElement",

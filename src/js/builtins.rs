@@ -53,7 +53,15 @@ fn this_arr(this: &Value) -> R<ObjRef> {
     }
 }
 
+/// The array's elements (holes read as undefined).
 fn arr_vec(this: &Value) -> R<Vec<Value>> {
+    let o = this_arr(this)?;
+    let b = o.borrow();
+    if let Kind::Array(a) = &b.kind { Ok(a.iter().cloned().map(Value::unhole).collect()) } else { unreachable!() }
+}
+
+/// The array's elements, holes included.
+fn arr_vec_raw(this: &Value) -> R<Vec<Value>> {
     let o = this_arr(this)?;
     let b = o.borrow();
     if let Kind::Array(a) = &b.kind { Ok(a.clone()) } else { unreachable!() }
@@ -335,6 +343,33 @@ pub fn install(it: &mut Interp) {
         ("toLocaleTimeString", date_locale_time),
         ("toLocaleString", date_to_string),
         ("setTime", date_set_time),
+        ("getUTCMilliseconds", |it, t, _| date_part(it, &t, 7)),
+        ("getYear", |it, t, _| {
+            let y = date_part(it, &t, 0)?;
+            Ok(match y {
+                Value::Num(y) => Value::Num(y - 1900.0),
+                v => v,
+            })
+        }),
+        ("setFullYear", |it, t, a| date_set(it, &t, a, 0)),
+        ("setUTCFullYear", |it, t, a| date_set(it, &t, a, 0)),
+        ("setMonth", |it, t, a| date_set(it, &t, a, 1)),
+        ("setUTCMonth", |it, t, a| date_set(it, &t, a, 1)),
+        ("setDate", |it, t, a| date_set(it, &t, a, 2)),
+        ("setUTCDate", |it, t, a| date_set(it, &t, a, 2)),
+        ("setHours", |it, t, a| date_set(it, &t, a, 4)),
+        ("setUTCHours", |it, t, a| date_set(it, &t, a, 4)),
+        ("setMinutes", |it, t, a| date_set(it, &t, a, 5)),
+        ("setUTCMinutes", |it, t, a| date_set(it, &t, a, 5)),
+        ("setSeconds", |it, t, a| date_set(it, &t, a, 6)),
+        ("setUTCSeconds", |it, t, a| date_set(it, &t, a, 6)),
+        ("setMilliseconds", |it, t, a| date_set(it, &t, a, 7)),
+        ("setUTCMilliseconds", |it, t, a| date_set(it, &t, a, 7)),
+        ("setYear", |it, t, a| {
+            let y = num(it, a, 0)?;
+            let y = if (0.0..=99.0).contains(&y.trunc()) { 1900.0 + y.trunc() } else { y };
+            date_set(it, &t, &[Value::Num(y)], 0)
+        }),
     ] {
         it.def_method(&dp, n, f);
     }
@@ -387,6 +422,7 @@ pub fn install(it: &mut Interp) {
     for (n, f) in [
         ("parseInt", parse_int as NativeFn),
         ("parseFloat", parse_float),
+        ("eval", global_eval),
         ("isNaN", global_is_nan),
         ("isFinite", global_is_finite),
         ("encodeURIComponent", encode_uri_component),
@@ -550,6 +586,15 @@ fn obj_get_own_desc(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let Value::Obj(ob) = &o else { return Ok(Value::Undef) };
     let p = ob.borrow().props.get(&key).cloned();
     let Some(p) = p else {
+        // Virtual own properties (array indices, length, DOM attributes...)
+        // get a value descriptor; inherited ones are not own.
+        let mut cur = ob.borrow().proto.clone();
+        while let Some(c) = cur {
+            if c.borrow().props.get(&key).is_some() {
+                return Ok(Value::Undef);
+            }
+            cur = c.borrow().proto.clone();
+        }
         if it.has_prop(&o, &key) {
             let v = it.get(&o, &key)?;
             let d = it.plain();
@@ -569,6 +614,13 @@ fn obj_get_own_desc(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     Interp::set_prop(&d, "enumerable", Value::Bool(p.enumerable));
     Interp::set_prop(&d, "configurable", Value::Bool(true));
     Ok(Value::Obj(d))
+}
+/// `eval(src)`, evaluated in the global scope (indirect eval semantics).
+fn global_eval(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    match arg(a, 0) {
+        Value::Str(src) => it.eval_global(&src),
+        v => Ok(v),
+    }
 }
 fn obj_from_entries(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let o = it.plain();
@@ -605,7 +657,7 @@ fn obj_to_string(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
         }
     }
     Ok(Value::str(match &t {
-        Value::Undef => "[object Undefined]",
+        Value::Undef | Value::Hole => "[object Undefined]",
         Value::Null => "[object Null]",
         Value::BigInt(_) => "[object BigInt]",
         Value::Obj(o) => match o.borrow().kind {
@@ -688,7 +740,7 @@ fn array_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
             if n < 0.0 || n.fract() != 0.0 || n > 1e8 {
                 return Err(make_error_value("RangeError", "Invalid array length"));
             }
-            return Ok(it.array(vec![Value::Undef; n as usize]));
+            return Ok(it.array(vec![Value::Hole; n as usize]));
         }
     }
     Ok(it.array(a.to_vec()))
@@ -750,10 +802,10 @@ fn arr_splice(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     Ok(it.array(removed))
 }
 fn arr_concat(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let mut v = arr_vec(&t)?;
+    let mut v = arr_vec_raw(&t)?;
     for x in a {
         match x {
-            Value::Obj(o) if matches!(o.borrow().kind, Kind::Array(_)) => v.extend(arr_vec(x)?),
+            Value::Obj(o) if matches!(o.borrow().kind, Kind::Array(_)) => v.extend(arr_vec_raw(x)?),
             _ => v.push(x.clone()),
         }
     }
@@ -791,9 +843,9 @@ fn rel_arg(it: &mut Interp, v: &Value, len: usize, default: usize) -> R<usize> {
 }
 fn arr_index_of(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let x = arg(a, 0);
-    let v = arr_vec(&t)?;
+    let v = arr_vec_raw(&t)?;
     let from = rel_arg(it, &arg(a, 1), v.len(), 0)?;
-    ok_num(v[from..].iter().position(|v| strict_eq(v, &x)).map_or(-1.0, |i| (i + from) as f64))
+    ok_num(v[from..].iter().position(|v| !matches!(v, Value::Hole) && strict_eq(v, &x)).map_or(-1.0, |i| (i + from) as f64))
 }
 fn arr_last_index_of(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let x = arg(a, 0);
@@ -938,14 +990,27 @@ array_methods! {
     "toReversed" => g_to_reversed(arr_to_reversed, false),
     "toSpliced" => g_to_spliced(arr_to_spliced, false),
 }
-fn each(it: &mut Interp, t: &Value, a: &[Value], mut f: impl FnMut(&mut Interp, usize, &Value, Value) -> R<bool>) -> R<()> {
-    let v = arr_vec(t)?;
+fn each(it: &mut Interp, t: &Value, a: &[Value], f: impl FnMut(&mut Interp, usize, &Value, Value) -> R<bool>) -> R<()> {
+    each_impl(it, t, a, false, f)
+}
+
+/// Like `each`, skipping holes (map, forEach, filter, some, every).
+fn each_present(it: &mut Interp, t: &Value, a: &[Value], f: impl FnMut(&mut Interp, usize, &Value, Value) -> R<bool>) -> R<()> {
+    each_impl(it, t, a, true, f)
+}
+
+fn each_impl(it: &mut Interp, t: &Value, a: &[Value], skip_holes: bool, mut f: impl FnMut(&mut Interp, usize, &Value, Value) -> R<bool>) -> R<()> {
+    let raw = arr_vec_raw(t)?;
+    let v: Vec<Value> = if skip_holes { raw } else { raw.into_iter().map(Value::unhole).collect() };
     let cb = arg(a, 0);
     if !Interp::is_callable(&cb) {
         return Err(type_error("callback is not a function"));
     }
     let this = arg(a, 1);
     for (i, x) in v.iter().enumerate() {
+        if matches!(x, Value::Hole) {
+            continue;
+        }
         let r = it.call(&cb, this.clone(), &[x.clone(), Value::Num(i as f64), t.clone()])?;
         if !f(it, i, x, r)? {
             break;
@@ -990,7 +1055,7 @@ fn arr_find_last_index(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 }
 fn arr_filter(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let mut out = Vec::new();
-    each(it, &t, a, |_, _, x, r| {
+    each_present(it, &t, a, |_, _, x, r| {
         if r.truthy() {
             out.push(x.clone());
         }
@@ -999,20 +1064,23 @@ fn arr_filter(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     Ok(it.array(out))
 }
 fn arr_map(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let mut out = Vec::new();
-    each(it, &t, a, |_, _, _, r| {
-        out.push(r);
+    // The result keeps the source's holes.
+    let mut out = vec![Value::Hole; arr_vec_raw(&t)?.len()];
+    each_present(it, &t, a, |_, i, _, r| {
+        if i < out.len() {
+            out[i] = r;
+        }
         Ok(true)
     })?;
     Ok(it.array(out))
 }
 fn arr_for_each(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    each(it, &t, a, |_, _, _, _| Ok(true))?;
+    each_present(it, &t, a, |_, _, _, _| Ok(true))?;
     Ok(Value::Undef)
 }
 fn arr_some(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let mut any = false;
-    each(it, &t, a, |_, _, _, r| {
+    each_present(it, &t, a, |_, _, _, r| {
         any = r.truthy();
         Ok(!any)
     })?;
@@ -1020,16 +1088,16 @@ fn arr_some(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 }
 fn arr_every(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let mut all = true;
-    each(it, &t, a, |_, _, _, r| {
+    each_present(it, &t, a, |_, _, _, r| {
         all = r.truthy();
         Ok(all)
     })?;
     Ok(Value::Bool(all))
 }
 fn arr_reduce(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let v = arr_vec(&t)?;
+    let v = arr_vec_raw(&t)?;
     let f = arg(a, 0);
-    let mut iter = v.into_iter().enumerate();
+    let mut iter = v.into_iter().enumerate().filter(|(_, x)| !matches!(x, Value::Hole));
     let mut acc = if a.len() >= 2 {
         a[1].clone()
     } else {
@@ -1044,7 +1112,7 @@ fn arr_reduce(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     Ok(acc)
 }
 fn arr_reduce_right(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let rev = it.array(arr_vec(&t)?.into_iter().rev().collect());
+    let rev = it.array(arr_vec_raw(&t)?.into_iter().rev().collect());
     arr_reduce(it, rev, a)
 }
 fn sort_values(it: &mut Interp, v: &mut [Value], f: &Value) -> R<()> {
@@ -1896,7 +1964,7 @@ fn json_ser(it: &mut Interp, v: &Value, indent: &str, cur: &str, out: &mut Strin
         }
     }
     match &v {
-        Value::Undef => return Ok(false),
+        Value::Undef | Value::Hole => return Ok(false),
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Num(n) => out.push_str(&if n.is_finite() { num_to_str(*n) } else { "null".into() }),
@@ -2309,6 +2377,48 @@ fn date_set_time(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     }
     ok_num(n)
 }
+/// Date setters: overwrite fields starting at `first` (0 year, 1 month,
+/// 2 day, 4 hours, 5 minutes, 6 seconds, 7 ms) with the arguments, then
+/// recompute the time value (out-of-range fields carry over, as in JS).
+fn date_set(it: &mut Interp, t: &Value, a: &[Value], first: usize) -> R<Value> {
+    let cur = this_date(t)?;
+    if cur.is_nan() && first != 0 {
+        return ok_num(f64::NAN);
+    }
+    let f = if cur.is_nan() { date_fields(0.0) } else { date_fields(cur) };
+    let mut v: [f64; 8] = f.map(|x| x as f64);
+    let order: &[usize] = match first {
+        0 => &[0, 1, 2],
+        1 => &[1, 2],
+        2 => &[2],
+        4 => &[4, 5, 6, 7],
+        5 => &[5, 6, 7],
+        6 => &[6, 7],
+        _ => &[7],
+    };
+    for (i, &field) in order.iter().enumerate() {
+        if i == 0 || i < a.len() {
+            let x = num(it, a, i)?;
+            if !x.is_finite() {
+                set_date_value(t, f64::NAN);
+                return ok_num(f64::NAN);
+            }
+            v[field] = x.trunc();
+        }
+    }
+    let days = days_from_civil(v[0] as i64, v[1] as i64, 1) as f64 + v[2] - 1.0;
+    let ms = days * 86_400_000.0 + v[4] * 3_600_000.0 + v[5] * 60_000.0 + v[6] * 1000.0 + v[7];
+    let ms = if ms.abs() > 8.64e15 { f64::NAN } else { ms };
+    set_date_value(t, ms);
+    ok_num(ms)
+}
+
+fn set_date_value(t: &Value, ms: f64) {
+    if let Value::Obj(o) = t {
+        o.borrow_mut().kind = Kind::Date(ms);
+    }
+}
+
 fn date_fields(ms: f64) -> [i64; 8] {
     let ms_i = ms as i64;
     let days = ms_i.div_euclid(86_400_000);
@@ -2520,6 +2630,10 @@ pub fn settle(it: &mut Interp, p: &ObjRef, ok: bool, v: Value) {
             _ => Vec::new(),
         }
     };
+    if !ok && reactions.is_empty() {
+        // Reported at the next checkpoint unless a handler is attached.
+        it.unhandled_rejections.push(p.clone());
+    }
     for (on_ok, on_err, child) in reactions {
         schedule_reaction(it, if ok { on_ok } else { on_err }, child, ok, v.clone());
     }
@@ -2615,6 +2729,9 @@ fn schedule_reaction(it: &mut Interp, handler: Value, child: ObjRef, ok: bool, v
 }
 
 fn add_reaction(it: &mut Interp, p: &ObjRef, on_ok: Value, on_err: Value, child: Option<ObjRef>) -> ObjRef {
+    if !it.unhandled_rejections.is_empty() {
+        it.unhandled_rejections.retain(|u| !Rc::ptr_eq(u, p));
+    }
     let child = child.unwrap_or_else(|| new_promise(it));
     let state = {
         let mut b = p.borrow_mut();
