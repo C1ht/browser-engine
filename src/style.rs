@@ -1678,7 +1678,7 @@ mod tests {
             <div><p>a</p><p id=x class=big>b</p></div><p>c</p>"#,
         );
         let m = Media { vw: 800.0, vh: 600.0 };
-        let sheets: Vec<(String, String)> = doc.styles.iter().map(|s| (s.clone(), String::new())).collect();
+        let sheets = crate::engine::sheets_for(&doc, "", &mut Default::default());
         let cas = build_cascade(&sheets, &m, doc.quirks);
         let st = compute(&doc, &cas, 800.0, 600.0);
         let elems = |n| doc.children(n).filter(|&c| doc.elem(c).is_some()).collect::<Vec<_>>();
@@ -1701,7 +1701,7 @@ mod tests {
                .x { --fg: blue }</style><p>a</p><div class=x><p>b</p></div>"#,
         );
         let m = Media { vw: 800.0, vh: 600.0 };
-        let sheets: Vec<(String, String)> = doc.styles.iter().map(|s| (s.clone(), String::new())).collect();
+        let sheets = crate::engine::sheets_for(&doc, "", &mut Default::default());
         let cas = build_cascade(&sheets, &m, doc.quirks);
         let st = compute(&doc, &cas, 800.0, 600.0);
         let ps: Vec<_> = (0..doc.nodes.len() as u32).filter(|&n| doc.tag(n) == Some(k::p)).collect();

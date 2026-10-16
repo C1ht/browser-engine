@@ -16,6 +16,7 @@ mod brotli_tables;
 mod css;
 mod dom;
 mod engine;
+mod entities;
 mod fonts;
 mod forms;
 mod fx;
@@ -142,7 +143,8 @@ fn dump(doc: &dom::Document, n: dom::NodeId, depth: usize) {
                 println!("{}\"{}\"", "  ".repeat(depth), short);
             }
         }
-        dom::Data::Document => {}
+        dom::Data::Comment(t) => println!("{}<!--{}-->", "  ".repeat(depth), t.chars().take(50).collect::<String>()),
+        _ => {}
     }
 }
 
@@ -175,12 +177,13 @@ fn bench(a: &Args) {
         Err(e) => return eprintln!("load failed: {e}"),
     };
     let (w, h) = (a.width, if a.height == 0 { 768 } else { a.height });
-    println!("bench {}  ({} bytes html, {} stylesheets, fetch {:.1}ms)", l.url, l.html.len(), l.sheets.len(), l.fetch_ms);
-    let (html, sheets, url) = (l.html.clone(), l.sheets.clone(), l.url.clone());
+    println!("bench {}  ({} bytes html, {} stylesheets, fetch {:.1}ms)", l.url, l.html.len(), l.css.len(), l.fetch_ms);
+    let (html, url) = (l.html.clone(), l.url.clone());
     // Load images once so layout and paint include them.
     let mut page = Page::new(l, w as f32, h as f32);
     page.load_fonts_blocking(w as f32, h as f32);
     page.load_images_blocking(w as f32, h as f32);
+    let sheets = engine::sheets_for(&page.doc, &page.base, &mut page.css);
     let (mut res, base) = (page.res, page.base);
     let _ = url;
     let mut glyphs = GlyphCache::default();
@@ -407,7 +410,8 @@ impl Browser {
         self.scroll = 0.0;
         self.repaint();
         if let Some(p) = &self.page {
-            let title = if p.title().is_empty() { p.url.as_str() } else { p.title() };
+            let title = p.title();
+            let title = if title.is_empty() { p.url.as_str() } else { title.as_str() };
             self.window.set_title(&format!("{title} — bolt"));
             eprintln!("[bolt] {}\n        fetch {:.1}ms | scripts {:.1}ms | {}", p.url, p.t.fetch, p.script_ms, p.t.summary());
         }

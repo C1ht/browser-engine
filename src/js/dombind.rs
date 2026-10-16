@@ -3,7 +3,7 @@
 use super::builtins::{arg, make_error_value};
 use super::*;
 use crate::atom::{self, k};
-use crate::dom::{Data, Element, NONE};
+use crate::dom::{Data, Element, Ns, NONE};
 
 // ------------------------------------------------------------- wrappers
 
@@ -58,7 +58,8 @@ fn descendants(it: &Interp, root: NodeId) -> Vec<NodeId> {
 
 fn text_of(it: &Interp, id: NodeId) -> String {
     match &it.doc.nodes[id as usize].data {
-        Data::Text(t) => t.clone(),
+        Data::Text(t) | Data::Comment(t) => t.clone(),
+        Data::Doctype(_) | Data::Document => String::new(),
         _ => {
             let mut s = String::new();
             it.doc.text_content(id, &mut s);
@@ -68,9 +69,10 @@ fn text_of(it: &Interp, id: NodeId) -> String {
 }
 
 fn set_text(it: &mut Interp, id: NodeId, s: &str) {
-    if let Data::Text(t) = &mut it.doc.nodes[id as usize].data {
+    if let Data::Text(t) | Data::Comment(t) = &mut it.doc.nodes[id as usize].data {
         *t = s.to_owned();
     } else {
+        let id = it.doc.templates.get(&id).copied().unwrap_or(id);
         it.doc.remove_children(id);
         if !s.is_empty() {
             let t = it.doc.add(Data::Text(s.to_owned()));
@@ -80,34 +82,27 @@ fn set_text(it: &mut Interp, id: NodeId, s: &str) {
     it.dirty = true;
 }
 
-/// Parse an HTML fragment into detached nodes of the live document.
-fn parse_fragment(it: &mut Interp, html: &str) -> Vec<NodeId> {
-    let frag = crate::html::parse(html);
+/// Parse an HTML fragment (as the contents of `context`) into detached
+/// nodes of the live document.
+fn parse_fragment(it: &mut Interp, html: &str, context: NodeId) -> Vec<NodeId> {
+    let (tag, ns) = match it.doc.elem(context) {
+        Some(e) => (e.tag, e.ns),
+        None => (k::body, Ns::Html),
+    };
+    let frag = crate::html::parse_fragment(html, tag, ns);
     let mut out = Vec::new();
-    for c in frag.children(frag.body).collect::<Vec<_>>() {
+    for c in frag.children(frag.html).collect::<Vec<_>>() {
         out.push(it.doc.import(&frag, c));
     }
     out
 }
 
 fn clone_node(it: &mut Interp, n: NodeId, deep: bool) -> NodeId {
-    let data = match &it.doc.nodes[n as usize].data {
-        Data::Element(e) => Data::Element(Element { tag: e.tag, id: e.id, classes: e.classes.clone(), attrs: e.attrs.clone() }),
-        Data::Text(t) => Data::Text(t.clone()),
-        Data::Document => Data::Text(String::new()),
-    };
-    let id = it.doc.add(data);
-    if deep {
-        for c in it.doc.children(n).collect::<Vec<_>>() {
-            let cc = clone_node(it, c, true);
-            it.doc.append(id, cc);
-        }
-    }
-    id
+    it.doc.clone_node(n, deep)
 }
 
 fn is_fragment(it: &Interp, id: NodeId) -> bool {
-    it.doc.tag(id).is_some_and(|t| atom::name(t) == "#document-fragment")
+    matches!(it.doc.nodes[id as usize].data, Data::Fragment)
 }
 
 /// Insert (moving fragments' children) and run newly connected scripts.
@@ -261,18 +256,38 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             Data::Element(_) => 1.0,
             Data::Text(_) => 3.0,
             Data::Document => 9.0,
+            Data::Comment(_) => 8.0,
+            Data::Doctype(_) => 10.0,
+            Data::Fragment => 11.0,
         }),
         "nodeName" | "tagName" | "localName" => match &it.doc.nodes[id as usize].data {
             Data::Element(e) => {
                 let n = atom::name(e.tag);
-                Value::str(&if key == "localName" { n.to_owned() } else { n.to_ascii_uppercase() })
+                Value::str(&match e.ns {
+                    Ns::Svg => crate::dom::svg_tag_case(n).to_owned(),
+                    _ if key == "localName" => n.to_owned(),
+                    Ns::Html => n.to_ascii_uppercase(),
+                    Ns::MathMl => n.to_owned(),
+                })
             }
+            _ if key != "nodeName" => Value::Undef,
             Data::Text(_) => Value::str("#text"),
             Data::Document => Value::str("#document"),
+            Data::Comment(_) => Value::str("#comment"),
+            Data::Fragment => Value::str("#document-fragment"),
+            Data::Doctype(d) => Value::str(&d.name),
+        },
+        "name" | "publicId" | "systemId" if matches!(it.doc.nodes[id as usize].data, Data::Doctype(_)) => match &it.doc.nodes[id as usize].data {
+            Data::Doctype(d) => Value::str(match key {
+                "name" => &d.name,
+                "publicId" => d.public.as_deref().unwrap_or(""),
+                _ => d.system.as_deref().unwrap_or(""),
+            }),
+            _ => Value::Undef,
         },
         "parentNode" | "parentElement" => {
             let p = it.doc.parent(id);
-            if key == "parentElement" && (p == NONE || p == 0) { Value::Null } else { node_obj(it, p) }
+            if key == "parentElement" && (p == NONE || p == 0 || it.doc.elem(p).is_none()) { Value::Null } else { node_obj(it, p) }
         }
         "childNodes" => {
             let kids = it.doc.children(id).collect();
@@ -295,7 +310,20 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             let c = it.doc.children(id).filter(|&c| is_elem(it, c)).last().unwrap_or(NONE);
             node_obj(it, c)
         }
-        "content" if it.doc.tag(id) == Some(k::template) => node_obj(it, id),
+        "content" if it.doc.tag(id) == Some(k::template) => {
+            let c = it.doc.template_content(id);
+            node_obj(it, c)
+        }
+        "namespaceURI" => match it.doc.elem(id).map(|e| e.ns) {
+            Some(Ns::Html) => Value::str("http://www.w3.org/1999/xhtml"),
+            Some(Ns::Svg) => Value::str("http://www.w3.org/2000/svg"),
+            Some(Ns::MathMl) => Value::str("http://www.w3.org/1998/Math/MathML"),
+            None => Value::Null,
+        },
+        "doctype" if doc_node => {
+            let d = it.doc.children(0).find(|&c| matches!(it.doc.nodes[c as usize].data, Data::Doctype(_))).unwrap_or(NONE);
+            node_obj(it, d)
+        }
         "nextElementSibling" => node_obj(it, it.doc.next_element(id)),
         "previousElementSibling" => node_obj(it, it.doc.prev_element(id)),
         "textContent" | "innerText" | "nodeValue" | "data" | "outerText" => {
@@ -343,12 +371,9 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "offsetParent" => node_obj(it, it.doc.body),
         // document-only
         "body" if doc_node => node_obj(it, it.doc.body),
-        "head" if doc_node => {
-            let h = it.doc.children(it.doc.html).find(|&c| it.doc.tag(c) == Some(k::head)).unwrap_or(NONE);
-            node_obj(it, h)
-        }
+        "head" if doc_node => node_obj(it, it.doc.head),
         "documentElement" | "scrollingElement" if doc_node => node_obj(it, it.doc.html),
-        "title" if doc_node => Value::str(&it.doc.title),
+        "title" if doc_node => Value::str(&it.doc.title()),
         "readyState" if doc_node => Value::str("complete"),
         "visibilityState" if doc_node => Value::str("visible"),
         "URL" | "documentURI" if doc_node => Value::str(&it.url),
@@ -448,9 +473,10 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
         }
         "innerHTML" => {
             let html = it.to_str(v)?;
-            it.doc.remove_children(id);
-            for n in parse_fragment(it, &html) {
-                it.doc.append(id, n);
+            let target = it.doc.templates.get(&id).copied().unwrap_or(id);
+            it.doc.remove_children(target);
+            for n in parse_fragment(it, &html, id) {
+                it.doc.append(target, n);
             }
             it.dirty = true;
         }
@@ -459,7 +485,7 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
             let p = it.doc.parent(id);
             if p != NONE {
                 let next = it.doc.nodes[id as usize].next;
-                for n in parse_fragment(it, &html) {
+                for n in parse_fragment(it, &html, p) {
                     it.doc.insert_before(p, n, next);
                 }
                 it.doc.detach(id);
@@ -492,11 +518,12 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
             } else {
                 it.doc.remove_attr(id, a);
             }
-            crate::forms::refresh(&mut it.doc, id);
+
             it.dirty = true;
         }
         "title" if id == 0 => {
-            it.doc.title = it.to_str(v)?.to_string();
+            let t = it.to_str(v)?;
+            it.doc.set_title(&t);
         }
         "cookie" if id == 0 => {
             let c = it.to_str(v)?;
@@ -773,8 +800,9 @@ fn n_insert_adjacent_html(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let n = this_node(&t)?;
     let pos = it.to_str(&arg(a, 0))?.to_ascii_lowercase();
     let html = it.to_str(&arg(a, 1))?;
-    let nodes = parse_fragment(it, &html);
     let p = it.doc.parent(n);
+    let ctx = if matches!(pos.as_str(), "beforebegin" | "afterend") { p } else { n };
+    let nodes = parse_fragment(it, &html, ctx);
     for c in nodes {
         match pos.as_str() {
             "beforebegin" if p != NONE => it.doc.insert_before(p, c, n),
@@ -995,8 +1023,19 @@ fn d_get_by_id(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     Ok(node_obj(it, found.unwrap_or(NONE)))
 }
 fn d_create_element(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
-    let tag = it.to_str(&arg(a, if a.len() > 1 && matches!(arg(a, 1), Value::Str(_)) { 1 } else { 0 }))?;
-    let id = it.doc.add(Data::Element(Element { tag: atom::intern_lower(&tag), id: None, classes: Vec::new(), attrs: Vec::new() }));
+    let tag = it.to_str(&arg(a, 0))?;
+    let id = it.doc.add(Data::Element(Element::new(atom::intern_lower(&tag), Ns::Html, Vec::new())));
+    Ok(node_obj(it, id))
+}
+fn d_create_element_ns(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let ns = match arg(a, 0) {
+        Value::Str(s) if &*s == "http://www.w3.org/2000/svg" => Ns::Svg,
+        Value::Str(s) if &*s == "http://www.w3.org/1998/Math/MathML" => Ns::MathMl,
+        _ => Ns::Html,
+    };
+    let tag = it.to_str(&arg(a, 1))?;
+    let local = tag.rsplit(':').next().unwrap_or(&tag);
+    let id = it.doc.add(Data::Element(Element::new(atom::intern_lower(local), ns, Vec::new())));
     Ok(node_obj(it, id))
 }
 fn d_create_text(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
@@ -1004,12 +1043,13 @@ fn d_create_text(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let id = it.doc.add(Data::Text(s.to_string()));
     Ok(node_obj(it, id))
 }
-fn d_create_comment(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
-    let id = it.doc.add(Data::Text(String::new()));
+fn d_create_comment(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let s = if a.is_empty() { Rc::from("") } else { it.to_str(&arg(a, 0))? };
+    let id = it.doc.add(Data::Comment(s.to_string()));
     Ok(node_obj(it, id))
 }
 fn d_create_fragment(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
-    let id = it.doc.add(Data::Element(Element { tag: atom::intern("#document-fragment"), id: None, classes: Vec::new(), attrs: Vec::new() }));
+    let id = it.doc.add(Data::Fragment);
     Ok(node_obj(it, id))
 }
 fn d_write(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
@@ -1019,7 +1059,7 @@ fn d_write(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
         html.push_str(&it.to_str(v)?);
     }
     let body = it.doc.body;
-    for n in parse_fragment(it, &html) {
+    for n in parse_fragment(it, &html, body) {
         it.doc.append(body, n);
     }
     it.dirty = true;
@@ -1271,7 +1311,7 @@ pub fn install(it: &mut Interp) {
         ("attachShadow", |_, t, _| Ok(t)),
         ("getElementById", d_get_by_id),
         ("createElement", d_create_element),
-        ("createElementNS", d_create_element),
+        ("createElementNS", d_create_element_ns),
         ("createTextNode", d_create_text),
         ("createComment", d_create_comment),
         ("createDocumentFragment", d_create_fragment),

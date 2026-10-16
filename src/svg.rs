@@ -37,44 +37,7 @@ impl El {
 }
 
 fn decode_entities(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_owned();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut rest = s;
-    while let Some(p) = rest.find('&') {
-        out.push_str(&rest[..p]);
-        rest = &rest[p..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
-            out.push('&');
-            rest = &rest[1..];
-            continue;
-        };
-        let name = &rest[1..end];
-        let c = match name {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "nbsp" => Some('\u{a0}'),
-            _ if name.starts_with("#x") || name.starts_with("#X") => u32::from_str_radix(&name[2..], 16).ok().and_then(char::from_u32),
-            _ if name.starts_with('#') => name[1..].parse().ok().and_then(char::from_u32),
-            _ => None,
-        };
-        match c {
-            Some(c) => {
-                out.push(c);
-                rest = &rest[end + 1..];
-            }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    out
+    crate::html::decode_entities(s)
 }
 
 /// Parse XML and return the first `<svg>` element.

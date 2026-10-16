@@ -619,8 +619,13 @@ impl<'a> Engine<'a> {
         let saved = self.ws_space;
         self.ws_space = true;
         if !self.contains_block[node as usize] {
-            for c in self.doc.children(node) {
-                self.collect_inline(c, bx, link, 0);
+            match crate::forms::display_text(self.doc, node) {
+                Some(t) => self.push_text(&t, node, bx, link, 0),
+                None => {
+                    for c in self.doc.children(node) {
+                        self.collect_inline(c, bx, link, 0);
+                    }
+                }
             }
             if self.items_blank(bx) {
                 self.boxes[bx as usize].items.clear();
@@ -699,7 +704,7 @@ impl<'a> Engine<'a> {
                     };
                     self.boxes[bx as usize].children.push(id);
                 }
-                Data::Document => {}
+                _ => {}
             }
         }
         self.ws_space = saved;
@@ -841,11 +846,15 @@ impl<'a> Engine<'a> {
                 }
                 let link = self.link_for(c, link);
                 let bg = if st.bg >> 24 != 0 { st.bg } else { bg };
+                if let Some(t) = crate::forms::display_text(doc, c) {
+                    self.push_text(&t, c, bx, link, bg);
+                    return;
+                }
                 for cc in doc.children(c) {
                     self.collect_inline(cc, bx, link, bg);
                 }
             }
-            Data::Document => {}
+            _ => {}
         }
     }
 

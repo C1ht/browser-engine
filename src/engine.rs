@@ -3,7 +3,7 @@
 
 use crate::atom::k;
 use crate::css::{self, Media};
-use crate::dom::{Data, Document, NodeId, NONE};
+use crate::dom::{Data, Document, Element, NodeId, NONE};
 use crate::forms::{self, Activation};
 pub use crate::forms::Nav;
 use crate::fx::FxHashMap;
@@ -69,8 +69,8 @@ impl Resources {
 pub struct Loaded {
     pub url: String,
     pub html: String,
-    /// (css, base url)
-    pub sheets: Vec<(String, String)>,
+    /// Fetched `<link rel=stylesheet>` sheets by absolute URL.
+    pub css: FxHashMap<String, String>,
     pub doc: Document,
     /// External script sources by absolute URL.
     pub scripts: FxHashMap<String, String>,
@@ -79,7 +79,72 @@ pub struct Loaded {
 }
 
 fn base_of(doc: &Document, url: &str) -> String {
-    doc.base.as_ref().map(|b| net::resolve(url, b)).unwrap_or_else(|| url.to_owned())
+    doc.base_href().map(|b| net::resolve(url, &b)).unwrap_or_else(|| url.to_owned())
+}
+
+fn print_only(media: Option<&str>) -> bool {
+    media.is_some_and(|m| {
+        let m = m.to_ascii_lowercase();
+        m.contains("print") && !m.contains("screen") && !m.contains("all")
+    })
+}
+
+/// The absolute URL of a `<link rel=stylesheet>` that applies to the screen.
+fn stylesheet_link(e: &Element, base: &str) -> Option<String> {
+    let rel = e.attr(k::rel)?.to_ascii_lowercase();
+    if !rel.split_ascii_whitespace().any(|r| r == "stylesheet") || rel.contains("alternate") || print_only(e.attr(k::media)) || e.attr(k::disabled).is_some() {
+        return None;
+    }
+    let h = e.attr(k::href)?.trim();
+    (!h.is_empty()).then(|| net::resolve(base, h))
+}
+
+/// The document's stylesheets in tree order, as (css, base url): `<style>`
+/// contents and `<link rel=stylesheet>` sheets found in `css`. Links not in
+/// `css` yet are pushed to `missing`.
+fn collect_sheets(doc: &Document, base: &str, css: &FxHashMap<String, String>, missing: &mut Vec<String>) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut stack = vec![0 as NodeId];
+    while let Some(n) = stack.pop() {
+        if let Some(e) = doc.elem(n) {
+            if e.tag == k::style {
+                if !print_only(e.attr(k::media)) && e.attr(k::type_).is_none_or(|t| t.trim().is_empty() || t.trim().eq_ignore_ascii_case("text/css")) {
+                    let mut s = String::new();
+                    doc.text_content(n, &mut s);
+                    out.push((s, base.to_owned()));
+                }
+            } else if e.tag == k::link {
+                if let Some(u) = stylesheet_link(e, base) {
+                    match css.get(&u) {
+                        Some(t) => out.push((t.clone(), u)),
+                        None => missing.push(u),
+                    }
+                }
+            }
+        }
+        let mut c = doc.nodes[n as usize].last_child;
+        while c != NONE {
+            stack.push(c);
+            c = doc.nodes[c as usize].prev;
+        }
+    }
+    out
+}
+
+/// The document's current stylesheets, fetching any linked sheets that
+/// haven't been downloaded yet (e.g. added by a script).
+pub fn sheets_for(doc: &Document, base: &str, css: &mut FxHashMap<String, String>) -> Vec<(String, String)> {
+    let mut missing = Vec::new();
+    let sheets = collect_sheets(doc, base, css, &mut missing);
+    if missing.is_empty() {
+        return sheets;
+    }
+    missing.sort();
+    missing.dedup();
+    for (u, b) in missing.iter().zip(net::fetch_many(&missing)) {
+        css.insert(u.clone(), b.map(|b| net::decode(&b)).unwrap_or_default());
+    }
+    collect_sheets(doc, base, css, &mut Vec::new())
 }
 
 /// Fetch a document and its stylesheets (in parallel).
@@ -108,7 +173,8 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
 
     let t = Instant::now();
     let base = base_of(&doc, &url);
-    let urls: Vec<String> = doc.stylesheet_links.iter().map(|h| net::resolve(&base, h)).collect();
+    let mut urls = Vec::new();
+    collect_sheets(&doc, &base, &FxHashMap::default(), &mut urls);
     let script_urls: Vec<String> = doc
         .scripts
         .iter()
@@ -119,10 +185,9 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
     // Stylesheets and scripts download together in one parallel batch.
     let all: Vec<String> = urls.iter().chain(&script_urls).cloned().collect();
     let mut bodies = net::fetch_many(&all).into_iter().map(|b| b.map(|b| net::decode(&b)).unwrap_or_default());
-    let mut sheets: Vec<(String, String)> = urls.iter().map(|u| (bodies.next().unwrap_or_default(), u.clone())).collect();
+    let css = urls.iter().map(|u| (u.clone(), bodies.next().unwrap_or_default())).collect();
     let scripts = script_urls.iter().map(|u| (u.clone(), bodies.next().unwrap_or_default())).collect();
-    sheets.extend(doc.styles.iter().map(|s| (s.clone(), base.clone())));
-    Ok(Loaded { url, html, sheets, doc, scripts, fetch_ms: fetch_html + ms(t), parse_ms })
+    Ok(Loaded { url, html, css, doc, scripts, fetch_ms: fetch_html + ms(t), parse_ms })
 }
 
 /// Is this <script> classic JavaScript we should run?
@@ -267,7 +332,8 @@ pub struct Page {
     pub url: String,
     pub base: String,
     pub doc: Document,
-    pub sheets: Vec<(String, String)>,
+    /// Downloaded linked stylesheets by URL.
+    pub css: FxHashMap<String, String>,
     pub styles: Vec<Style>,
     pub tree: LayoutTree,
     pub dl: DisplayList,
@@ -383,8 +449,10 @@ impl Page {
         let (doc, js, script_ms) = run_scripts(l.doc, &l.scripts, &l.url, &base, vw, vh);
         let mut res = Resources::default();
         Self::collect_img_src(&doc, &base, &mut res);
-        let (styles, tree, dl) = render(&doc, &l.sheets, &base, &mut res, vw, vh, &mut t);
-        let mut page = Page { url: l.url, base, doc, sheets: l.sheets, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), vw, vh };
+        let mut css = l.css;
+        let sheets = sheets_for(&doc, &base, &mut css);
+        let (styles, tree, dl) = render(&doc, &sheets, &base, &mut res, vw, vh, &mut t);
+        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), vw, vh };
         page.sync_js_geometry();
         page.script_requests();
         page
@@ -827,7 +895,8 @@ impl Page {
     pub fn relayout(&mut self, vw: f32, vh: f32) {
         self.vw = vw;
         self.vh = vh;
-        let (styles, tree, dl) = render(&self.doc, &self.sheets, &self.base, &mut self.res, vw, vh, &mut self.t);
+        let sheets = sheets_for(&self.doc, &self.base, &mut self.css);
+        let (styles, tree, dl) = render(&self.doc, &sheets, &self.base, &mut self.res, vw, vh, &mut self.t);
         self.styles = styles;
         self.tree = tree;
         self.dl = dl;
@@ -904,8 +973,8 @@ impl Page {
         self.relayout(vw, vh);
     }
 
-    pub fn title(&self) -> &str {
-        &self.doc.title
+    pub fn title(&self) -> String {
+        self.doc.title()
     }
 
     pub fn link_href(&self, link: u32) -> Option<String> {
@@ -949,7 +1018,7 @@ mod tests {
 
     fn page_from(html: &str) -> Page {
         let doc = html::parse(html);
-        let l = Loaded { url: "https://example.com/start".into(), html: html.into(), sheets: Vec::new(), doc, scripts: FxHashMap::default(), fetch_ms: 0.0, parse_ms: 0.0 };
+        let l = Loaded { url: "https://example.com/start".into(), html: html.into(), css: FxHashMap::default(), doc, scripts: FxHashMap::default(), fetch_ms: 0.0, parse_ms: 0.0 };
         Page::new(l, 800.0, 600.0)
     }
 

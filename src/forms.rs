@@ -2,7 +2,7 @@
 //! form submission (application/x-www-form-urlencoded).
 
 use crate::atom::{self, k};
-use crate::dom::{Data, Document, Element, NodeId, NONE};
+use crate::dom::{Document, Element, NodeId, NONE};
 
 /// A navigation request (a link, a form submission or a script).
 #[derive(Clone, Debug, PartialEq)]
@@ -16,8 +16,30 @@ fn input_type(el: &Element) -> String {
     el.attr(k::type_).unwrap_or("text").trim().to_ascii_lowercase()
 }
 
-/// Text shown inside an `<input>` (its synthesized child text), if any.
-pub fn input_text(el: &Element) -> Option<String> {
+/// What a form control shows in place of its children: an `<input>`'s
+/// value / placeholder / button label, or a `<select>`'s chosen option.
+pub fn display_text(doc: &Document, id: NodeId) -> Option<String> {
+    let el = doc.elem(id)?;
+    if el.ns != crate::dom::Ns::Html {
+        return None;
+    }
+    match el.tag {
+        k::input => input_text(el),
+        k::select => {
+            let opts = options(doc, id);
+            let chosen = opts.iter().copied().find(|&o| doc.attr(o, k::selected).is_some()).or(opts.first().copied());
+            let mut t = String::new();
+            if let Some(o) = chosen {
+                doc.text_content(o, &mut t);
+            }
+            Some(format!("{} \u{25be}", t.split_whitespace().collect::<Vec<_>>().join(" ")))
+        }
+        _ => None,
+    }
+}
+
+/// Text shown inside an `<input>`, if any.
+fn input_text(el: &Element) -> Option<String> {
     let ty = input_type(el);
     let value = el.attr(k::value).filter(|v| !v.is_empty());
     let t = match ty.as_str() {
@@ -126,20 +148,6 @@ pub fn set_value(doc: &mut Document, id: NodeId, v: &str) {
         }
     } else {
         doc.set_attr(id, k::value, v);
-        refresh(doc, id);
-    }
-}
-
-/// Rebuild an `<input>`'s displayed text from its attributes.
-pub fn refresh(doc: &mut Document, id: NodeId) {
-    let Some(el) = doc.elem(id) else { return };
-    if el.tag != k::input {
-        return;
-    }
-    let text = input_text(el);
-    doc.remove_children(id);
-    if let Some(t) = text {
-        doc.append_text(id, &t);
     }
 }
 
@@ -225,7 +233,6 @@ pub fn restore_checked(doc: &mut Document, snap: &[(NodeId, bool)]) {
         } else {
             doc.remove_attr(n, k::checked);
         }
-        refresh(doc, n);
     }
 }
 
@@ -257,7 +264,6 @@ pub fn activate_control(doc: &mut Document, id: NodeId) -> Activation {
         } else {
             doc.set_attr(id, k::checked, "");
         }
-        refresh(doc, id);
         return Activation::Toggled(id);
     }
     if doc.tag(id) == Some(k::input) && ty == "radio" {
@@ -271,7 +277,6 @@ pub fn activate_control(doc: &mut Document, id: NodeId) -> Activation {
             }
         }
         doc.set_attr(id, k::checked, "");
-        refresh(doc, id);
         return Activation::Toggled(id);
     }
     if doc.tag(id) == Some(k::select) {
@@ -282,14 +287,6 @@ pub fn activate_control(doc: &mut Document, id: NodeId) -> Activation {
             let next = opts[(cur + 1) % opts.len()];
             opts.iter().for_each(|&o| doc.remove_attr(o, k::selected));
             doc.set_attr(next, k::selected, "");
-            let mut label = String::new();
-            doc.text_content(next, &mut label);
-            let label = format!("{} \u{25be}", label.split_whitespace().collect::<Vec<_>>().join(" "));
-            // The select shows its chosen option as a trailing text child.
-            let last = doc.nodes[id as usize].last_child;
-            if last != NONE && matches!(doc.nodes[last as usize].data, Data::Text(_)) {
-                doc.nodes[last as usize].data = Data::Text(label);
-            }
             return Activation::Toggled(id);
         }
         return Activation::None;

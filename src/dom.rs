@@ -1,19 +1,56 @@
 //! Arena-allocated DOM. Nodes live in one contiguous Vec and link to each other
 //! by u32 index: no per-node heap allocation, no refcounting, cache friendly.
 
-use crate::atom::Atom;
+use crate::atom::{k, Atom};
+use crate::fx::FxHashMap;
 
 pub type NodeId = u32;
 pub const NONE: NodeId = u32::MAX;
 
+/// Element namespace.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Ns {
+    #[default]
+    Html,
+    Svg,
+    MathMl,
+}
+
 pub struct Element {
     pub tag: Atom,
+    pub ns: Ns,
     pub id: Option<Atom>,
     pub classes: Vec<Atom>,
     pub attrs: Vec<(Atom, String)>,
 }
 
 impl Element {
+    /// A new element; `id` and `classes` are derived from `attrs`.
+    pub fn new(tag: Atom, ns: Ns, attrs: Vec<(Atom, String)>) -> Element {
+        let mut el = Element { tag, ns, id: None, classes: Vec::new(), attrs };
+        if let Some(id) = el.attr(k::id) {
+            let id = id.trim();
+            if !id.is_empty() {
+                el.id = Some(crate::atom::intern(id));
+            }
+        }
+        if let Some(c) = el.attr(k::class) {
+            let mut classes = Vec::new();
+            for c in c.split_ascii_whitespace() {
+                let a = crate::atom::intern(c);
+                if !classes.contains(&a) {
+                    classes.push(a);
+                }
+            }
+            el.classes = classes;
+        }
+        el
+    }
+
+    pub fn clone_shallow(&self) -> Element {
+        Element { tag: self.tag, ns: self.ns, id: self.id, classes: self.classes.clone(), attrs: self.attrs.clone() }
+    }
+
     #[inline]
     pub fn attr(&self, name: Atom) -> Option<&str> {
         self.attrs.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str())
@@ -24,6 +61,33 @@ pub enum Data {
     Document,
     Element(Element),
     Text(String),
+    Comment(String),
+    /// `<!DOCTYPE name>`.
+    Doctype(Box<DocType>),
+    /// A DocumentFragment (also `<template>` contents and shadow roots).
+    Fragment,
+}
+
+impl Data {
+    /// A copy of this node's own data (no children).
+    pub fn clone_shallow(&self) -> Data {
+        match self {
+            Data::Document => Data::Fragment,
+            Data::Element(e) => Data::Element(e.clone_shallow()),
+            Data::Text(t) => Data::Text(t.clone()),
+            Data::Comment(t) => Data::Comment(t.clone()),
+            Data::Doctype(t) => Data::Doctype(t.clone()),
+            Data::Fragment => Data::Fragment,
+        }
+    }
+}
+
+/// A doctype node's name and identifiers.
+#[derive(Clone)]
+pub struct DocType {
+    pub name: String,
+    pub public: Option<String>,
+    pub system: Option<String>,
 }
 
 pub struct Node {
@@ -37,14 +101,11 @@ pub struct Node {
 
 pub struct Document {
     pub nodes: Vec<Node>,
-    pub title: String,
-    /// Contents of inline <style> elements, in document order.
-    pub styles: Vec<String>,
-    /// hrefs of <link rel=stylesheet>, in document order.
-    pub stylesheet_links: Vec<String>,
-    pub base: Option<String>,
     pub html: NodeId,
+    pub head: NodeId,
     pub body: NodeId,
+    /// `<template>` element -> its content fragment.
+    pub templates: FxHashMap<NodeId, NodeId>,
     /// <script> elements in document order.
     pub scripts: Vec<NodeId>,
     /// No <!doctype html>: render in quirks mode.
@@ -64,12 +125,10 @@ impl Document {
                 prev: NONE,
                 data: Data::Document,
             }],
-            title: String::new(),
-            styles: Vec::new(),
-            stylesheet_links: Vec::new(),
-            base: None,
             html: NONE,
+            head: NONE,
             body: NONE,
+            templates: FxHashMap::default(),
             scripts: Vec::new(),
             quirks: true,
             focus: NONE,
@@ -173,8 +232,8 @@ impl Document {
         for c in self.children(id) {
             match &self.nodes[c as usize].data {
                 Data::Text(t) => out.push_str(t),
-                Data::Element(_) => self.text_content(c, out),
-                Data::Document => {}
+                Data::Element(_) | Data::Fragment => self.text_content(c, out),
+                _ => {}
             }
         }
     }
@@ -290,17 +349,101 @@ impl Document {
 
     /// Copy `src`'s subtree rooted at `n` into this document; returns the new id.
     pub fn import(&mut self, src: &Document, n: NodeId) -> NodeId {
-        let data = match &src.nodes[n as usize].data {
-            Data::Element(e) => Data::Element(Element { tag: e.tag, id: e.id, classes: e.classes.clone(), attrs: e.attrs.clone() }),
-            Data::Text(t) => Data::Text(t.clone()),
-            Data::Document => Data::Text(String::new()),
-        };
-        let id = self.add(data);
+        let id = self.add(src.nodes[n as usize].data.clone_shallow());
         for c in src.children(n).collect::<Vec<_>>() {
             let cc = self.import(src, c);
             self.append(id, cc);
         }
+        if let Some(&content) = src.templates.get(&n) {
+            let cc = self.import(src, content);
+            self.templates.insert(id, cc);
+        }
         id
+    }
+
+    /// Deep- or shallow-copy a node within this document.
+    pub fn clone_node(&mut self, n: NodeId, deep: bool) -> NodeId {
+        let id = self.add(self.nodes[n as usize].data.clone_shallow());
+        if deep {
+            for c in self.children(n).collect::<Vec<_>>() {
+                let cc = self.clone_node(c, true);
+                self.append(id, cc);
+            }
+        }
+        if let Some(&content) = self.templates.get(&n) {
+            let cc = if deep { self.clone_node(content, true) } else { self.add(Data::Fragment) };
+            self.templates.insert(id, cc);
+        }
+        id
+    }
+
+    /// The content fragment of a `<template>` (created on demand).
+    pub fn template_content(&mut self, t: NodeId) -> NodeId {
+        if let Some(&c) = self.templates.get(&t) {
+            return c;
+        }
+        let c = self.add(Data::Fragment);
+        self.templates.insert(t, c);
+        c
+    }
+
+    /// Is the node in the document tree (reachable from the root)?
+    pub fn connected(&self, mut n: NodeId) -> bool {
+        while n != NONE {
+            if n == 0 {
+                return true;
+            }
+            n = self.nodes[n as usize].parent;
+        }
+        false
+    }
+
+    /// First element in tree order matching `f`.
+    pub fn find(&self, f: impl Fn(&Element) -> bool) -> NodeId {
+        let mut stack = vec![0 as NodeId];
+        while let Some(n) = stack.pop() {
+            if let Data::Element(e) = &self.nodes[n as usize].data {
+                if f(e) {
+                    return n;
+                }
+            }
+            let mut c = self.nodes[n as usize].last_child;
+            while c != NONE {
+                stack.push(c);
+                c = self.nodes[c as usize].prev;
+            }
+        }
+        NONE
+    }
+
+    /// `document.title`: the first HTML `<title>`'s text, whitespace-collapsed.
+    pub fn title(&self) -> String {
+        let t = self.find(|e| e.tag == k::title && e.ns == Ns::Html);
+        if t == NONE {
+            return String::new();
+        }
+        let mut s = String::new();
+        self.text_content(t, &mut s);
+        s.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    pub fn set_title(&mut self, s: &str) {
+        let mut t = self.find(|e| e.tag == k::title && e.ns == Ns::Html);
+        if t == NONE {
+            if self.head == NONE {
+                return;
+            }
+            t = self.add(Data::Element(Element::new(k::title, Ns::Html, Vec::new())));
+            self.append(self.head, t);
+        }
+        self.remove_children(t);
+        self.append_text(t, s);
+    }
+
+    /// `href` of the first `<base>` element.
+    pub fn base_href(&self) -> Option<String> {
+        let b = self.find(|e| e.tag == k::base && e.attr(k::href).is_some());
+        self.attr(b, k::href).map(|h| h.trim().to_owned())
     }
 
     /// Nodes reachable from the root, in tree order.
@@ -320,6 +463,7 @@ impl Document {
 
     /// Serialize a node's children as HTML.
     pub fn inner_html(&self, id: NodeId, out: &mut String) {
+        let id = self.templates.get(&id).copied().unwrap_or(id);
         for c in self.children(id) {
             self.outer_html(c, out);
         }
@@ -328,6 +472,11 @@ impl Document {
     pub fn outer_html(&self, id: NodeId, out: &mut String) {
         match &self.nodes[id as usize].data {
             Data::Text(t) => {
+                let p = self.nodes[id as usize].parent;
+                if p != NONE && self.elem(p).is_some_and(|e| e.ns == Ns::Html && matches!(crate::atom::name(e.tag), "style" | "script" | "xmp" | "iframe" | "noembed" | "noframes" | "plaintext" | "noscript")) {
+                    out.push_str(t);
+                    return;
+                }
                 for ch in t.chars() {
                     match ch {
                         '&' => out.push_str("&amp;"),
@@ -350,7 +499,7 @@ impl Document {
                     out.push('"');
                 }
                 out.push('>');
-                if matches!(name, "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr") {
+                if e.ns == Ns::Html && matches!(name, "area" | "base" | "basefont" | "bgsound" | "br" | "col" | "embed" | "frame" | "hr" | "img" | "input" | "keygen" | "link" | "meta" | "param" | "source" | "track" | "wbr") {
                     return;
                 }
                 self.inner_html(id, out);
@@ -358,9 +507,32 @@ impl Document {
                 out.push_str(name);
                 out.push('>');
             }
-            Data::Document => self.inner_html(id, out),
+            Data::Comment(t) => {
+                out.push_str("<!--");
+                out.push_str(t);
+                out.push_str("-->");
+            }
+            Data::Doctype(d) => {
+                out.push_str("<!DOCTYPE ");
+                out.push_str(&d.name);
+                out.push('>');
+            }
+            Data::Document | Data::Fragment => self.inner_html(id, out),
         }
     }
+}
+
+/// The mixed-case spelling of an SVG element name (the DOM stores names lowercased).
+pub fn svg_tag_case(name: &str) -> &str {
+    const NAMES: &[&str] = &[
+        "altGlyph", "altGlyphDef", "altGlyphItem", "animateColor", "animateMotion", "animateTransform", "clipPath",
+        "feBlend", "feColorMatrix", "feComponentTransfer", "feComposite", "feConvolveMatrix", "feDiffuseLighting",
+        "feDisplacementMap", "feDistantLight", "feDropShadow", "feFlood", "feFuncA", "feFuncB", "feFuncG", "feFuncR",
+        "feGaussianBlur", "feImage", "feMerge", "feMergeNode", "feMorphology", "feOffset", "fePointLight",
+        "feSpecularLighting", "feSpotLight", "feTile", "feTurbulence", "foreignObject", "glyphRef", "linearGradient",
+        "radialGradient", "textPath",
+    ];
+    NAMES.iter().find(|n| n.eq_ignore_ascii_case(name)).copied().unwrap_or(name)
 }
 
 pub struct Children<'a> {
