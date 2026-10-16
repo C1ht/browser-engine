@@ -109,18 +109,12 @@ pub fn load(url: &str) -> Result<Loaded, String> {
         .filter_map(|&s| doc.attr(s, k::src))
         .map(|h| net::resolve(&base, h.trim()))
         .collect();
-    // Stylesheets and scripts download in parallel.
-    let fetch = |u: &String| (net::fetch(u).map(|(_, b)| net::decode(&b)).unwrap_or_default(), u.clone());
-    let (mut sheets, scripts): (Vec<(String, String)>, Vec<(String, String)>) = std::thread::scope(|s| {
-        let hs: Vec<_> = urls.iter().map(|u| s.spawn(move || fetch(u))).collect();
-        let hj: Vec<_> = script_urls.iter().map(|u| s.spawn(move || fetch(u))).collect();
-        (
-            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect(),
-            hj.into_iter().map(|h| h.join().unwrap_or_default()).collect(),
-        )
-    });
+    // Stylesheets and scripts download together in one parallel batch.
+    let all: Vec<String> = urls.iter().chain(&script_urls).cloned().collect();
+    let mut bodies = net::fetch_many(&all).into_iter().map(|b| b.map(|b| net::decode(&b)).unwrap_or_default());
+    let mut sheets: Vec<(String, String)> = urls.iter().map(|u| (bodies.next().unwrap_or_default(), u.clone())).collect();
+    let scripts = script_urls.iter().map(|u| (u.clone(), bodies.next().unwrap_or_default())).collect();
     sheets.extend(doc.styles.iter().map(|s| (s.clone(), base.clone())));
-    let scripts = scripts.into_iter().map(|(code, u)| (u, code)).collect();
     Ok(Loaded { url, html, sheets, doc, scripts, fetch_ms: fetch_html + ms(t), parse_ms })
 }
 
@@ -147,6 +141,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, ba
     let t0 = Instant::now();
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
+    it.deadline = Some(t0 + std::time::Duration::from_millis(SCRIPT_BUDGET as u64));
     for s in scripts {
         if !is_js(&it.doc, s) || ms(t0) > SCRIPT_BUDGET {
             continue;
@@ -196,10 +191,7 @@ fn run_pending(it: &mut js::Interp, t0: &Instant) {
         if urls.is_empty() || ms(*t0) > SCRIPT_BUDGET {
             return;
         }
-        let codes: Vec<String> = std::thread::scope(|s| {
-            let hs: Vec<_> = urls.iter().map(|u| s.spawn(move || net::fetch(u).map(|(_, b)| net::decode(&b)).unwrap_or_default())).collect();
-            hs.into_iter().map(|h| h.join().unwrap_or_default()).collect()
-        });
+        let codes: Vec<String> = net::fetch_many(&urls).into_iter().map(|b| b.map(|b| net::decode(&b)).unwrap_or_default()).collect();
         for c in codes {
             run_one(it, &c);
         }
@@ -219,31 +211,29 @@ fn img_url(doc: &Document, n: NodeId, base: &str) -> Option<String> {
     Some(if pick.starts_with("data:") { pick } else { net::resolve(base, &pick) })
 }
 
-/// Download and register web fonts in parallel.
+/// Download (one parallel batch) and register web fonts.
 pub fn fetch_fonts(faces: &[css::FontFace]) {
-    let next = AtomicUsize::new(0);
+    let urls: Vec<String> = faces.iter().map(|f| f.url.clone()).collect();
+    let bodies = net::fetch_many(&urls);
     std::thread::scope(|s| {
-        for _ in 0..faces.len().min(6) {
-            s.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(f) = faces.get(i) else { break };
-                let bytes = net::fetch(&f.url).ok().map(|(_, b)| b);
-                crate::fonts::fonts().add_web(&f.family, &f.url, f.weight, f.italic, bytes);
-            });
+        for (f, bytes) in faces.iter().zip(bodies) {
+            s.spawn(move || crate::fonts::fonts().add_web(&f.family, &f.url, f.weight, f.italic, bytes));
         }
     });
 }
 
-/// Fetch and decode images in parallel; `done` is called as each finishes.
+/// Fetch images (one parallel batch) and decode them on all cores; `done`
+/// is called as each finishes decoding.
 pub fn fetch_images(urls: &[String], done: &(dyn Fn(String, Option<Arc<Image>>) + Sync)) {
+    let bodies = net::fetch_many(urls);
     let next = AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(urls.len().max(1));
     std::thread::scope(|s| {
-        for _ in 0..urls.len().min(8) {
+        for _ in 0..threads {
             s.spawn(|| loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 let Some(u) = urls.get(i) else { break };
-                let bytes = if u.starts_with("data:") { image::data_url(u) } else { net::fetch(u).ok().map(|(_, b)| b) };
-                let img = bytes.and_then(|b| image::decode(&b)).map(Arc::new);
+                let img = bodies[i].as_deref().and_then(image::decode).map(Arc::new);
                 done(u.clone(), img);
             });
         }
@@ -330,6 +320,8 @@ impl Page {
     fn with_js<T>(&mut self, f: impl FnOnce(&mut js::Interp) -> T) -> Option<T> {
         let it = self.js.as_mut()?;
         it.doc = std::mem::take(&mut self.doc);
+        // Event handlers and timers get a short leash.
+        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(500));
         let r = f(it);
         let t0 = Instant::now();
         run_pending(it, &t0);

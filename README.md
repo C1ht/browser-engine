@@ -1,13 +1,8 @@
 # bolt
 
-A small browser engine written from scratch in Rust, built for speed.
+A browser engine written from scratch in Rust, built for speed.
 
-bolt parses HTML and CSS, runs the cascade, lays out the page and rasterizes it
-in software. The only dependencies are `minifb` (opens a window and blits a
-pixel buffer) and `fontdue` (turns glyph outlines into coverage bitmaps).
-The engine itself has no dependencies: tokenizer, DOM, CSS parser, selector
-matching, cascade, layout, display list, rasterizer and PNG encoder are all in
-this repo (~6.5k lines).
+bolt parses HTML and CSS, runs the cascade, lays out pages (block, inline, floats, positioning, flexbox, grid and tables), decodes images, loads web fonts, runs JavaScript, and rasterizes everything in software. It has two dependencies: `minifb` opens a window and blits pixels, and `fontdue` turns glyph outlines into bitmaps. Everything else is in this repo, including the HTML parser, CSS engine, layout, the PNG/JPEG/GIF decoders, the inflate (zlib) decompressor, the JavaScript interpreter and its regex engine, and the rasterizer.
 
 ## Usage
 
@@ -17,57 +12,87 @@ cargo build --release
 bolt                                   # opens the built-in home page
 bolt https://news.ycombinator.com      # URL (http/https are fetched with the system curl)
 bolt path/to/page.html                 # local file
+bolt about:features                    # flexbox, grid, floats, positioning, effects
+bolt about:js                          # JavaScript demo (counter, to-dos, timers)
 bolt about:stress                      # 1 MB synthetic page with ~45k nodes
 
 bolt --bench about:stress --iters 30   # time each pipeline phase (median / min)
 bolt --shot out.png <url> [--width 1024] [--height 0 = full page]
+bolt --js script.js                    # run a JavaScript file in the interpreter
 bolt --dump <url>                      # print the DOM tree
 bolt --boxes <url>                     # print the layout box tree
 ```
 
-Keys in the window: `Ctrl+L`/`F6` or clicking the bar edits the address,
-wheel / arrows / `PgUp` / `PgDn` / `Space` / `Home` / `End` scroll,
-`Backspace` or `Alt+←` goes back, `Alt+→` goes forward, `F5` reloads,
-`F12` prints timings.
+Keys in the window:
+
+| Key | Action |
+|---|---|
+| `Ctrl+L` / `F6`, or click the bar | Edit the address |
+| Wheel, arrows, `PgUp` / `PgDn` / `Space`, `Home` / `End` | Scroll |
+| `Backspace` / `Alt+←` | Back |
+| `Alt+→` | Forward |
+| `F5` | Reload |
+| `F12` | Print timings |
 
 ## Pipeline
 
-| Stage | File | What makes it fast |
+| Stage | Code | What makes it fast |
 |---|---|---|
-| Fetch | `net.rs` | Stylesheets are fetched in parallel. |
-| Parse | `html.rs` | A single pass over bytes. A word-at-a-time (SWAR) `memchr` scans for `<` and `&`. Nodes go into an arena with `u32` links, and tag/attribute/class names are interned to integer atoms (`atom.rs`, FxHash). |
-| CSS | `css.rs` | Values are fully typed at parse time and shorthands are expanded, so the cascade never re-parses strings (except declarations that use `var()`). |
-| Style | `style.rs` | Rules are bucketed by id / class / tag. A 256-bit ancestor bloom filter rejects descendant selectors without walking up the tree. A parent always has a lower arena index than its children, so styles are computed in one linear loop with no recursion. |
-| Layout | `layout.rs` | Positions are relative to the parent's content box, so moving a subtree is O(1). Intrinsic sizes are cached per box. Glyph advances live in lock-free atomic tables. |
-| Paint | `paint.rs` | A flat display list is culled to the viewport. Glyphs are rasterized once and cached. The frame is split into horizontal bands painted in parallel without locks. Scrolling only repaints and never re-runs layout. |
+| Fetch | `net.rs` | Stylesheets and scripts download in one batch, using a single parallel `curl` process that reuses connections. |
+| Parse | `html.rs` | A single pass over bytes. A word-at-a-time (SWAR) `memchr` scans for `<` and `&`. Nodes go into an arena with `u32` links, and names are interned to integer atoms. |
+| CSS | `css.rs` | Values are typed at parse time and shorthands expanded. `calc()`, `min()`, `max()`, `clamp()`, `var()` and gradients are pre-parsed. |
+| Style | `style.rs` | Rules are bucketed by id / class / tag. A 512-bit ancestor bloom filter rejects descendant selectors early. Per-rule flags skip work, and the results of `var()` substitution are cached. |
+| Layout | `layout.rs` | Positions are relative to the parent, so moving a subtree is O(1). Intrinsic sizes are cached. Glyph advances live in lock-free atomic tables. |
+| Images | `image.rs` | Decoders are written from scratch. Images get mipmaps for smooth downscaling and decode on all cores. |
+| Paint | `paint.rs` | A flat display list is culled to the viewport, and banded rasterization runs on all cores without locks. Scrolling only repaints and never re-runs layout. |
+| Script | `js/` | A tree-walking interpreter with a step and wall-clock budget, so a page can't hang the browser. |
 
 ## Performance
 
-Measured with `bolt --bench` at 1024px width on a 16-thread desktop; each figure is the median of 30 warm runs:
+Measured with `bolt --bench` at 1024 px on a 16-thread desktop; each figure is the median of warm runs:
 
 | Page | Nodes | Parse | Style | Layout | Display list | Paint (frame) | Total |
 |---|---|---|---|---|---|---|---|
-| `about:stress` (1 MB HTML) | 45,270 | 5.7 ms | 8.6 ms | 13.0 ms | 2.2 ms | 1.0 ms | **31 ms** |
+| `about:stress` (1 MB HTML) | 45,270 | 3.6 ms | 9.9 ms | 13.0 ms | 3.4 ms | 0.8 ms | **31 ms** |
 | news.ycombinator.com | 1,294 | 0.6 ms | 0.4 ms | 0.4 ms | 0.03 ms | 1.6 ms | **4 ms** |
 
-The first page you load also pays one-time font parsing, about 25–130 ms per face. The common faces are pre-loaded on background threads at startup to hide most of that cost.
+On real sites, total load time is dominated by the network, not the engine.
 
 ## Supported
 
-- HTML: implicit `html`/`head`/`body`, auto-closing `p`/`li`/`dt`/`dd`/`tr`/`td`/`option`, void and raw-text elements, character references, quirks mode for pages without a doctype, and form controls drawn as boxes.
-- Selectors: type, `.class`, `#id`, `*`, attribute selectors (all operators, with `i`), all four combinators, `:first-child`, `:last-child`, `:only-child`, `:first-of-type`, `:last-of-type`, `:nth-child()`, `:nth-last-child()`, `:not()`, `:is()`, `:where()`, `:root`, `:empty` and `:link`.
-- Cascade: origin, specificity, `!important`, inline `style`, presentational attributes (`bgcolor`, `width`, `align`, `<font>`, `cellpadding`, …), inheritance, `inherit` / `initial` / `unset`, `@media` (width/height ranges, `prefers-*`) and `@supports`.
-- Values: `px em rem % pt vw vh ex ch`, named / hex / `rgb()` / `hsl()` colors, `calc()`, custom properties with `var()` and fallbacks.
-- Layout: block flow with margin collapsing (sibling, parent–child, through empty blocks), `width` / `min-width` / `max-width` / `height`, `box-sizing`, auto-margin centering, `<center>` / `-webkit-center`, inline formatting with line breaking, `white-space`, `text-align`, `text-transform`, inline-block, an automatic table layout algorithm (`colspan`, percentage columns, `border-spacing`, `vertical-align` in cells) and list markers (disc, circle, square, decimal, alpha, roman).
-- Paint: backgrounds, borders, text with underline and line-through, inline backgrounds, and fallback fonts for symbols and CJK.
-- Browser: links, hover status bar, back/forward history, `#fragment` scrolling, address bar, window resize.
+- **HTML:** implicit `html`/`head`/`body`, auto-closing tags, raw-text elements, character references and quirks mode.
+- **Selectors:** type, class, id, attribute selectors, all combinators, `:nth-child()`, `:not()`, `:is()`, `:where()`, `:first-of-type` and more.
+- **Cascade:**
+  - Specificity, `!important` and presentational attributes.
+  - `@media`, `@supports`, `@font-face`.
+  - Custom properties with `var()`.
+  - `calc()`, `min()`, `max()`, `clamp()`.
+- **Layout:**
+  - Block flow with margin collapsing, inline formatting with line breaking, and `inline-block`.
+  - Floats and `clear`, wrapping text around floats.
+  - `position: relative / absolute / fixed / sticky` with `z-index`.
+  - Flexbox: direction, wrap, grow / shrink / basis, `justify-content`, `align-*`, `gap`, `order`, auto margins.
+  - Grid: `repeat()` (including auto-fill), `minmax`, `fr`, line and span placement, `grid-template-areas`.
+  - Tables (automatic layout), lists, `overflow: hidden`.
+- **Paint:** backgrounds, borders, rounded corners, box shadows, opacity, linear / radial / repeating gradients, background images (size / position / repeat) and `object-fit`.
+- **Images:** PNG (all color types and depths, interlaced), baseline and progressive JPEG, GIF (first frame) and `data:` URLs.
+- **Fonts:** `@font-face` with TTF, OTF and WOFF, matched by weight and style; symbol and CJK fallback fonts.
+- **JavaScript:**
+  - ES2015+ syntax: classes with private names, destructuring, spread, arrow functions, template literals, optional chaining, `async` / `await`.
+  - Built-ins: Promises, Map / Set, JSON, RegExp, Date.
+  - DOM: `querySelector`, `innerHTML`, `classList`, `style`, events with bubbling, timers.
+- **Browser:** links, back / forward history, `#fragment` scrolling, address bar, resizing, clicks dispatched to scripts.
 
 ## Not supported (yet)
 
-JavaScript, image decoding (images draw as placeholders or show their alt text), floats, flexbox and grid (these lay out as plain blocks), positioned elements (`absolute`/`fixed` are hidden), `min()` / `max()` / `clamp()`, transforms, shadows, rounded corners, web fonts, form interaction, and text that is right-to-left or needs complex shaping.
+- WOFF2 fonts (they need a Brotli decoder) and SVG / WebP images.
+- Generators, ES modules, `fetch` / XHR and form text editing.
+- Transforms, filters, animations / transitions and right-to-left text.
 
 ## Tests
 
 ```sh
 cargo test --release
 ```
+
+The image decoders are checked against Pillow-decoded fixtures in `testdata/`. JavaScript semantics, the DOM bindings and end-to-end clicks have unit tests in `src/js` and `src/engine.rs`.

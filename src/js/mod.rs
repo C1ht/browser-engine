@@ -277,6 +277,8 @@ pub struct Interp {
     pub start: std::time::Instant,
     /// Label of the loop about to execute (for labeled break/continue).
     label: Option<Name>,
+    /// Scripts are interrupted after this instant.
+    pub deadline: Option<std::time::Instant>,
 }
 
 pub const WINDOW: u32 = u32::MAX - 1;
@@ -317,6 +319,7 @@ impl Interp {
             computed: FxHashMap::default(),
             start: std::time::Instant::now(),
             label: None,
+            deadline: None,
         };
         builtins::install(&mut it);
         dombind::install(&mut it);
@@ -362,10 +365,13 @@ impl Interp {
         matches!(v, Value::Obj(o) if matches!(o.borrow().kind, Kind::Func(_)))
     }
 
+    #[inline]
     fn tick(&mut self) -> R<()> {
         self.steps += 1;
-        if self.steps > self.budget {
-            return Err(builtins::make_error_value("Error", "script execution budget exceeded"));
+        if self.steps & 0xFFFF == 0 {
+            if self.steps > self.budget || self.deadline.is_some_and(|d| std::time::Instant::now() > d) {
+                return Err(builtins::make_error_value("Error", "script took too long and was stopped"));
+            }
         }
         Ok(())
     }
@@ -1072,7 +1078,8 @@ impl Interp {
             Stmt::Block(b) => return self.block(b, env),
             Stmt::For(init, test, update, body) => {
                 let my = self.label.take();
-                let per_iter = matches!(init.as_deref(), Some(Stmt::Var(VarKind::Let | VarKind::Const, _)));
+                // Fresh per-iteration bindings only matter if closures can capture them.
+                let per_iter = matches!(init.as_deref(), Some(Stmt::Var(VarKind::Let | VarKind::Const, _))) && stmt_has_closure(body);
                 let mut scope = new_scope(Some(env.clone()), None, None, false);
                 if let Some(i) = init {
                     self.exec(i, &scope)?;
@@ -1915,6 +1922,57 @@ impl Interp {
         if self.console.len() < 1000 {
             self.console.push(s.to_owned());
         }
+    }
+}
+
+/// Does a statement create functions (which could capture loop variables)?
+fn stmt_has_closure(s: &Stmt) -> bool {
+    match s {
+        Stmt::Expr(e) | Stmt::Throw(e) => expr_has_closure(e),
+        Stmt::Var(_, ds) => ds.iter().any(|(p, e)| pat_has_closure(p) || e.as_ref().is_some_and(expr_has_closure)),
+        Stmt::Func(_) | Stmt::Class(_) => true,
+        Stmt::Return(e) => e.as_ref().is_some_and(expr_has_closure),
+        Stmt::If(c, a, b) => expr_has_closure(c) || stmt_has_closure(a) || b.as_deref().is_some_and(stmt_has_closure),
+        Stmt::Block(b) => b.iter().any(stmt_has_closure),
+        Stmt::For(i, t, u, b) => i.as_deref().is_some_and(stmt_has_closure) || t.as_ref().is_some_and(expr_has_closure) || u.as_ref().is_some_and(expr_has_closure) || stmt_has_closure(b),
+        Stmt::ForIn(_, e, b) | Stmt::ForOf(_, e, b) | Stmt::While(e, b) | Stmt::DoWhile(b, e) => expr_has_closure(e) || stmt_has_closure(b),
+        Stmt::Try(a, c, f) => a.iter().any(stmt_has_closure) || c.as_ref().is_some_and(|(_, c)| c.iter().any(stmt_has_closure)) || f.as_ref().is_some_and(|f| f.iter().any(stmt_has_closure)),
+        Stmt::Switch(d, cases) => expr_has_closure(d) || cases.iter().any(|(t, b)| t.as_ref().is_some_and(expr_has_closure) || b.iter().any(stmt_has_closure)),
+        Stmt::Labeled(_, b) => stmt_has_closure(b),
+        Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => false,
+    }
+}
+
+fn pat_has_closure(p: &Pattern) -> bool {
+    match p {
+        Pattern::Ident(_) => false,
+        Pattern::Expr(e) => expr_has_closure(e),
+        Pattern::Default(i, e) => pat_has_closure(i) || expr_has_closure(e),
+        Pattern::Array(items, r) => items.iter().flatten().any(pat_has_closure) || r.as_deref().is_some_and(pat_has_closure),
+        Pattern::Object(props, r) => props.iter().any(|(k, p)| matches!(k, PropKey::Computed(e) if expr_has_closure(e)) || pat_has_closure(p)) || r.as_deref().is_some_and(pat_has_closure),
+    }
+}
+
+fn expr_has_closure(e: &Expr) -> bool {
+    let items = |v: &[ArrItem]| v.iter().any(|i| matches!(i, ArrItem::Item(e) | ArrItem::Spread(e) if expr_has_closure(e)));
+    match e {
+        Expr::Func(_) | Expr::Class(_) => true,
+        Expr::Num(_) | Expr::Str(_) | Expr::Regex(..) | Expr::Ident(_) | Expr::This | Expr::Super | Expr::Null | Expr::Bool(_) => false,
+        Expr::Template(_, xs) | Expr::Seq(xs) => xs.iter().any(expr_has_closure),
+        Expr::TaggedTemplate(t, _, xs) => expr_has_closure(t) || xs.iter().any(expr_has_closure),
+        Expr::Array(v) => items(v),
+        Expr::Object(ps) => ps.iter().any(|p| match p {
+            PropDef::Value(k, v) => matches!(k, PropKey::Computed(e) if expr_has_closure(e)) || expr_has_closure(v),
+            PropDef::Getter(..) | PropDef::Setter(..) => true,
+            PropDef::Spread(e) => expr_has_closure(e),
+        }),
+        Expr::Unary(_, x) | Expr::Spread(x) | Expr::Await(x) => expr_has_closure(x),
+        Expr::Update { target, .. } => expr_has_closure(target),
+        Expr::Binary(_, a, b) | Expr::Logical(_, a, b) | Expr::Index(a, b, _) => expr_has_closure(a) || expr_has_closure(b),
+        Expr::Assign(_, p, v) => pat_has_closure(p) || expr_has_closure(v),
+        Expr::Cond(a, b, c) => expr_has_closure(a) || expr_has_closure(b) || expr_has_closure(c),
+        Expr::Call(f, a, _) | Expr::New(f, a) => expr_has_closure(f) || items(a),
+        Expr::Member(o, _, _) => expr_has_closure(o),
     }
 }
 

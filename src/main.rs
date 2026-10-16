@@ -34,6 +34,7 @@ const BAR: usize = 40;
 struct Args {
     url: String,
     bench: bool,
+    js: Option<String>,
     shot: Option<String>,
     dump: bool,
     boxes: bool,
@@ -43,11 +44,12 @@ struct Args {
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { url: "about:home".into(), bench: false, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30 };
+    let mut a = Args { url: "about:home".into(), bench: false, js: None, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30 };
     let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
             "--bench" => a.bench = true,
+            "--js" => a.js = it.next(),
             "--dump" => a.dump = true,
             "--boxes" => a.boxes = true,
             "--shot" => a.shot = it.next(),
@@ -67,7 +69,19 @@ fn main() {
         .spawn(|| {
             fonts().prewarm();
             let args = parse_args();
-            if args.boxes {
+            if let Some(path) = &args.js {
+                // Run a JavaScript file (developer aid): prints console output and timing.
+                let src = std::fs::read_to_string(path).unwrap_or_default();
+                let mut it = js::Interp::new(dom::Document::new(), "about:blank", 800.0, 600.0);
+                let t0 = Instant::now();
+                let r = it.run_script(&src);
+                it.run_microtasks();
+                it.run_timers(1e12);
+                if let Err(e) = r {
+                    eprintln!("error: {e}");
+                }
+                eprintln!("[js] {:.1}ms, {} steps", ms(t0), it.steps);
+            } else if args.boxes {
                 match engine::load(&args.url) {
                     Ok(l) => {
                         let p = Page::new(l, args.width as f32, 768.0);

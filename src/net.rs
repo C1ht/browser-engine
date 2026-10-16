@@ -31,6 +31,50 @@ pub fn fetch(url: &str) -> Result<(String, Vec<u8>), String> {
     Err(format!("unsupported URL scheme: {url}"))
 }
 
+/// Fetch many URLs at once. HTTP(S) URLs go through a single curl process
+/// with `--parallel`, so connections (and HTTP/2 multiplexing) are reused
+/// instead of paying a TLS handshake per resource.
+pub fn fetch_many(urls: &[String]) -> Vec<Option<Vec<u8>>> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static BATCH: AtomicUsize = AtomicUsize::new(0);
+    let mut out: Vec<Option<Vec<u8>>> = vec![None; urls.len()];
+    let mut remote = Vec::new();
+    for (i, u) in urls.iter().enumerate() {
+        if u.starts_with("http://") || u.starts_with("https://") {
+            remote.push(i);
+        } else if u.starts_with("data:") {
+            out[i] = crate::image::data_url(u);
+        } else {
+            out[i] = fetch(u).ok().map(|(_, b)| b);
+        }
+    }
+    if remote.is_empty() {
+        return out;
+    }
+    let dir = std::env::temp_dir().join(format!("bolt-{}-{}", std::process::id(), BATCH.fetch_add(1, Ordering::Relaxed)));
+    if std::fs::create_dir_all(&dir).is_err() {
+        return out;
+    }
+    let esc = |s: &str| s.replace('\\', "/").replace('"', "%22");
+    let mut cfg = String::new();
+    for &i in &remote {
+        let path = dir.join(i.to_string());
+        cfg.push_str(&format!("url = \"{}\"\noutput = \"{}\"\n", esc(&urls[i]), esc(&path.to_string_lossy())));
+    }
+    let cfg_path = dir.join("batch.cfg");
+    if std::fs::write(&cfg_path, cfg).is_ok() {
+        let _ = Command::new("curl")
+            .args(["-sSL", "--fail", "--compressed", "--max-time", "30", "--parallel", "--parallel-max", "16", "-A", UA, "-K"])
+            .arg(&cfg_path)
+            .output();
+        for &i in &remote {
+            out[i] = std::fs::read(dir.join(i.to_string())).ok();
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
 /// Decode bytes to text, honouring a Latin-1 / Windows-1252 charset declaration.
 pub fn decode(bytes: &[u8]) -> String {
     let head = &bytes[..bytes.len().min(2048)];
