@@ -426,6 +426,11 @@ pub struct Page {
     focus_value: String,
     url_events: Vec<js::UrlEvent>,
     history_go: Option<i32>,
+    /// Vertical scroll offset as last told by the browser.
+    scroll: f32,
+    scroll_changed: bool,
+    /// Layout changed since geometry observers were last checked.
+    geo_dirty: bool,
     vw: f32,
     vh: f32,
 }
@@ -528,9 +533,16 @@ impl Page {
         let mut css = l.css;
         let sheets = sheets_for(&doc, &base, &mut css);
         let (styles, tree, dl) = render(&doc, &sheets, &base, &mut res, vw, vh, &mut t);
-        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, vw, vh };
+        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, vw, vh };
         page.sync_js_geometry();
         page.script_requests();
+        // Initial IntersectionObserver / ResizeObserver callbacks (lazy
+        // loading etc.) before the first paint.
+        for _ in 0..3 {
+            if !page.check_geometry() {
+                break;
+            }
+        }
         page
     }
 
@@ -553,7 +565,35 @@ impl Page {
             it.rects = self.tree.node_rects();
             it.vw = self.vw;
             it.vh = self.vh;
+            self.geo_dirty = true;
         }
+    }
+
+    /// Run IntersectionObserver / ResizeObserver callbacks if the layout or
+    /// scroll position changed. Returns true if any ran.
+    fn check_geometry(&mut self) -> bool {
+        let wanted = self.js.as_ref().is_some_and(|it| it.has_geometry_observers() && (self.geo_dirty || it.geo_pending));
+        self.geo_dirty = false;
+        if !wanted {
+            return false;
+        }
+        self.with_js(|it| it.check_geometry()).unwrap_or(false)
+    }
+
+    /// The browser scrolled the page.
+    pub fn set_scroll(&mut self, y: f32) {
+        if (y - self.scroll).abs() > 0.5 {
+            self.scroll = y;
+            self.scroll_changed = true;
+            if let Some(it) = &mut self.js {
+                it.scroll_y = y;
+            }
+        }
+    }
+
+    /// A scroll position requested by a script.
+    pub fn take_scroll_request(&mut self) -> Option<f32> {
+        self.js.as_mut().and_then(|it| it.scroll_request.take())
     }
 
     /// Run `f` with the document moved into the script engine; relayout if
@@ -565,6 +605,7 @@ impl Page {
         it.deadline = Some(Instant::now() + std::time::Duration::from_millis(500));
         let focus_before = it.doc.focus;
         let r = f(it);
+        it.run_microtasks();
         let t0 = Instant::now();
         run_pending(it, &t0);
         self.doc = std::mem::take(&mut it.doc);
@@ -975,16 +1016,26 @@ impl Page {
     pub fn tick(&mut self, now: f64) -> bool {
         let Some(it) = &self.js else { return false };
         let due = it.next_timer_at().is_some_and(|t| t <= now);
-        if !due && it.requests.is_empty() {
+        let geo = it.has_geometry_observers() && (self.geo_dirty || it.geo_pending || self.scroll_changed);
+        if !due && it.requests.is_empty() && !self.scroll_changed && !geo {
             return false;
         }
         let before = self.layouts;
-        self.with_js(|it| {
-            it.poll_requests(None);
-            if due {
-                it.run_timers(now);
-            }
-        });
+        if std::mem::take(&mut self.scroll_changed) {
+            self.geo_dirty = true;
+            self.with_js(|it| {
+                js::dombind::dispatch(it, 0, "scroll", |_, _| {});
+            });
+        }
+        if due || !self.js.as_ref().is_some_and(|it| it.requests.is_empty()) {
+            self.with_js(|it| {
+                it.poll_requests(None);
+                if due {
+                    it.run_timers(now);
+                }
+            });
+        }
+        self.check_geometry();
         self.layouts != before
     }
 
@@ -1122,6 +1173,31 @@ mod tests {
     fn node_by_id(p: &Page, id: &str) -> NodeId {
         let a = crate::atom::lookup(id).unwrap();
         (0..p.doc.nodes.len() as u32).find(|&n| p.doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap()
+    }
+
+    #[test]
+    fn intersection_observer() {
+        let mut p = page_from(
+            r#"<!doctype html><div id=top style="height:100px">top</div><div style="height:3000px"></div><div id=far style="height:50px">far</div>
+               <script>
+                 window.seen = [];
+                 const io = new IntersectionObserver(es => es.forEach(e => seen.push(e.target.id + '=' + e.isIntersecting)));
+                 io.observe(document.getElementById('top')); io.observe(document.getElementById('far'));
+                 new ResizeObserver(es => seen.push('size ' + es[0].contentRect.height)).observe(document.getElementById('top'));
+               </script>"#,
+        );
+        let seen = |p: &mut Page| p.with_js(|it| {
+            let g = js::Value::Obj(it.global.clone());
+            let s = it.get(&g, "seen").unwrap();
+            let j = it.get(&g, "JSON").unwrap();
+            let f = it.get(&j, "stringify").unwrap();
+            let v = it.call(&f, j, &[s]).unwrap();
+            it.to_str(&v).unwrap().to_string()
+        }).unwrap();
+        assert_eq!(seen(&mut p), r#"["top=true","far=false","size 100"]"#);
+        p.set_scroll(3000.0);
+        p.tick(0.0);
+        assert_eq!(seen(&mut p), r#"["top=true","far=false","size 100","top=false","far=true"]"#);
     }
 
     #[test]

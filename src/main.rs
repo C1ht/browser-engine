@@ -517,6 +517,9 @@ impl Browser {
 
     fn repaint(&mut self) {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll());
+        if let Some(p) = &mut self.page {
+            p.set_scroll(self.scroll);
+        }
         let (w, vh) = (self.w, self.vh());
         let t0 = Instant::now();
         if let Some(p) = &self.page {
@@ -658,6 +661,10 @@ impl Browser {
                 dirty = true;
             }
             self.page_history();
+            if let Some(y) = self.page.as_mut().and_then(|p| p.take_scroll_request()) {
+                self.scroll = y;
+                dirty = true;
+            }
             if let Some(n) = self.page.as_mut().and_then(|p| p.take_nav()) {
                 self.navigate_to(n, true);
                 continue;

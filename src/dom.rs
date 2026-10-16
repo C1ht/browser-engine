@@ -98,6 +98,13 @@ pub struct SheetData {
     pub init: bool,
 }
 
+/// A DOM change, logged while a MutationObserver exists.
+pub enum Mutation {
+    ChildList { target: NodeId, added: Option<NodeId>, removed: Option<NodeId>, prev: NodeId, next: NodeId },
+    Attr { target: NodeId, name: Atom, old: Option<String> },
+    Text { target: NodeId, old: String },
+}
+
 /// A doctype node's name and identifiers.
 #[derive(Clone)]
 pub struct DocType {
@@ -128,6 +135,9 @@ pub struct Document {
     pub free_sheets: Vec<Vec<String>>,
     /// `document.adoptedStyleSheets` (indices into `free_sheets`).
     pub adopted: Vec<usize>,
+    /// Changes since the last MutationObserver delivery, each with the
+    /// target's ancestor path at that time (None: nobody observes).
+    pub mutations: Option<Vec<(Mutation, Vec<NodeId>)>>,
     /// <script> elements in document order.
     pub scripts: Vec<NodeId>,
     /// No <!doctype html>: render in quirks mode.
@@ -154,6 +164,7 @@ impl Document {
             cssom: FxHashMap::default(),
             free_sheets: Vec::new(),
             adopted: Vec::new(),
+            mutations: None,
             scripts: Vec::new(),
             quirks: true,
             focus: NONE,
@@ -173,8 +184,35 @@ impl Document {
         id
     }
 
+    #[inline]
+    fn log(&mut self, m: Mutation) {
+        if self.mutations.is_none() {
+            return;
+        }
+        let mut n = match &m {
+            Mutation::ChildList { target, .. } | Mutation::Attr { target, .. } | Mutation::Text { target, .. } => *target,
+        };
+        let mut path = Vec::new();
+        while n != NONE {
+            path.push(n);
+            n = self.nodes[n as usize].parent;
+        }
+        if let Some(v) = &mut self.mutations {
+            v.push((m, path));
+        }
+    }
+
+    /// Replace a text / comment node's data.
+    pub fn set_data(&mut self, id: NodeId, s: &str) {
+        if let Data::Text(t) | Data::Comment(t) = &mut self.nodes[id as usize].data {
+            let old = std::mem::replace(t, s.to_owned());
+            self.log(Mutation::Text { target: id, old });
+        }
+    }
+
     pub fn append(&mut self, parent: NodeId, child: NodeId) {
         let last = self.nodes[parent as usize].last_child;
+        self.log(Mutation::ChildList { target: parent, added: Some(child), removed: None, prev: last, next: NONE });
         {
             let c = &mut self.nodes[child as usize];
             c.parent = parent;
@@ -280,6 +318,7 @@ impl Document {
         if parent == NONE {
             return;
         }
+        self.log(Mutation::ChildList { target: parent, added: None, removed: Some(id), prev, next });
         if prev != NONE {
             self.nodes[prev as usize].next = next;
         } else {
@@ -319,6 +358,7 @@ impl Document {
             return;
         }
         let prev = self.nodes[before as usize].prev;
+        self.log(Mutation::ChildList { target: parent, added: Some(child), removed: None, prev, next: before });
         {
             let c = &mut self.nodes[child as usize];
             c.parent = parent;
@@ -341,6 +381,10 @@ impl Document {
     }
 
     pub fn set_attr(&mut self, id: NodeId, name: Atom, value: &str) {
+        if self.mutations.is_some() && self.elem(id).is_some() {
+            let old = self.attr(id, name).map(str::to_owned);
+            self.log(Mutation::Attr { target: id, name, old });
+        }
         if let Data::Element(e) = &mut self.nodes[id as usize].data {
             match e.attrs.iter_mut().find(|(n, _)| *n == name) {
                 Some(slot) => slot.1 = value.to_owned(),
@@ -362,6 +406,11 @@ impl Document {
     }
 
     pub fn remove_attr(&mut self, id: NodeId, name: Atom) {
+        if self.mutations.is_some() {
+            if let Some(old) = self.attr(id, name).map(str::to_owned) {
+                self.log(Mutation::Attr { target: id, name, old: Some(old) });
+            }
+        }
         if let Data::Element(e) = &mut self.nodes[id as usize].data {
             e.attrs.retain(|(n, _)| *n != name);
             if name == crate::atom::k::id {

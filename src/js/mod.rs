@@ -10,6 +10,7 @@ pub mod dombind;
 pub mod generator;
 pub mod iter;
 pub mod module;
+pub mod observe;
 pub mod proxy;
 pub mod lexer;
 pub mod parser;
@@ -386,6 +387,16 @@ pub struct Interp {
     pub module_sources: FxHashMap<String, String>,
     /// Import map entries (specifier or prefix -> URL), longest first.
     pub import_map: Vec<(String, String)>,
+    pub mut_regs: Vec<observe::MutReg>,
+    /// Mutation records waiting for delivery: (observer, record).
+    pub mut_queue: Vec<(ObjRef, Value)>,
+    pub geo_regs: Vec<observe::GeoReg>,
+    /// A geometry observer was added (check at the next opportunity).
+    pub geo_pending: bool,
+    /// The page's vertical scroll offset.
+    pub scroll_y: f32,
+    /// A scroll position requested by a script (`scrollTo`, ...).
+    pub scroll_request: Option<f32>,
     /// Generators / async calls whose coroutines are running, innermost last.
     pub co_stack: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
@@ -448,6 +459,12 @@ impl Interp {
             module_map: FxHashMap::default(),
             module_sources: FxHashMap::default(),
             import_map: Vec::new(),
+            mut_regs: Vec::new(),
+            mut_queue: Vec::new(),
+            geo_regs: Vec::new(),
+            geo_pending: false,
+            scroll_y: 0.0,
+            scroll_request: None,
             co_stack: Vec::new(),
             nav: None,
             submit_form: None,
@@ -459,6 +476,7 @@ impl Interp {
         cssom::install(&mut it);
         binary::install(&mut it);
         dombind::install(&mut it);
+        observe::install(&mut it);
         web::install(&mut it);
         if let Err(e) = it.run_script(include_str!("prelude.js")) {
             eprintln!("js prelude: {e}");
@@ -2262,15 +2280,25 @@ impl Interp {
     /// Run queued promise reactions.
     pub fn run_microtasks(&mut self) {
         let mut n = 0;
-        while let Some((f, args)) = self.micro.pop_front() {
-            if let Err(e) = self.call(&f, Value::Undef, &args) {
-                let m = self.describe_error(&e);
-                self.log(&format!("Uncaught (in promise) {m}"));
+        loop {
+            // Mutations made before a microtask was queued are delivered
+            // first (their notification was queued at the first mutation).
+            self.deliver_mutations();
+            while let Some((f, args)) = self.micro.pop_front() {
+                if let Err(e) = self.call(&f, Value::Undef, &args) {
+                    let m = self.describe_error(&e);
+                    self.log(&format!("Uncaught (in promise) {m}"));
+                }
+                n += 1;
+                if n > 100_000 {
+                    return;
+                }
             }
-            n += 1;
-            if n > 100_000 {
+            // MutationObserver callbacks run at the microtask checkpoint.
+            if !self.deliver_mutations() || n > 100_000 {
                 break;
             }
+            n += 1;
         }
     }
 
@@ -2538,6 +2566,35 @@ mod tests {
                 "2 0 false",
                 "1,9,3 3,4,3,4 1,3",
                 "10,20,30 1,2 function",
+            ]
+        );
+    }
+
+    #[test]
+    fn mutation_observer() {
+        let out = run(r#"
+            const root = document.createElement('div');
+            document.appendChild(root);
+            const log = [];
+            const mo = new MutationObserver((recs, obs) => {
+                for (const r of recs) log.push(r.type + ':' + (r.attributeName || '') + ':' + r.addedNodes.length + r.removedNodes.length + ':' + (r.oldValue ?? '-'));
+                console.log(log.join(' '), obs === mo);
+            });
+            mo.observe(root, { childList: true, attributes: true, subtree: true, attributeOldValue: true, characterData: true });
+            const c = document.createElement('span');
+            root.appendChild(c);
+            c.setAttribute('class', 'x');
+            c.setAttribute('class', 'y');
+            root.removeChild(c);
+            const t = document.createTextNode('a'); root.appendChild(t); t.data = 'b';
+            console.log('sync', log.length);
+            Promise.resolve().then(() => { mo.disconnect(); root.appendChild(document.createElement('i')); });
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "sync 0".to_string(),
+                "childList::10:- attributes:class:00:- attributes:class:00:x childList::01:- childList::10:- characterData::00:- true".to_string(),
             ]
         );
     }

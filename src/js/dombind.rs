@@ -69,8 +69,8 @@ fn text_of(it: &Interp, id: NodeId) -> String {
 }
 
 fn set_text(it: &mut Interp, id: NodeId, s: &str) {
-    if let Data::Text(t) | Data::Comment(t) = &mut it.doc.nodes[id as usize].data {
-        *t = s.to_owned();
+    if matches!(it.doc.nodes[id as usize].data, Data::Text(_) | Data::Comment(_)) {
+        it.doc.set_data(id, s);
     } else {
         let id = it.doc.templates.get(&id).copied().unwrap_or(id);
         it.doc.remove_children(id);
@@ -384,6 +384,7 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "offsetHeight" | "clientHeight" | "scrollHeight" => Value::Num(rect(it, id)[3] as f64),
         "offsetLeft" => Value::Num(rect(it, id)[0] as f64),
         "offsetTop" => Value::Num(rect(it, id)[1] as f64),
+        "scrollTop" if id == it.doc.html || id == it.doc.body || doc_node => Value::Num(it.scroll_y as f64),
         "scrollTop" | "scrollLeft" | "clientTop" | "clientLeft" => Value::Num(0.0),
         "offsetParent" => node_obj(it, it.doc.body),
         // document-only
@@ -862,11 +863,50 @@ fn n_insert_adjacent_html(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 fn n_bounding_rect(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let n = this_node(&t)?;
     let [x, y, w, h] = rect(it, n);
-    let o = it.plain();
-    for (k, v) in [("x", x), ("y", y), ("left", x), ("top", y), ("width", w), ("height", h), ("right", x + w), ("bottom", y + h)] {
-        Interp::set_prop(&o, k, Value::Num(v as f64));
+    // Relative to the viewport.
+    Ok(crate::js::observe::rect_obj(it, x, y - it.scroll_y, w, h))
+}
+fn n_scroll_into_view(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    let r = rect(it, n);
+    it.scroll_request = Some(r[1]);
+    Ok(Value::Undef)
+}
+/// window.scrollTo(x, y) / scrollTo({top}) / scrollBy(...).
+fn w_scroll(it: &mut Interp, a: &[Value], by: bool) -> R<Value> {
+    let y = match arg(a, 0) {
+        o @ Value::Obj(_) => match it.get(&o, "top")? {
+            Value::Undef => None,
+            v => Some(it.to_num(&v)?),
+        },
+        _ => match arg(a, 1) {
+            Value::Undef => None,
+            v => Some(it.to_num(&v)?),
+        },
+    };
+    if let Some(y) = y.filter(|y| y.is_finite()) {
+        let base = if by { it.scroll_request.unwrap_or(it.scroll_y) } else { 0.0 };
+        it.scroll_request = Some((base + y as f32).max(0.0));
     }
-    Ok(Value::Obj(o))
+    Ok(Value::Undef)
+}
+fn w_scroll_to(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    w_scroll(it, a, false)
+}
+fn w_scroll_by(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    w_scroll(it, a, true)
+}
+fn w_scroll_y(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Ok(Value::Num(it.scroll_y as f64))
+}
+fn w_zero(_: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Ok(Value::Num(0.0))
+}
+fn w_inner_width(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Ok(Value::Num(it.vw as f64))
+}
+fn w_inner_height(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Ok(Value::Num(it.vh as f64))
 }
 fn n_click(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let n = this_node(&t)?;
@@ -1517,7 +1557,7 @@ pub fn install(it: &mut Interp) {
         ("requestSubmit", n_request_submit),
         ("select", noop),
         ("setSelectionRange", noop),
-        ("scrollIntoView", noop),
+        ("scrollIntoView", n_scroll_into_view),
         ("scrollTo", noop),
         ("scrollBy", noop),
         ("setPointerCapture", noop),
@@ -1601,9 +1641,7 @@ pub fn install(it: &mut Interp) {
         }
     }
     Interp::set_hidden(&np, "constructor", node_ctor);
-    for n in ["MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"] {
-        ctor(it, n, observer_ctor, None);
-    }
+    ctor(it, "PerformanceObserver", observer_ctor, None);
     for n in ["XMLHttpRequest", "WebSocket", "Worker", "EventSource"] {
         ctor(it, n, w_unsupported_ctor, None);
     }
@@ -1672,8 +1710,18 @@ pub fn install(it: &mut Interp) {
     Interp::set_prop(&screen, "width", Value::Num(it.vw as f64));
     Interp::set_prop(&screen, "height", Value::Num(it.vh as f64));
     Interp::set_hidden(&g, "screen", Value::Obj(screen));
-    for (k, v) in [("innerWidth", it.vw as f64), ("innerHeight", it.vh as f64), ("outerWidth", it.vw as f64), ("outerHeight", it.vh as f64), ("devicePixelRatio", 1.0), ("scrollX", 0.0), ("scrollY", 0.0), ("pageXOffset", 0.0), ("pageYOffset", 0.0)] {
-        Interp::set_hidden(&g, k, Value::Num(v));
+    Interp::set_hidden(&g, "devicePixelRatio", Value::Num(1.0));
+    for (k, f) in [
+        ("innerWidth", w_inner_width as NativeFn),
+        ("outerWidth", w_inner_width),
+        ("innerHeight", w_inner_height),
+        ("outerHeight", w_inner_height),
+        ("scrollY", w_scroll_y),
+        ("pageYOffset", w_scroll_y),
+        ("scrollX", w_zero),
+        ("pageXOffset", w_zero),
+    ] {
+        it.def_getter(&g, k, f);
     }
     for (n, f) in [
         ("getComputedStyle", w_get_computed_style as NativeFn),
@@ -1682,9 +1730,9 @@ pub fn install(it: &mut Interp) {
         ("confirm", w_confirm),
         ("prompt", |_, _, _| Ok(Value::Null)),
         ("fetch", w_fetch),
-        ("scrollTo", noop),
-        ("scrollBy", noop),
-        ("scroll", noop),
+        ("scrollTo", w_scroll_to),
+        ("scrollBy", w_scroll_by),
+        ("scroll", w_scroll_to),
         ("open", |_, _, _| Ok(Value::Null)),
         ("close", noop),
         ("print", noop),
