@@ -248,15 +248,17 @@ impl Builder<'_> {
             // <img> content, honouring object-fit.
             let (cx, cy) = (bx + b.b[3] + b.p[3], by + b.b[0] + b.p[0]);
             let (cw, ch) = (b.w, b.h);
-            let (iw, ih) = (img.w as f32, img.h as f32);
-            let s = match st.object_fit {
+            let (iw, ih) = (img.iw, img.ih);
+            // SVGs keep their aspect ratio (preserveAspectRatio="xMidYMid meet").
+            let fit = if img.vector && st.object_fit == 0 { 1 } else { st.object_fit };
+            let s = match fit {
                 1 => (cw / iw).min(ch / ih),
                 2 => (cw / iw).max(ch / ih),
                 3 => 1.0,
                 4 => (cw / iw).min(ch / ih).min(1.0),
                 _ => 0.0,
             };
-            let dst = if st.object_fit == 0 { [cx, cy, cw, ch] } else { [cx + (cw - iw * s) / 2.0, cy + (ch - ih * s) / 2.0, iw * s, ih * s] };
+            let dst = if fit == 0 { [cx, cy, cw, ch] } else { [cx + (cw - iw * s) / 2.0, cy + (ch - ih * s) / 2.0, iw * s, ih * s] };
             let alpha = (255.0 * self.opacity) as u32;
             let r = radii(st, b.border_w(), b.border_h());
             let radius = [0, 1, 2, 3].map(|i| (r[i] - b.b[3].max(b.b[0]) - b.p[3].max(b.p[0])).max(0.0));
@@ -301,7 +303,7 @@ impl Builder<'_> {
         match css::bg_image(bi) {
             css::BgImage::Url(u) => {
                 let Some(img) = self.res.url(&u) else { return };
-                let (w, h) = sized(img.w as f32, img.h as f32);
+                let (w, h) = sized(img.iw, img.ih);
                 if w < 0.5 || h < 0.5 {
                     return;
                 }

@@ -568,9 +568,9 @@ impl<'a> Engine<'a> {
                     k::iframe | k::video | k::canvas | k::embed | k::object => (300.0, 150.0),
                     _ => (0.0, 0.0),
                 };
-                let img = if tag == k::img { self.res.img(c).cloned() } else { None };
+                let img = if tag == k::img || tag == k::svg { self.res.img(c).cloned() } else { None };
                 let b = &mut self.boxes[bx as usize];
-                b.repl = img.as_ref().map_or(size, |i| (i.w as f32, i.h as f32));
+                b.repl = img.as_ref().map_or(size, |i| (i.iw, i.ih));
                 b.img = tag == k::img;
                 b.image = img;
             }

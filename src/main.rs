@@ -26,6 +26,7 @@ mod woff2;
 mod paint;
 mod png;
 mod style;
+mod svg;
 mod vp8_tables;
 
 use engine::{ms, Click, Edit, Nav, Page};
@@ -177,7 +178,7 @@ fn bench(a: &Args) {
     let mut page = Page::new(l, w as f32, h as f32);
     page.load_fonts_blocking(w as f32, h as f32);
     page.load_images_blocking(w as f32, h as f32);
-    let (res, base) = (page.res, page.base);
+    let (mut res, base) = (page.res, page.base);
     let _ = url;
     let mut glyphs = GlyphCache::default();
     let mut buf = vec![0u32; w * h];
@@ -190,7 +191,7 @@ fn bench(a: &Args) {
         let doc = html::parse(&html);
         let parse = ms(t0);
         let mut t = engine::Timings::default();
-        let (_styles, tree, dl) = engine::render(&doc, &sheets, &base, &res, w as f32, h as f32, &mut t);
+        let (_styles, tree, dl) = engine::render(&doc, &sheets, &base, &mut res, w as f32, h as f32, &mut t);
         let t0 = Instant::now();
         paint::paint(&dl, &tree.text, &mut glyphs, &mut buf, w, h, 0.0);
         let paint = ms(t0);

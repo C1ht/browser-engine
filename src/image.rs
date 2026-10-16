@@ -9,12 +9,22 @@ pub struct Image {
     pub px: Vec<u32>,
     /// Successively halved levels: (w, h, pixels).
     pub mips: Vec<(u32, u32, Vec<u32>)>,
+    /// Intrinsic size in CSS px (differs from w/h for vector images, which
+    /// are rasterized at a higher density).
+    pub iw: f32,
+    pub ih: f32,
+    /// Rendered from vector data (SVG): scales preserving aspect ratio.
+    pub vector: bool,
 }
 
 const MAX_DIM: u32 = 4096;
 
 pub fn decode(data: &[u8]) -> Option<Image> {
-    let (w, h, px) = if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+    if crate::svg::sniff(data) {
+        let r = crate::svg::render(&String::from_utf8_lossy(data), 0xFF000000, None)?;
+        return Some(Image { vector: true, ..from_pixels(r.w, r.h, r.px, r.iw, r.ih) });
+    }
+    let (w, h, px) =if data.starts_with(b"\x89PNG\r\n\x1a\n") {
         png(data)?
     } else if data.starts_with(&[0xFF, 0xD8]) {
         jpeg(data)?
@@ -28,6 +38,11 @@ pub fn decode(data: &[u8]) -> Option<Image> {
     if w == 0 || h == 0 || px.len() < (w * h) as usize {
         return None;
     }
+    Some(from_pixels(w, h, px, w as f32, h as f32))
+}
+
+/// Build an image (with mipmaps) from decoded pixels.
+pub fn from_pixels(w: u32, h: u32, px: Vec<u32>, iw: f32, ih: f32) -> Image {
     let (mut w, mut h, mut px) = (w, h, px);
     while w > MAX_DIM || h > MAX_DIM {
         (w, h, px) = halve(w, h, &px);
@@ -40,7 +55,7 @@ pub fn decode(data: &[u8]) -> Option<Image> {
         mips.push((nw, nh, next.clone()));
         (mw, mh, cur) = (nw, nh, Some(next));
     }
-    Some(Image { w, h, px, mips })
+    Image { w, h, px, mips, iw, ih, vector: false }
 }
 
 /// 2x2 box filter.
@@ -1178,7 +1193,22 @@ pub fn data_url(url: &str) -> Option<Vec<u8>> {
     let comma = rest.find(',')?;
     let (meta, payload) = (&rest[..comma], &rest[comma + 1..]);
     if !meta.ends_with(";base64") {
-        return Some(payload.as_bytes().to_vec());
+        // Percent-encoded text (e.g. data:image/svg+xml,%3Csvg...).
+        let b = payload.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                if let (Some(h), Some(l)) = ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16)) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        return Some(out);
     }
     let mut out = Vec::with_capacity(payload.len() * 3 / 4);
     let (mut buf, mut n) = (0u32, 0);

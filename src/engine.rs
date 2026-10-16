@@ -301,7 +301,7 @@ pub enum Click {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn render(doc: &Document, sheets: &[(String, String)], base: &str, res: &Resources, vw: f32, vh: f32, t: &mut Timings) -> (Vec<Style>, LayoutTree, DisplayList) {
+pub fn render(doc: &Document, sheets: &[(String, String)], base: &str, res: &mut Resources, vw: f32, vh: f32, t: &mut Timings) -> (Vec<Style>, LayoutTree, DisplayList) {
     let t0 = Instant::now();
     let cas = style::build_cascade(sheets, &Media { vw, vh }, doc.quirks);
     t.css = ms(t0);
@@ -309,6 +309,7 @@ pub fn render(doc: &Document, sheets: &[(String, String)], base: &str, res: &Res
     css::set_base(base);
     let styles = style::compute(doc, &cas, vw, vh);
     t.style = ms(t0);
+    inline_svgs(doc, &styles, res);
     let t0 = Instant::now();
     let tree = layout::layout(doc, &styles, vw, vh, res);
     t.layout = ms(t0);
@@ -321,6 +322,43 @@ pub fn render(doc: &Document, sheets: &[(String, String)], base: &str, res: &Res
     (styles, tree, dl)
 }
 
+/// Rasterize inline `<svg>` elements as images (cached by markup and
+/// `currentColor`).
+fn inline_svgs(doc: &Document, styles: &[Style], res: &mut Resources) {
+    use std::hash::{Hash, Hasher};
+    for (i, n) in doc.nodes.iter().enumerate() {
+        let Data::Element(e) = &n.data else { continue };
+        let id = i as NodeId;
+        if e.tag != k::svg || styles.get(i).is_none_or(|s| s.display == Display::None) {
+            continue;
+        }
+        // Only outermost <svg> elements; nested ones are part of their parent.
+        let mut p = doc.parent(id);
+        let mut nested = false;
+        while p != NONE {
+            if doc.tag(p) == Some(k::svg) {
+                nested = true;
+                break;
+            }
+            p = doc.parent(p);
+        }
+        if nested {
+            continue;
+        }
+        let mut markup = String::new();
+        doc.outer_html(id, &mut markup);
+        let color = styles[i].color;
+        let mut h = crate::fx::FxHasher::default();
+        markup.hash(&mut h);
+        let key = format!("svg-inline:{:x}:{color:x}", h.finish());
+        if !res.images.contains_key(&key) {
+            let img = crate::svg::render(&markup, color, None).map(|r| Arc::new(Image { vector: true, ..image::from_pixels(r.w, r.h, r.px, r.iw, r.ih) }));
+            res.images.insert(key.clone(), img);
+        }
+        res.img_src.insert(id, key);
+    }
+}
+
 impl Page {
     pub fn new(l: Loaded, vw: f32, vh: f32) -> Page {
         let mut t = Timings { fetch: l.fetch_ms, parse: l.parse_ms, ..Default::default() };
@@ -328,7 +366,7 @@ impl Page {
         let (doc, js, script_ms) = run_scripts(l.doc, &l.scripts, &l.url, &base, vw, vh);
         let mut res = Resources::default();
         Self::collect_img_src(&doc, &base, &mut res);
-        let (styles, tree, dl) = render(&doc, &l.sheets, &base, &res, vw, vh, &mut t);
+        let (styles, tree, dl) = render(&doc, &l.sheets, &base, &mut res, vw, vh, &mut t);
         let mut page = Page { url: l.url, base, doc, sheets: l.sheets, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), vw, vh };
         page.sync_js_geometry();
         page.script_requests();
@@ -766,7 +804,7 @@ impl Page {
     pub fn relayout(&mut self, vw: f32, vh: f32) {
         self.vw = vw;
         self.vh = vh;
-        let (styles, tree, dl) = render(&self.doc, &self.sheets, &self.base, &self.res, vw, vh, &mut self.t);
+        let (styles, tree, dl) = render(&self.doc, &self.sheets, &self.base, &mut self.res, vw, vh, &mut self.t);
         self.styles = styles;
         self.tree = tree;
         self.dl = dl;
