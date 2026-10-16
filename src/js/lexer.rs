@@ -21,7 +21,6 @@ pub struct Token {
     pub tok: Tok,
     /// A line terminator precedes this token (for automatic semicolons).
     pub nl: bool,
-    pub pos: usize,
 }
 
 const PUNCTS: &[&str] = &[
@@ -151,10 +150,10 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
             i += p.chars().count();
             Tok::Punct(p)
         };
-        out.push(Token { tok, nl, pos: start });
+        out.push(Token { tok, nl });
         nl = false;
     }
-    out.push(Token { tok: Tok::Eof, nl: true, pos: n });
+    out.push(Token { tok: Tok::Eof, nl: true });
     Ok(out)
 }
 

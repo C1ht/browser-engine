@@ -32,6 +32,8 @@ pub fn decode(data: &[u8]) -> Option<Image> {
         gif(data)?
     } else if data.len() > 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
         crate::webp::decode(data)?
+    } else if data.len() > 12 && &data[4..8] == b"ftyp" && data[8..data.len().min(64)].windows(4).any(|w| w == b"avif" || w == b"avis") {
+        crate::avif::decode(data)?
     } else {
         return None;
     };

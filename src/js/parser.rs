@@ -32,7 +32,6 @@ pub enum Expr {
     Member(Box<Expr>, Name, bool),
     Index(Box<Expr>, Box<Expr>, bool),
     Seq(Vec<Expr>),
-    Spread(Box<Expr>),
     Await(Box<Expr>),
     /// `yield` / `yield*`
     Yield(Option<Box<Expr>>, bool),

@@ -350,7 +350,6 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "title" if doc_node => Value::str(&it.doc.title),
         "readyState" if doc_node => Value::str("complete"),
         "visibilityState" if doc_node => Value::str("visible"),
-        "hidden" if doc_node => Value::Bool(false),
         "URL" | "documentURI" if doc_node => Value::str(&it.url),
         "cookie" if doc_node => Value::str(&it.cookie),
         "referrer" if doc_node => Value::str(""),

@@ -2,7 +2,7 @@
 
 A browser engine written from scratch in Rust, built for speed.
 
-bolt parses HTML and CSS, runs the cascade, lays out pages (block, inline, floats, positioning, flexbox, grid and tables), decodes images, loads web fonts, runs JavaScript, and rasterizes everything in software. It has two dependencies: `minifb` opens a window and blits pixels, and `fontdue` turns glyph outlines into bitmaps. Everything else is in this repo, including the HTML parser, CSS engine, layout, the PNG/JPEG/GIF decoders, the inflate (zlib) and Brotli decompressors, the JavaScript interpreter and its regex engine, and the rasterizer.
+bolt parses HTML and CSS, runs the cascade, lays out pages (block, inline, floats, positioning, flexbox, grid and tables), decodes images, loads web fonts, runs JavaScript, and rasterizes everything in software. It has two dependencies: `minifb` opens a window and blits pixels, and `fontdue` turns glyph outlines into bitmaps. Everything else is in this repo, including the HTML parser, CSS engine, layout, the PNG, JPEG, GIF, WebP and AVIF decoders (including a complete AV1 intra-frame decoder), the SVG renderer, the inflate (zlib) and Brotli decompressors, the JavaScript interpreter and its regex engine, and the rasterizer.
 
 ## Usage
 
@@ -77,7 +77,12 @@ On real sites, total load time is dominated by the network, not the engine.
   - Grid: `repeat()` (including auto-fill), `minmax`, `fr`, line and span placement, `grid-template-areas`.
   - Tables (automatic layout), lists, `overflow: hidden`.
 - **Paint:** backgrounds, borders, rounded corners, box shadows, opacity, linear / radial / repeating gradients, background images (size / position / repeat) and `object-fit`.
-- **Images:** PNG (all color types and depths, interlaced), baseline and progressive JPEG, GIF (first frame) and `data:` URLs.
+- **Images:**
+  - PNG (all color types and depths, interlaced), baseline and progressive JPEG, GIF (first frame).
+  - WebP: lossy, lossless, alpha and animations (first frame), matching libwebp pixel for pixel.
+  - AVIF: 8/10/12-bit, 4:2:0/4:2:2/4:4:4 and monochrome, alpha, grids, rotation and mirroring. The AV1 decoder covers every intra-frame tool (palette, intra block copy, filter intra, CfL, all transforms, deblocking, CDEF, loop restoration, film grain) and is bit-exact with dav1d.
+  - SVG in `<img>`, CSS backgrounds and inline `<svg>` (with `currentColor` from CSS): paths, shapes, transforms, `<use>`/`<symbol>`, gradients, clip paths, strokes with dashes, basic text, `<style>` sheets.
+  - `data:` URLs (base64 and percent-encoded).
 - **Fonts:** `@font-face` with TTF, OTF, WOFF and WOFF2 (Brotli plus the `glyf` / `loca` / `hmtx` transforms), matched by weight, style and `unicode-range`; symbol and CJK fallback fonts.
 - **JavaScript:**
   - ES2015+ syntax: classes with private names, destructuring, spread, arrow functions, template literals, optional chaining, `async` / `await`, generators and async generators.
@@ -88,7 +93,7 @@ On real sites, total load time is dominated by the network, not the engine.
 
 ## Not supported (yet)
 
-- SVG / WebP images. A text run uses one font face, so `unicode-range` subsets other than Latin are skipped.
+- Animated images beyond the first frame, AVIF superres, and SVG filters, masks, patterns and markers. A text run uses one font face, so `unicode-range` subsets other than Latin are skipped.
 - ES modules and `fetch` / XHR; text selection and drop-down menus for `<select>`. Generators run their body eagerly on the first `next()`, so an infinite generator stops after 100,000 values.
 - Transforms, filters, animations / transitions and right-to-left text.
 - Google search results: Google only serves them after a JavaScript anti-bot challenge that bolt can't pass yet. Forms on Google (search box, cookie consent) work.
@@ -99,4 +104,4 @@ On real sites, total load time is dominated by the network, not the engine.
 cargo test --release
 ```
 
-The image decoders are checked against Pillow-decoded fixtures in `testdata/`, and the Brotli decoder against real CDN responses. The WOFF2 test optionally compares every ASCII glyph with the same font as plain TTF (`BOLT_REF_TTF=<folder with lobster.ttf, roboto-bold.ttf>`). JavaScript semantics, the DOM bindings and end-to-end clicks have unit tests in `src/js` and `src/engine.rs`.
+The image decoders are checked against Pillow-decoded fixtures in `testdata/`: WebP pixel-exact against libwebp, and AVIF planes bit-exact against dav1d (`testdata/avif`, plus `BOLT_AVIF_DIR=<folder of x.avif + x.yuv>` for larger sets such as the link-u samples). The Brotli decoder against real CDN responses. The WOFF2 test optionally compares every ASCII glyph with the same font as plain TTF (`BOLT_REF_TTF=<folder with lobster.ttf, roboto-bold.ttf>`). JavaScript semantics, the DOM bindings and end-to-end clicks have unit tests in `src/js` and `src/engine.rs`.

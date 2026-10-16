@@ -1672,7 +1672,6 @@ impl Interp {
                 }
                 self.construct(&f, &a)?
             }
-            Expr::Spread(x) => self.eval(x, env)?,
             Expr::Await(x) => {
                 let v = self.eval(x, env)?;
                 builtins::await_value(self, v)?
@@ -2050,7 +2049,7 @@ fn expr_has_closure(e: &Expr) -> bool {
             PropDef::Getter(..) | PropDef::Setter(..) => true,
             PropDef::Spread(e) => expr_has_closure(e),
         }),
-        Expr::Unary(_, x) | Expr::Spread(x) | Expr::Await(x) => expr_has_closure(x),
+        Expr::Unary(_, x) | Expr::Await(x) => expr_has_closure(x),
         Expr::Yield(x, _) => x.as_deref().is_some_and(expr_has_closure),
         Expr::Update { target, .. } => expr_has_closure(target),
         Expr::Binary(_, a, b) | Expr::Logical(_, a, b) | Expr::Index(a, b, _) => expr_has_closure(a) || expr_has_closure(b),

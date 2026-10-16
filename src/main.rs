@@ -8,6 +8,9 @@
 #![allow(non_upper_case_globals)]
 
 mod atom;
+mod av1;
+mod avif;
+mod av1_tables;
 mod brotli;
 mod brotli_tables;
 mod css;
@@ -814,9 +817,7 @@ impl Browser {
                             self.hover = None;
                             self.navigate_to(n, true);
                             continue;
-                        } else if result == Click::Handled {
-                            dirty = true;
-                        } else if let Some(target) = hover {
+                        } else if let (Click::Default, Some(target)) = (&result, hover) {
                             self.hover = None;
                             if !target.starts_with("javascript:") {
                                 self.navigate(&target, true);
