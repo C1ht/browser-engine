@@ -52,8 +52,11 @@ pub fn ms(t: Instant) -> f64 {
 /// Decoded images and which `<img>` uses which URL.
 #[derive(Default)]
 pub struct Resources {
-    /// By absolute URL; None = failed or unsupported format.
+    /// By absolute URL; None = failed or unsupported format (or still
+    /// being fetched, if in `pending`).
     pub images: FxHashMap<String, Option<Arc<Image>>>,
+    /// Image URLs requested but not yet arrived.
+    pub pending: crate::fx::FxHashSet<String>,
     pub img_src: FxHashMap<NodeId, String>,
 }
 
@@ -310,13 +313,15 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
 /// only (no network, images unloaded). Returns element rects, scroll
 /// metrics and computed styles.
 #[allow(clippy::type_complexity)]
-pub fn script_layout(doc: &Document, src: &js::LayoutSrc, vw: f32, vh: f32) -> (FxHashMap<NodeId, [f32; 4]>, FxHashMap<NodeId, [f32; 4]>, Vec<Style>) {
+pub fn script_layout(doc: &Document, src: &js::LayoutSrc, images: &FxHashMap<String, Option<Arc<Image>>>, vw: f32, vh: f32) -> (FxHashMap<NodeId, [f32; 4]>, FxHashMap<NodeId, [f32; 4]>, Vec<Style>) {
     let mut missing = Vec::new();
     let sheets = collect_sheets(doc, &src.base, &src.css, &mut missing);
     let cas = style::cached_cascade(&sheets, &Media { vw, vh }, doc.quirks);
     css::set_base(&src.base);
     let styles = style::compute(doc, &cas, vw, vh);
-    let mut res = Resources::default();
+    // Loaded images keep their sizes in script-side layout.
+    let mut res = Resources { images: images.clone(), ..Resources::default() };
+    Page::collect_img_src(doc, &src.base, &mut res);
     let tree = layout::layout(doc, &styles, vw, vh, &mut res);
     let mut metrics = FxHashMap::default();
     for b in &tree.boxes {
@@ -436,8 +441,9 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     it.deadline = Some(t0 + std::time::Duration::from_millis(script_budget() as u64));
     it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: css.clone(), base: base.to_owned() }));
     // Parser-blocking classic scripts run in order; `defer` and module
-    // scripts after them (in order), then `async` ones.
-    let (mut deferred, mut later) = (Vec::new(), Vec::new());
+    // scripts after them (in order), then `async` ones. Scripts that don't
+    // fit the startup budget are queued and run one per event loop turn.
+    let (mut classic, mut deferred, mut later) = (Vec::new(), Vec::new(), Vec::new());
     for s in scripts {
         let kind = script_kind(&it.doc, s);
         let external = it.doc.attr(s, k::src).is_some();
@@ -448,30 +454,28 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
                 it.add_import_map(&c, base);
             }
             ScriptKind::Other => {}
-            _ if has_attr(&it.doc, s, "async") && (external || kind == ScriptKind::Module) => later.push((s, kind)),
-            ScriptKind::Module => deferred.push((s, kind)),
-            ScriptKind::Classic if external && has_attr(&it.doc, s, "defer") => deferred.push((s, kind)),
-            ScriptKind::Classic => {
-                if ms(t0) <= script_budget() {
-                    run_script_node(&mut it, s, kind, sources, base);
-                    run_pending(&mut it, &t0);
-                }
-            }
+            _ if has_attr(&it.doc, s, "async") && (external || kind == ScriptKind::Module) => later.push(s),
+            ScriptKind::Module => deferred.push(s),
+            ScriptKind::Classic if external && has_attr(&it.doc, s, "defer") => deferred.push(s),
+            ScriptKind::Classic => classic.push(s),
         }
     }
-    for (s, kind) in deferred.into_iter().chain(later) {
-        if ms(t0) <= script_budget() {
+    for s in classic.into_iter().chain(deferred).chain(later) {
+        if it.script_queue.is_empty() && ms(t0) <= script_budget() {
+            it.deadline = Some(Instant::now() + std::time::Duration::from_millis(SCRIPT_TASK_MS));
+            let kind = script_kind(&it.doc, s);
             run_script_node(&mut it, s, kind, sources, base);
             run_pending(&mut it, &t0);
+        } else {
+            it.script_queue.push_back(s);
         }
     }
-    it.ready_state = "interactive";
-    js::dombind::dispatch_nobubble(&mut it, 0, "readystatechange");
-    js::dombind::dispatch(&mut it, 0, "DOMContentLoaded", |_, _| {});
-    it.ready_state = "complete";
-    js::dombind::dispatch_nobubble(&mut it, 0, "readystatechange");
-    js::dombind::dispatch_nobubble(&mut it, js::WINDOW, "load");
-    js::dombind::dispatch_nobubble(&mut it, js::WINDOW, "pageshow");
+    if it.script_queue.is_empty() {
+        fire_load_events(&mut it);
+    } else {
+        it.script_sources = Some(std::rc::Rc::new(sources.clone()));
+        it.load_events_pending = true;
+    }
     it.run_microtasks();
     if profile_scripts() {
         eprintln!("[profile] scripts + load events done at {:.0}ms", ms(t0));
@@ -509,6 +513,21 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     it.dirty = false;
     let doc = std::mem::take(&mut it.doc);
     (doc, Some(it), elapsed)
+}
+
+/// How long one script (or event handler / timer task) may run.
+const SCRIPT_TASK_MS: u64 = 5000;
+
+/// The document finished loading: readystatechange, DOMContentLoaded, load.
+fn fire_load_events(it: &mut js::Interp) {
+    it.load_events_pending = false;
+    it.ready_state = "interactive";
+    js::dombind::dispatch_nobubble(it, 0, "readystatechange");
+    js::dombind::dispatch(it, 0, "DOMContentLoaded", |_, _| {});
+    it.ready_state = "complete";
+    js::dombind::dispatch_nobubble(it, 0, "readystatechange");
+    js::dombind::dispatch_nobubble(it, js::WINDOW, "load");
+    js::dombind::dispatch_nobubble(it, js::WINDOW, "pageshow");
 }
 
 fn run_one(it: &mut js::Interp, code: &str) {
@@ -751,7 +770,7 @@ impl Page {
         page
     }
 
-    fn collect_img_src(doc: &Document, base: &str, res: &mut Resources) {
+    pub(crate) fn collect_img_src(doc: &Document, base: &str, res: &mut Resources) {
         res.img_src.clear();
         for (i, n) in doc.nodes.iter().enumerate() {
             if let Data::Element(e) = &n.data {
@@ -764,9 +783,39 @@ impl Page {
         }
     }
 
+    /// Fire `load` / `error` at <img> elements whose image has arrived
+    /// (or failed) since the last call.
+    pub fn fire_image_events(&mut self) {
+        let Some(it) = &self.js else { return };
+        let due: Vec<(NodeId, String, bool)> = self
+            .res
+            .img_src
+            .iter()
+            .filter_map(|(&n, u)| {
+                if self.res.pending.contains(u) {
+                    return None;
+                }
+                let ok = self.res.images.get(u)?.is_some();
+                (it.img_fired.get(&n) != Some(u)).then(|| (n, u.clone(), ok))
+            })
+            .collect();
+        if due.is_empty() {
+            return;
+        }
+        self.with_js(|it| {
+            for (n, u, ok) in due {
+                it.img_fired.insert(n, u);
+                js::dombind::dispatch_nobubble(it, n, if ok { "load" } else { "error" });
+            }
+        });
+    }
+
     /// Give scripts the latest element geometry.
     fn sync_js_geometry(&mut self) {
         if let Some(it) = &mut self.js {
+            if it.images.len() + self.res.pending.len() != self.res.images.len() {
+                it.images = self.res.images.iter().filter(|(u, _)| !self.res.pending.contains(*u)).map(|(u, i)| (u.clone(), i.clone())).collect();
+            }
             it.rects = self.tree.node_rects();
             it.vw = self.vw;
             it.vh = self.vh;
@@ -913,7 +962,7 @@ impl Page {
         it.doc = std::mem::take(&mut self.doc);
         // Event handlers and timers get a leash; generous, since a killed
         // task (half-rendered component) is worse than a slow one.
-        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(5000));
+        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(SCRIPT_TASK_MS));
         let focus_before = it.doc.focus;
         let r = f(it);
         it.run_microtasks();
@@ -1340,6 +1389,23 @@ impl Page {
 
     /// Run due timers (`now` = ms since load). Returns true if the page changed.
     pub fn tick(&mut self, now: f64) -> bool {
+        // Page scripts deferred past the startup budget: one per turn.
+        if self.js.as_ref().is_some_and(|it| !it.script_queue.is_empty() || it.load_events_pending) {
+            let base = self.base.clone();
+            self.with_js(|it| {
+                if let Some(s) = it.script_queue.pop_front() {
+                    let sources = it.script_sources.clone().unwrap_or_default();
+                    let kind = script_kind(&it.doc, s);
+                    it.dirty = true;
+                    run_script_node(it, s, kind, &sources, &base);
+                }
+                if it.script_queue.is_empty() && it.load_events_pending {
+                    it.script_sources = None;
+                    fire_load_events(it);
+                }
+            });
+            return true;
+        }
         let Some(it) = &self.js else { return false };
         let due = it.next_timer_at().is_some_and(|t| t <= now);
         let geo = it.has_geometry_observers() && (self.geo_dirty || it.geo_pending || self.scroll_changed);
@@ -1459,6 +1525,7 @@ impl Page {
             self.res.images.insert(u, img);
         }
         self.relayout(vw, vh);
+        self.fire_image_events();
     }
 
     pub fn title(&self) -> String {

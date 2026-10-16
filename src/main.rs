@@ -602,7 +602,8 @@ impl Browser {
             return;
         }
         for u in &urls {
-            page.res.images.insert(u.clone(), None); // pending
+            page.res.images.insert(u.clone(), None);
+            page.res.pending.insert(u.clone());
         }
         let (tx, generation) = (self.img_tx.clone(), self.generation);
         std::thread::spawn(move || {
@@ -626,6 +627,7 @@ impl Browser {
             }
             if let Some(p) = &mut self.page {
                 if !u.is_empty() {
+                    p.res.pending.remove(&u);
                     p.res.images.insert(u, img);
                 }
                 changed = true;
@@ -635,12 +637,14 @@ impl Browser {
             let (w, vh) = (self.w as f32, self.vh() as f32);
             if let Some(p) = &mut self.page {
                 p.relayout(w, vh);
+                p.fire_image_events();
                 // Newly visible elements (e.g. via media queries) may want more images.
                 let urls = p.wanted_images();
                 if !urls.is_empty() {
                     let (tx, generation) = (self.img_tx.clone(), self.generation);
                     for u in &urls {
                         p.res.images.insert(u.clone(), None);
+                        p.res.pending.insert(u.clone());
                     }
                     std::thread::spawn(move || {
                         engine::fetch_images(&urls, &|u, img| {

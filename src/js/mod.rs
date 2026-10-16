@@ -293,7 +293,7 @@ impl Interp {
         }
         let Some(src) = self.layout_src.clone() else { return };
         let t = std::time::Instant::now();
-        let (rects, metrics, styles) = crate::engine::script_layout(&self.doc, &src, self.vw, self.vh);
+        let (rects, metrics, styles) = crate::engine::script_layout(&self.doc, &src, &self.images, self.vw, self.vh);
         if std::env::var_os("BOLT_PROFILE").is_some() {
             eprintln!("[profile] forced layout {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
         }
@@ -488,6 +488,18 @@ pub struct Interp {
     pub co_stack: Vec<ObjRef>,
     /// Top-level scripts / module bodies being evaluated (JS on the stack).
     pub script_running: u32,
+    /// Images the page has loaded, by URL (None: failed). For script-side
+    /// layout, naturalWidth / complete, and load events.
+    pub images: FxHashMap<String, Option<std::sync::Arc<crate::image::Image>>>,
+    /// <img> elements whose load / error event has fired (for which URL).
+    pub img_fired: FxHashMap<NodeId, String>,
+    /// Page scripts that didn't fit the startup budget: run one per event
+    /// loop turn (the window stays responsive), in order.
+    pub script_queue: std::collections::VecDeque<NodeId>,
+    /// External script sources for the queued scripts.
+    pub script_sources: Option<Rc<FxHashMap<String, String>>>,
+    /// DOMContentLoaded / load still to fire (after the queue drains).
+    pub load_events_pending: bool,
     /// Promises rejected with no handler yet (reported after microtasks).
     pub unhandled_rejections: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
@@ -578,6 +590,11 @@ impl Interp {
             styles: None,
             co_stack: Vec::new(),
             script_running: 0,
+            images: FxHashMap::default(),
+            img_fired: FxHashMap::default(),
+            script_queue: Default::default(),
+            script_sources: None,
+            load_events_pending: false,
             unhandled_rejections: Vec::new(),
             nav: None,
             submit_form: None,
@@ -1151,7 +1168,7 @@ impl Interp {
         self.depth += 1;
         let r = if prof::on() {
             self.call_closure_profiled(def, env, arrow_this, home, this, args, fobj)
-        } else if trace_on() {
+        } else if trace_on() || std::env::var_os("BOLT_TRACE_THROW").is_some() {
             TRACE_STACK.with(|s| s.borrow_mut().push(def.clone()));
             let r = self.call_closure_inner(def, env, arrow_this, home, this, args, fobj);
             TRACE_STACK.with(|s| s.borrow_mut().pop());
@@ -1740,6 +1757,10 @@ impl Interp {
             Stmt::Continue(l) => return Ok(Flow::Cont(l.clone())),
             Stmt::Throw(e) => {
                 let v = self.eval(e, env)?;
+                if trace_throw() {
+                    let m = self.describe_error(&v);
+                    self.log(&format!("[throw] {m}{}", trace_stack()));
+                }
                 return Err(v);
             }
             Stmt::Try(block, catch, finally) => {
@@ -2856,6 +2877,13 @@ pub(crate) fn trace_stack() -> String {
             })
             .collect()
     })
+}
+
+/// `BOLT_TRACE_THROW=1`: log the first `throw` statements executed.
+fn trace_throw() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    *ON.get_or_init(|| std::env::var_os("BOLT_TRACE_THROW").is_some()) && COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30
 }
 
 pub(crate) fn trace_on() -> bool {

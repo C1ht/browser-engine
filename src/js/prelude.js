@@ -620,6 +620,87 @@
     });
   })();
 
+  // Media elements: no playback, but the API exists and behaves like a
+  // paused, never-loaded video (so players don't crash; posters show).
+  (function () {
+    var NP = Node.prototype, media = { video: 1, audio: 1 };
+    var isMedia = function (el) { return el && el.nodeType === 1 && media[el.localName]; };
+    var state = function (el) {
+      return el.__media || (el.__media = { currentTime: 0, paused: true, muted: el.hasAttribute('muted'), volume: 1, playbackRate: 1, ended: false });
+    };
+    var methods = {
+      load: function () {},
+      play: function () {
+        var el = this;
+        state(el);
+        return Promise.reject(new DOMException('The element has no supported sources.', 'NotSupportedError'));
+      },
+      pause: function () { state(this).paused = true; },
+      canPlayType: function () { return ''; },
+      addTextTrack: function () { return { mode: 'disabled', cues: [], addCue: function () {} }; },
+      fastSeek: function (t) { state(this).currentTime = t; },
+      requestPictureInPicture: function () { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); },
+      captureStream: function () { return null; }
+    };
+    Object.keys(methods).forEach(function (k) {
+      if (!(k in NP)) Object.defineProperty(NP, k, { value: function () { return isMedia(this) ? methods[k].apply(this, arguments) : undefined; }, configurable: true, writable: true });
+    });
+    var props = {
+      currentTime: [function () { return state(this).currentTime; }, function (v) { state(this).currentTime = +v || 0; }],
+      paused: [function () { return state(this).paused; }],
+      ended: [function () { return false; }],
+      muted: [function () { return state(this).muted; }, function (v) { state(this).muted = !!v; }],
+      volume: [function () { return state(this).volume; }, function (v) { state(this).volume = +v; }],
+      playbackRate: [function () { return state(this).playbackRate; }, function (v) { state(this).playbackRate = +v; }],
+      duration: [function () { return NaN; }],
+      readyState: [function () { return 0; }],
+      networkState: [function () { return 3; }],
+      buffered: [function () { return { length: 0, start: function () { return 0; }, end: function () { return 0; } }; }],
+      seekable: [function () { return { length: 0, start: function () { return 0; }, end: function () { return 0; } }; }],
+      played: [function () { return { length: 0 }; }],
+      videoWidth: [function () { return 0; }],
+      videoHeight: [function () { return 0; }],
+      currentSrc: [function () { return this.src || ''; }],
+      textTracks: [function () { return []; }]
+    };
+    var nget = window['@@nativeGet'], nset = window['@@nativeSet'];
+    Object.keys(props).forEach(function (k) {
+      if (Object.getOwnPropertyDescriptor(NP, k)) return;
+      var g = props[k][0], s = props[k][1];
+      // Marked native: the DOM layer answers first (document.readyState...);
+      // these only serve media elements.
+      var get = function () { return isMedia(this) ? g.call(this) : nget(this, k); };
+      var set = function (v) { if (isMedia(this) && s) s.call(this, v); else nset(this, k, v); };
+      Object.defineProperty(get, '@@nativeAccessor', { value: true });
+      Object.defineProperty(set, '@@nativeAccessor', { value: true });
+      Object.defineProperty(NP, k, { get: get, set: set, configurable: true });
+    });
+    ['HAVE_NOTHING', 'HAVE_METADATA', 'HAVE_CURRENT_DATA', 'HAVE_FUTURE_DATA', 'HAVE_ENOUGH_DATA'].forEach(function (k, i) {
+      if (window.HTMLMediaElement) HTMLMediaElement[k] = i;
+    });
+  })();
+
+  // Iframes: we don't load frame documents; contentWindow is an inert,
+  // about:blank-like window (cross-origin pages see much the same).
+  (function () {
+    var NP = Node.prototype;
+    if (Object.getOwnPropertyDescriptor(NP, 'contentWindow')) return;
+    var frameWindow = function (el) {
+      if (el.__frameWindow) return el.__frameWindow;
+      var w = {
+        location: { href: 'about:blank', origin: 'null', protocol: 'about:', host: '', hostname: '', pathname: 'blank', search: '', hash: '', replace: function () {}, assign: function () {}, reload: function () {} },
+        postMessage: function () {}, addEventListener: function () {}, removeEventListener: function () {},
+        focus: function () {}, blur: function () {}, close: function () {}, closed: false,
+        parent: window, top: window, frames: [], length: 0, opener: null
+      };
+      w.window = w; w.self = w;
+      el.__frameWindow = w;
+      return w;
+    };
+    Object.defineProperty(NP, 'contentWindow', { get: function () { return this.localName === 'iframe' || this.localName === 'frame' || this.localName === 'object' ? frameWindow(this) : undefined; }, configurable: true });
+    Object.defineProperty(NP, 'contentDocument', { get: function () { return this.localName === 'iframe' || this.localName === 'frame' || this.localName === 'object' ? null : undefined; }, configurable: true });
+  })();
+
   // Newer ECMAScript library functions.
   var def = function (o, name, f) { if (!(name in o)) Object.defineProperty(o, name, { value: f, writable: true, configurable: true, enumerable: false }); };
   def(Object, 'hasOwn', function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); });

@@ -2181,10 +2181,16 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
     let (w, h) = if st.border_box { (bw, bh) } else { (cw, ch) };
     put("width", if rect.is_some() && st.display != Display::Inline { css_px(if st.border_box { w } else { cw }) } else { "auto".into() });
     put("height", if rect.is_some() && st.display != Display::Inline { css_px(if st.border_box { h } else { ch }) } else { "auto".into() });
-    put("min-width", css_len(st.min_w, bw));
-    put("max-width", if st.max_w == Len::Auto { "none".into() } else { css_len(st.max_w, bw) });
-    put("min-height", css_len(st.min_h, bh));
-    put("max-height", if st.max_h == Len::Auto { "none".into() } else { css_len(st.max_h, bh) });
+    // Min / max sizes report percentages as specified (as browsers do).
+    let size = |l: Len, base: f32| match l {
+        Len::Pct(p) => format!("{}%", (p * 1000.0).round() / 1000.0),
+        Len::Auto => "auto".into(),
+        l => css_len(l, base),
+    };
+    put("min-width", size(st.min_w, bw));
+    put("max-width", if st.max_w == Len::Auto { "none".into() } else { size(st.max_w, bw) });
+    put("min-height", size(st.min_h, bh));
+    put("max-height", if st.max_h == Len::Auto { "none".into() } else { size(st.max_h, bh) });
     for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
         put(&format!("margin-{side}"), css_len(st.margin[i], bw));
         put(&format!("padding-{side}"), css_px(pad[i]));

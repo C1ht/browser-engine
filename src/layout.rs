@@ -1263,7 +1263,12 @@ impl<'a> Engine<'a> {
                     Some(h) if nh > 0.0 => h * nw / nh,
                     _ => nw,
                 });
-                (w, w)
+                // Compressible replaced elements: a percentage width or
+                // max-width makes the min-content contribution zero (an
+                // `img { max-width: 100% }` shrinks with its container).
+                let pct = |l: Len| matches!(l, Len::Pct(_) | Len::Ex(_));
+                let compressible = pct(st.width) || (st.width.fixed().is_none() && pct(st.max_w));
+                (if compressible { 0.0 } else { w }, w)
             }
             Kind::Table => {
                 let st = self.st(id);
@@ -2381,14 +2386,21 @@ impl<'a> Engine<'a> {
                 _ => limit[i] = cmax[i].max(base[i]),
             }
         }
-        // Spanning items: grow the spanned tracks evenly to fit their minimum.
+        // Spanning items: grow the spanned tracks with an intrinsic minimum
+        // (auto / min-content / max-content) evenly to fit the item's
+        // minimum. Items spanning a flexible track don't take part (their
+        // size is resolved with the fr tracks), nor do fixed-minimum tracks.
+        let intrinsic = |t: &Track| matches!(t.min, Breadth::Auto | Breadth::MinContent | Breadth::MaxContent);
         for &(c, s, span) in placed {
-            if span > 1 {
+            if span > 1 && s + span <= n && !tracks[s..s + span].iter().any(|t| matches!(t.max, Breadth::Fr(_))) {
                 let (mn, _) = self.intrinsic_outer(c);
                 let cur: f32 = base[s..s + span].iter().sum::<f32>() + gap * (span - 1) as f32;
-                if mn > cur {
-                    let add = (mn - cur) / span as f32;
-                    base[s..s + span].iter_mut().for_each(|b| *b += add);
+                let growable: Vec<usize> = (s..s + span).filter(|&i| intrinsic(&tracks[i])).collect();
+                if mn > cur && !growable.is_empty() {
+                    let add = (mn - cur) / growable.len() as f32;
+                    for i in growable {
+                        base[i] += add;
+                    }
                 }
             }
         }

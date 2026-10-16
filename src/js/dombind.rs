@@ -14,9 +14,166 @@ pub fn node_obj(it: &mut Interp, id: NodeId) -> Value {
     if let Some(o) = it.node_objs.get(&id) {
         return Value::Obj(o.clone());
     }
-    let o = it.new_obj(it.p.node.clone(), Kind::Node(id));
+    let proto = it.p.web.get(interface_of(it, id)).cloned().or_else(|| it.p.node.clone());
+    let o = it.new_obj(proto, Kind::Node(id));
     it.node_objs.insert(id, o.clone());
     Value::Obj(o)
+}
+
+/// DOM interfaces and their parents (Node.prototype is the root).
+const INTERFACES: &[(&str, &str)] = &[
+    ("CharacterData", "Node"), ("Text", "CharacterData"), ("CDATASection", "Text"), ("Comment", "CharacterData"),
+    ("ProcessingInstruction", "CharacterData"), ("Document", "Node"), ("HTMLDocument", "Document"),
+    ("XMLDocument", "Document"), ("DocumentFragment", "Node"), ("ShadowRoot", "DocumentFragment"),
+    ("DocumentType", "Node"), ("Attr", "Node"), ("Element", "Node"), ("HTMLElement", "Element"),
+    ("SVGElement", "Element"), ("SVGGraphicsElement", "SVGElement"), ("SVGSVGElement", "SVGGraphicsElement"),
+    ("SVGGeometryElement", "SVGGraphicsElement"), ("SVGPathElement", "SVGGeometryElement"),
+    ("SVGRectElement", "SVGGeometryElement"), ("SVGCircleElement", "SVGGeometryElement"),
+    ("SVGEllipseElement", "SVGGeometryElement"), ("SVGLineElement", "SVGGeometryElement"),
+    ("SVGPolygonElement", "SVGGeometryElement"), ("SVGPolylineElement", "SVGGeometryElement"),
+    ("SVGGElement", "SVGGraphicsElement"), ("SVGUseElement", "SVGGraphicsElement"), ("SVGTextElement", "SVGGraphicsElement"),
+    ("SVGImageElement", "SVGGraphicsElement"), ("SVGForeignObjectElement", "SVGGraphicsElement"),
+    ("SVGDefsElement", "SVGGraphicsElement"), ("SVGSymbolElement", "SVGElement"), ("SVGStopElement", "SVGElement"),
+    ("SVGGradientElement", "SVGElement"), ("SVGLinearGradientElement", "SVGGradientElement"),
+    ("SVGRadialGradientElement", "SVGGradientElement"), ("SVGClipPathElement", "SVGElement"), ("SVGMaskElement", "SVGElement"),
+    ("SVGTitleElement", "SVGElement"), ("SVGDescElement", "SVGElement"),
+    ("MathMLElement", "Element"), ("HTMLMediaElement", "HTMLElement"), ("HTMLVideoElement", "HTMLMediaElement"),
+    ("HTMLAudioElement", "HTMLMediaElement"), ("HTMLUnknownElement", "HTMLElement"),
+    ("HTMLAnchorElement", "HTMLElement"), ("HTMLAreaElement", "HTMLElement"), ("HTMLBaseElement", "HTMLElement"),
+    ("HTMLBodyElement", "HTMLElement"), ("HTMLBRElement", "HTMLElement"), ("HTMLButtonElement", "HTMLElement"),
+    ("HTMLCanvasElement", "HTMLElement"), ("HTMLDataElement", "HTMLElement"), ("HTMLDataListElement", "HTMLElement"),
+    ("HTMLDetailsElement", "HTMLElement"), ("HTMLDialogElement", "HTMLElement"), ("HTMLDivElement", "HTMLElement"),
+    ("HTMLDListElement", "HTMLElement"), ("HTMLEmbedElement", "HTMLElement"), ("HTMLFieldSetElement", "HTMLElement"),
+    ("HTMLFormElement", "HTMLElement"), ("HTMLFrameElement", "HTMLElement"), ("HTMLFrameSetElement", "HTMLElement"),
+    ("HTMLHeadingElement", "HTMLElement"), ("HTMLHeadElement", "HTMLElement"), ("HTMLHRElement", "HTMLElement"),
+    ("HTMLHtmlElement", "HTMLElement"), ("HTMLIFrameElement", "HTMLElement"), ("HTMLImageElement", "HTMLElement"),
+    ("HTMLInputElement", "HTMLElement"), ("HTMLLabelElement", "HTMLElement"), ("HTMLLegendElement", "HTMLElement"),
+    ("HTMLLIElement", "HTMLElement"), ("HTMLLinkElement", "HTMLElement"), ("HTMLMapElement", "HTMLElement"),
+    ("HTMLMenuElement", "HTMLElement"), ("HTMLMetaElement", "HTMLElement"), ("HTMLMeterElement", "HTMLElement"),
+    ("HTMLModElement", "HTMLElement"), ("HTMLObjectElement", "HTMLElement"), ("HTMLOListElement", "HTMLElement"),
+    ("HTMLOptGroupElement", "HTMLElement"), ("HTMLOptionElement", "HTMLElement"), ("HTMLOutputElement", "HTMLElement"),
+    ("HTMLParagraphElement", "HTMLElement"), ("HTMLParamElement", "HTMLElement"), ("HTMLPictureElement", "HTMLElement"),
+    ("HTMLPreElement", "HTMLElement"), ("HTMLProgressElement", "HTMLElement"), ("HTMLQuoteElement", "HTMLElement"),
+    ("HTMLScriptElement", "HTMLElement"), ("HTMLSearchElement", "HTMLElement"), ("HTMLSelectElement", "HTMLElement"),
+    ("HTMLSlotElement", "HTMLElement"), ("HTMLSourceElement", "HTMLElement"), ("HTMLSpanElement", "HTMLElement"),
+    ("HTMLStyleElement", "HTMLElement"), ("HTMLTableCaptionElement", "HTMLElement"), ("HTMLTableCellElement", "HTMLElement"),
+    ("HTMLTableColElement", "HTMLElement"), ("HTMLTableElement", "HTMLElement"), ("HTMLTableRowElement", "HTMLElement"),
+    ("HTMLTableSectionElement", "HTMLElement"), ("HTMLTemplateElement", "HTMLElement"), ("HTMLTextAreaElement", "HTMLElement"),
+    ("HTMLTimeElement", "HTMLElement"), ("HTMLTitleElement", "HTMLElement"), ("HTMLTrackElement", "HTMLElement"),
+    ("HTMLUListElement", "HTMLElement"), ("HTMLMarqueeElement", "HTMLElement"), ("HTMLDirectoryElement", "HTMLElement"),
+    ("HTMLFontElement", "HTMLElement"),
+];
+
+/// The DOM interface a node's wrapper should be an instance of.
+fn interface_of(it: &Interp, id: NodeId) -> &'static str {
+    match &it.doc.nodes[id as usize].data {
+        Data::Document => "HTMLDocument",
+        Data::Text(_) => "Text",
+        Data::Comment(_) => "Comment",
+        Data::Doctype(_) => "DocumentType",
+        Data::Fragment if it.doc.shadow_hosts.contains_key(&id) => "ShadowRoot",
+        Data::Fragment => "DocumentFragment",
+        Data::Element(e) => match e.ns {
+            Ns::Svg => match atom::name(e.tag) {
+                "svg" => "SVGSVGElement",
+                "path" => "SVGPathElement",
+                "g" => "SVGGElement",
+                "use" => "SVGUseElement",
+                "rect" => "SVGRectElement",
+                "circle" => "SVGCircleElement",
+                "ellipse" => "SVGEllipseElement",
+                "line" => "SVGLineElement",
+                "polygon" => "SVGPolygonElement",
+                "polyline" => "SVGPolylineElement",
+                "text" | "tspan" => "SVGTextElement",
+                "image" => "SVGImageElement",
+                "symbol" => "SVGSymbolElement",
+                "defs" => "SVGDefsElement",
+                "stop" => "SVGStopElement",
+                "lineargradient" | "linearGradient" => "SVGLinearGradientElement",
+                "radialgradient" | "radialGradient" => "SVGRadialGradientElement",
+                "foreignobject" | "foreignObject" => "SVGForeignObjectElement",
+                "clippath" | "clipPath" => "SVGClipPathElement",
+                "mask" => "SVGMaskElement",
+                "title" => "SVGTitleElement",
+                "desc" => "SVGDescElement",
+                _ => "SVGElement",
+            },
+            Ns::MathMl => "MathMLElement",
+            _ => match atom::name(e.tag) {
+                "a" => "HTMLAnchorElement",
+                "area" => "HTMLAreaElement",
+                "audio" => "HTMLAudioElement",
+                "base" => "HTMLBaseElement",
+                "body" => "HTMLBodyElement",
+                "br" => "HTMLBRElement",
+                "button" => "HTMLButtonElement",
+                "canvas" => "HTMLCanvasElement",
+                "data" => "HTMLDataElement",
+                "datalist" => "HTMLDataListElement",
+                "details" => "HTMLDetailsElement",
+                "dialog" => "HTMLDialogElement",
+                "div" => "HTMLDivElement",
+                "dl" => "HTMLDListElement",
+                "embed" => "HTMLEmbedElement",
+                "fieldset" => "HTMLFieldSetElement",
+                "form" => "HTMLFormElement",
+                "frame" => "HTMLFrameElement",
+                "frameset" => "HTMLFrameSetElement",
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => "HTMLHeadingElement",
+                "head" => "HTMLHeadElement",
+                "hr" => "HTMLHRElement",
+                "html" => "HTMLHtmlElement",
+                "iframe" => "HTMLIFrameElement",
+                "img" => "HTMLImageElement",
+                "input" => "HTMLInputElement",
+                "label" => "HTMLLabelElement",
+                "legend" => "HTMLLegendElement",
+                "li" => "HTMLLIElement",
+                "link" => "HTMLLinkElement",
+                "map" => "HTMLMapElement",
+                "menu" => "HTMLMenuElement",
+                "meta" => "HTMLMetaElement",
+                "meter" => "HTMLMeterElement",
+                "del" | "ins" => "HTMLModElement",
+                "object" => "HTMLObjectElement",
+                "ol" => "HTMLOListElement",
+                "optgroup" => "HTMLOptGroupElement",
+                "option" => "HTMLOptionElement",
+                "output" => "HTMLOutputElement",
+                "p" => "HTMLParagraphElement",
+                "param" => "HTMLParamElement",
+                "picture" => "HTMLPictureElement",
+                "pre" | "listing" | "xmp" => "HTMLPreElement",
+                "progress" => "HTMLProgressElement",
+                "q" | "blockquote" => "HTMLQuoteElement",
+                "script" => "HTMLScriptElement",
+                "search" => "HTMLSearchElement",
+                "select" => "HTMLSelectElement",
+                "slot" => "HTMLSlotElement",
+                "source" => "HTMLSourceElement",
+                "span" => "HTMLSpanElement",
+                "style" => "HTMLStyleElement",
+                "caption" => "HTMLTableCaptionElement",
+                "td" | "th" => "HTMLTableCellElement",
+                "col" | "colgroup" => "HTMLTableColElement",
+                "table" => "HTMLTableElement",
+                "tr" => "HTMLTableRowElement",
+                "tbody" | "thead" | "tfoot" => "HTMLTableSectionElement",
+                "template" => "HTMLTemplateElement",
+                "textarea" => "HTMLTextAreaElement",
+                "time" => "HTMLTimeElement",
+                "title" => "HTMLTitleElement",
+                "track" => "HTMLTrackElement",
+                "ul" => "HTMLUListElement",
+                "video" => "HTMLVideoElement",
+                "marquee" => "HTMLMarqueeElement",
+                "dir" => "HTMLDirectoryElement",
+                "font" => "HTMLFontElement",
+                _ => "HTMLElement",
+            },
+        },
+    }
 }
 
 pub(crate) fn node_id(v: &Value) -> Option<NodeId> {
@@ -291,6 +448,18 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             Data::Fragment => 11.0,
         }),
         "attributes" if it.doc.elem(id).is_some() => attributes_map(it, id),
+        "naturalWidth" | "naturalHeight" | "complete" if it.doc.tag(id) == Some(k::img) => {
+            let src = get_attr(it, id, "src").map(|v| crate::net::resolve(&it.url, &v));
+            let entry = src.as_ref().and_then(|u| it.images.get(u));
+            match key {
+                // No src, or the fetch finished (loaded or failed).
+                "complete" => Value::Bool(src.is_none() || entry.is_some()),
+                _ => {
+                    let img = entry.and_then(|e| e.as_ref());
+                    Value::Num(img.map_or(0.0, |i| if key == "naturalWidth" { i.iw } else { i.ih }) as f64)
+                }
+            }
+        }
         "nodeName" | "tagName" | "localName" => match &it.doc.nodes[id as usize].data {
             Data::Element(e) => {
                 let n = atom::name(e.tag);
@@ -2248,28 +2417,28 @@ pub fn install(it: &mut Interp) {
     ] {
         ctor(it, n, event_ctor, Some(ev.clone()));
     }
-    for n in [
-        "Node", "Element", "HTMLElement", "HTMLDivElement", "HTMLSpanElement", "HTMLInputElement", "HTMLAnchorElement",
-        "HTMLImageElement", "HTMLDocument", "Document", "DocumentFragment", "Text", "Comment", "CharacterData",
-        "SVGElement", "SVGSVGElement", "HTMLTemplateElement", "HTMLScriptElement", "HTMLStyleElement",
-        "HTMLLinkElement", "HTMLMetaElement", "HTMLButtonElement", "HTMLFormElement", "HTMLSelectElement",
-        "HTMLOptionElement", "HTMLTextAreaElement", "HTMLLabelElement", "HTMLIFrameElement", "HTMLCanvasElement",
-        "HTMLVideoElement", "HTMLAudioElement", "HTMLMediaElement", "HTMLBodyElement", "HTMLHeadElement",
-        "HTMLHtmlElement", "HTMLParagraphElement", "HTMLHeadingElement", "HTMLUListElement", "HTMLLIElement",
-        "HTMLTableElement", "HTMLSlotElement", "HTMLUnknownElement", "ShadowRoot",
-        "Attr", "CDATASection", "ProcessingInstruction", "DocumentType", "XMLDocument", "MathMLElement", "SVGGraphicsElement", "SVGGeometryElement", "SVGPathElement",
-        "SVGGElement", "SVGUseElement", "SVGSymbolElement", "SVGRectElement", "SVGCircleElement", "SVGTextElement",
-        "SVGImageElement", "SVGDefsElement", "SVGStopElement", "SVGLinearGradientElement", "SVGForeignObjectElement",
-        "HTMLDialogElement", "HTMLTitleElement", "HTMLDetailsElement", "HTMLPictureElement", "HTMLSourceElement",
-        "HTMLObjectElement", "HTMLEmbedElement", "HTMLFieldSetElement", "HTMLOutputElement", "HTMLProgressElement",
-        "HTMLMeterElement", "HTMLDataListElement", "HTMLFrameElement", "HTMLMapElement", "HTMLAreaElement",
-        "HTMLBRElement", "HTMLHRElement", "HTMLPreElement", "HTMLQuoteElement", "HTMLModElement", "HTMLOListElement",
-        "HTMLDListElement", "HTMLTableRowElement", "HTMLTableCellElement", "HTMLTableSectionElement",
-        "HTMLTableCaptionElement", "HTMLTableColElement", "HTMLLegendElement", "HTMLOptGroupElement", "HTMLTimeElement",
-        "HTMLDataElement", "HTMLTrackElement", "HTMLBaseElement", "HTMLMenuElement", "HTMLSearchElement",
-        "HTMLFrameSetElement", "HTMLParamElement", "HTMLMarqueeElement", "HTMLDirectoryElement", "HTMLFontElement",
-    ] {
-        ctor(it, n, crate::js::custom::html_element_ctor, Some(np.clone()));
+    // The DOM interface hierarchy: each interface has its own prototype
+    // (HTMLDivElement.prototype -> HTMLElement.prototype -> Element.prototype
+    // -> Node.prototype), so `instanceof` tells element types apart. The
+    // methods themselves live on Node.prototype.
+    it.p.web.insert("Node", np.clone());
+    ctor(it, "Node", crate::js::custom::html_element_ctor, Some(np.clone()));
+    for &(n, parent) in INTERFACES {
+        let parent_proto = it.p.web.get(parent).cloned().unwrap_or_else(|| np.clone());
+        let proto = it.new_obj(Some(parent_proto), Kind::Plain);
+        it.p.web.insert(n, proto.clone());
+        ctor(it, n, crate::js::custom::html_element_ctor, Some(proto.clone()));
+        if let Ok(c) = it.get(&Value::Obj(it.global.clone()), n) {
+            Interp::set_hidden(&proto, "constructor", c);
+        }
+        Interp::set_hidden(&proto, "@@toStringTag", Value::str(n));
+    }
+    // Wrappers made before the hierarchy existed (document) get theirs now.
+    let early: Vec<(NodeId, ObjRef)> = it.node_objs.iter().map(|(&n, o)| (n, o.clone())).collect();
+    for (n, o) in early {
+        if o.borrow().proto.as_ref().is_some_and(|p| Rc::ptr_eq(p, &np)) {
+            o.borrow_mut().proto = it.p.web.get(interface_of(it, n)).cloned().or(Some(np.clone()));
+        }
     }
     // Node type and document-position constants.
     let consts = [
