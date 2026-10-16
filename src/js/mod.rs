@@ -252,6 +252,18 @@ pub struct GenStart {
     pub fobj: ObjRef,
 }
 
+/// An event listener: target (node or WINDOW), type, callback, options.
+pub struct Listener {
+    pub target: u32,
+    pub ty: Rc<str>,
+    pub f: Value,
+    pub capture: bool,
+    pub once: bool,
+    pub passive: bool,
+    /// An AbortSignal that removes the listener.
+    pub signal: Option<Value>,
+}
+
 pub struct LayoutSrc {
     pub css: FxHashMap<String, String>,
     pub base: String,
@@ -376,8 +388,11 @@ pub struct Interp {
     pub timers: Vec<Timer>,
     pub next_timer: u32,
     pub micro: VecDeque<(Value, Vec<Value>)>,
-    /// Event listeners: (target node or WINDOW, type, callback).
-    pub listeners: Vec<(u32, Rc<str>, Value)>,
+    /// Event listeners, in registration order.
+    pub listeners: Vec<Listener>,
+    /// document.readyState and document.currentScript.
+    pub ready_state: &'static str,
+    pub current_script: NodeId,
     pub node_objs: FxHashMap<NodeId, ObjRef>,
     pub url: String,
     pub storage: FxHashMap<String, String>,
@@ -388,8 +403,9 @@ pub struct Interp {
     pub rng: u64,
     pub symbols: u32,
     pub console: Vec<String>,
-    /// External scripts inserted by scripts, waiting to be fetched and run.
-    pub pending_scripts: Vec<String>,
+    /// External scripts inserted by scripts, waiting to be fetched and run:
+    /// (url, script element).
+    pub pending_scripts: Vec<(String, NodeId)>,
     pub cookie: String,
     /// Element border boxes from the last layout (x, y, w, h).
     pub rects: FxHashMap<NodeId, [f32; 4]>,
@@ -483,6 +499,8 @@ impl Interp {
             next_timer: 1,
             micro: VecDeque::new(),
             listeners: Vec::new(),
+            ready_state: "complete",
+            current_script: crate::dom::NONE,
             node_objs: FxHashMap::default(),
             url: url.to_owned(),
             storage: FxHashMap::default(),

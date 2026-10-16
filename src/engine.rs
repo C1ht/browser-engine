@@ -371,11 +371,23 @@ fn run_script_node(it: &mut js::Interp, s: NodeId, kind: ScriptKind, sources: &F
         }
         return;
     }
+    let external = src.is_some();
     let code = match src {
-        Some(url) => sources.get(&url).cloned().unwrap_or_default(),
+        Some(url) => match sources.get(&url) {
+            Some(c) => c.clone(),
+            None => {
+                js::dombind::dispatch_nobubble(it, s, "error");
+                return;
+            }
+        },
         None => inline(),
     };
+    let saved = std::mem::replace(&mut it.current_script, s);
     run_one(it, &code);
+    it.current_script = saved;
+    if external {
+        js::dombind::dispatch_nobubble(it, s, "load");
+    }
 }
 
 /// Wall-clock budget for running a page's scripts at load.
@@ -395,6 +407,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     let t0 = Instant::now();
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
+    it.ready_state = "loading";
     it.deadline = Some(t0 + std::time::Duration::from_millis(SCRIPT_BUDGET as u64));
     it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: css.clone(), base: base.to_owned() }));
     // Parser-blocking classic scripts run in order; `defer` and module
@@ -427,8 +440,13 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
             run_pending(&mut it, &t0);
         }
     }
+    it.ready_state = "interactive";
+    js::dombind::dispatch_nobubble(&mut it, 0, "readystatechange");
     js::dombind::dispatch(&mut it, 0, "DOMContentLoaded", |_, _| {});
-    js::dombind::dispatch(&mut it, js::WINDOW, "load", |_, _| {});
+    it.ready_state = "complete";
+    js::dombind::dispatch_nobubble(&mut it, 0, "readystatechange");
+    js::dombind::dispatch_nobubble(&mut it, js::WINDOW, "load");
+    js::dombind::dispatch_nobubble(&mut it, js::WINDOW, "pageshow");
     it.run_microtasks();
     // Timers that fire "immediately" so the first paint includes their work.
     for _ in 0..5 {
@@ -468,16 +486,29 @@ fn run_one(it: &mut js::Interp, code: &str) {
     it.run_microtasks();
 }
 
-/// Fetch and run scripts that were inserted by other scripts.
+/// Fetch and run scripts that were inserted by other scripts; they fire
+/// `load` (or `error`) when done.
 fn run_pending(it: &mut js::Interp, t0: &Instant) {
-    for _ in 0..3 {
-        let urls = std::mem::take(&mut it.pending_scripts);
-        if urls.is_empty() || ms(*t0) > SCRIPT_BUDGET {
+    for _ in 0..8 {
+        let pending = std::mem::take(&mut it.pending_scripts);
+        if pending.is_empty() || ms(*t0) > SCRIPT_BUDGET {
             return;
         }
-        let codes: Vec<String> = net::fetch_many(&urls).into_iter().map(|b| b.map(|b| net::decode(&b)).unwrap_or_default()).collect();
-        for c in codes {
-            run_one(it, &c);
+        let urls: Vec<String> = pending.iter().map(|(u, _)| u.clone()).collect();
+        let bodies = net::fetch_many(&urls);
+        for ((_, node), body) in pending.into_iter().zip(bodies) {
+            match body {
+                Some(b) => {
+                    let saved = std::mem::replace(&mut it.current_script, node);
+                    run_one(it, &net::decode(&b));
+                    it.current_script = saved;
+                    js::dombind::dispatch_nobubble(it, node, "load");
+                }
+                None => {
+                    js::dombind::dispatch_nobubble(it, node, "error");
+                }
+            }
+            it.run_microtasks();
         }
     }
 }
@@ -1700,6 +1731,43 @@ mod tests {
         let color = |id: &str| p.styles[node_by_id(&p, id) as usize].color & 0xFFFFFF;
         assert_eq!((color("a"), color("b"), color("c"), color("d")), (0x0000FF, 0xFF0000, 0x008000, 0x010203));
         assert_eq!(p.title(), "2 2 #b");
+    }
+
+    #[test]
+    fn event_dispatch_semantics() {
+        let p = page_from(
+            r#"<!doctype html><div id=o><a id=l href="/next"><span id=i>x</span></a></div>
+               <input type=checkbox id=c><input type=checkbox id=d>
+               <script>
+                 const log = [];
+                 document.readyState === 'loading' && log.push('loading:' + (document.currentScript && document.currentScript.tagName));
+                 const o = document.getElementById('o'), i = document.getElementById('i');
+                 o.addEventListener('click', e => log.push('oc' + e.eventPhase), true);
+                 o.addEventListener('click', e => log.push('ob' + e.eventPhase));
+                 i.addEventListener('click', e => log.push('i1'), { once: true });
+                 i.addEventListener('click', e => { log.push('i2'); e.stopImmediatePropagation(); });
+                 i.addEventListener('click', e => log.push('i3'));
+                 window.addEventListener('click', e => log.push('w' + e.composedPath().length), { capture: true });
+                 i.click(); i.click();
+                 const c = document.getElementById('c');
+                 c.addEventListener('change', () => log.push('change' + c.checked));
+                 c.click();
+                 const d = document.getElementById('d');
+                 d.addEventListener('click', e => e.preventDefault());
+                 d.click();
+                 log.push('d' + d.checked);
+                 const ac = new AbortController();
+                 o.addEventListener('x', () => log.push('aborted?'), { signal: ac.signal });
+                 ac.abort();
+                 o.dispatchEvent(new Event('x'));
+                 document.addEventListener('readystatechange', () => log.push(document.readyState));
+                 window.addEventListener('load', () => document.title = log.join(' '));
+               </script>"#,
+        );
+        assert_eq!(
+            p.title(),
+            "loading:SCRIPT w7 oc1 i1 i2 w7 oc1 i2 w5 changetrue w5 dfalse interactive complete"
+        );
     }
 
     #[test]

@@ -134,7 +134,7 @@ fn run_inserted_script(it: &mut Interp, s: NodeId) {
     }
     if let Some(src) = it.doc.attr(s, k::src) {
         let url = crate::net::resolve(&it.url, src);
-        it.pending_scripts.push(url);
+        it.pending_scripts.push((url, s));
         return;
     }
     let code = text_of(it, s);
@@ -457,7 +457,8 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "head" if doc_node => node_obj(it, it.doc.head),
         "documentElement" | "scrollingElement" if doc_node => node_obj(it, it.doc.html),
         "title" if doc_node => Value::str(&it.doc.title()),
-        "readyState" if doc_node => Value::str("complete"),
+        "readyState" if doc_node => Value::str(it.ready_state),
+        "currentScript" if doc_node => node_obj(it, it.current_script),
         "visibilityState" if doc_node => Value::str("visible"),
         "URL" | "documentURI" if doc_node => Value::str(&it.url),
         "cookie" if doc_node => Value::str(&it.cookie),
@@ -893,6 +894,14 @@ fn n_by_tag(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     add_list_methods(it, &arr);
     Ok(arr)
 }
+fn n_by_name(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let n = this_node(&t)?;
+    let s = it.to_str(&arg(a, 0))?;
+    let r: Vec<NodeId> = descendants(it, n).into_iter().filter(|&d| it.doc.attr(d, k::name) == Some(&*s)).collect();
+    let arr = elems(it, r);
+    add_list_methods(it, &arr);
+    Ok(arr)
+}
 fn n_closest(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let mut n = this_node(&t)?;
     let s = it.to_str(&arg(a, 0))?;
@@ -984,9 +993,56 @@ fn w_inner_width(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
 fn w_inner_height(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
     Ok(Value::Num(it.vh as f64))
 }
+/// `el.click()`: a click event, then the default action (follow a link,
+/// toggle a checkbox / radio, submit a form).
 fn n_click(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let n = this_node(&t)?;
-    dispatch(it, n, "click", |_, _| {});
+    if it.doc.attr(n, k::disabled).is_some() {
+        return Ok(Value::Undef);
+    }
+    // Checkboxes toggle before the click is dispatched (and revert if cancelled).
+    let control = crate::forms::control_for(&it.doc, n);
+    let checkable = control.filter(|&c| crate::forms::is_checkable(&it.doc, c));
+    let snapshot = checkable.map(|_| crate::forms::checked_snapshot(&it.doc));
+    let early = checkable.map(|c| crate::forms::activate_control(&mut it.doc, c));
+    let prevented = dispatch(it, n, "click", |it, ev| {
+        let _ = it.put(ev, "detail", Value::Num(1.0));
+    });
+    if prevented {
+        if let Some(s) = snapshot {
+            crate::forms::restore_checked(&mut it.doc, &s);
+        }
+        return Ok(Value::Undef);
+    }
+    it.dirty = true;
+    if let (Some(c), Some(crate::forms::Activation::Toggled(_))) = (checkable, early) {
+        dispatch(it, c, "input", |_, _| {});
+        dispatch(it, c, "change", |_, _| {});
+        return Ok(Value::Undef);
+    }
+    // A link (the element or an ancestor).
+    let mut a = n;
+    while a != NONE && a != 0 {
+        if it.doc.tag(a) == Some(k::a) {
+            if let Some(href) = it.doc.attr(a, k::href) {
+                let href = href.trim().to_owned();
+                if !href.to_ascii_lowercase().starts_with("javascript:") {
+                    let url = crate::net::resolve(&it.url, &href);
+                    it.nav = Some(crate::forms::Nav { url, post: None });
+                }
+                return Ok(Value::Undef);
+            }
+        }
+        a = it.doc.parent(a);
+    }
+    if let Some(c) = control {
+        if let crate::forms::Activation::Submit(form, _) = crate::forms::activate_control(&mut it.doc, c) {
+            let go = !dispatch(it, form, "submit", |_, _| {});
+            if go {
+                it.submit_form = Some(form);
+            }
+        }
+    }
     Ok(Value::Undef)
 }
 fn n_focus(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
@@ -1045,6 +1101,16 @@ fn target_of(t: &Value, it: &Interp) -> u32 {
     }
 }
 
+/// (capture, once, passive, signal) from addEventListener's third argument.
+fn listener_opts(it: &mut Interp, o: &Value) -> R<(bool, bool, bool, Option<Value>)> {
+    Ok(match o {
+        Value::Obj(_) => {
+            let signal = it.get(o, "signal")?;
+            (it.get(o, "capture")?.truthy(), it.get(o, "once")?.truthy(), it.get(o, "passive")?.truthy(), (!signal.is_nullish()).then_some(signal))
+        }
+        v => (v.truthy(), false, false, None),
+    })
+}
 fn add_listener(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let target = target_of(&t, it);
     let ty = it.to_str(&arg(a, 0))?;
@@ -1052,8 +1118,14 @@ fn add_listener(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     if !Interp::is_callable(&f) && !matches!(f, Value::Obj(_)) {
         return Ok(Value::Undef);
     }
-    if !it.listeners.iter().any(|(tg, ty2, f2)| *tg == target && *ty2 == ty && strict_eq(f2, &f)) {
-        it.listeners.push((target, ty, f));
+    let (capture, once, passive, signal) = listener_opts(it, &arg(a, 2))?;
+    if let Some(s) = &signal {
+        if it.get(s, "aborted")?.truthy() {
+            return Ok(Value::Undef);
+        }
+    }
+    if !it.listeners.iter().any(|l| l.target == target && l.ty == ty && l.capture == capture && strict_eq(&l.f, &f)) {
+        it.listeners.push(crate::js::Listener { target, ty, f, capture, once, passive, signal });
     }
     Ok(Value::Undef)
 }
@@ -1061,7 +1133,8 @@ fn remove_listener(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let target = target_of(&t, it);
     let ty = it.to_str(&arg(a, 0))?;
     let f = arg(a, 1);
-    it.listeners.retain(|(tg, ty2, f2)| !(*tg == target && *ty2 == ty && strict_eq(f2, &f)));
+    let (capture, ..) = listener_opts(it, &arg(a, 2))?;
+    it.listeners.retain(|l| !(l.target == target && l.ty == ty && l.capture == capture && strict_eq(&l.f, &f)));
     Ok(Value::Undef)
 }
 fn dispatch_event_m(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
@@ -1107,19 +1180,57 @@ fn dispatch_obj(it: &mut Interp, target: u32, ty: &str, ev: Value) -> R<bool> {
             n = if p == NONE { it.doc.shadow_hosts.get(&n).copied().unwrap_or(NONE) } else { p };
         }
     }
-    path.push(WINDOW);
+    if target == WINDOW || target == 0 || it.doc.connected(target) {
+        path.push(WINDOW);
+    }
+    let path_objs: Vec<Value> = path.iter().map(|&n| if n == WINDOW { Value::Obj(it.global.clone()) } else { node_obj(it, n) }).collect();
+    let pv = it.array(path_objs);
+    if let Value::Obj(eo) = &ev {
+        Interp::set_hidden(eo, "@@path", pv);
+    }
     let bubbles = it.get(&ev, "bubbles")?.truthy();
-    for (i, &cur) in path.iter().enumerate() {
-        if i > 0 && !bubbles {
-            break;
-        }
+    // Capture (window -> parent), target, bubble (parent -> window).
+    let mut phases: Vec<(u32, u8)> = path.iter().skip(1).rev().map(|&n| (n, 1)).collect();
+    phases.push((target, 2));
+    if bubbles {
+        phases.extend(path.iter().skip(1).map(|&n| (n, 3)));
+    }
+    for (cur, phase) in phases {
         let cv = if cur == WINDOW { Value::Obj(it.global.clone()) } else { node_obj(it, cur) };
         it.put(&ev, "currentTarget", cv.clone())?;
-        let ls: Vec<Value> = it.listeners.iter().filter(|(t, y, _)| *t == cur && &**y == ty).map(|(_, _, f)| f.clone()).collect();
-        // onclick-style handlers (property or attribute).
-        let prop = it.get(&cv, &format!("on{ty}")).unwrap_or_default();
-        for f in ls.into_iter().chain(Interp::is_callable(&prop).then_some(prop)) {
+        it.put(&ev, "eventPhase", Value::Num(phase as f64))?;
+        // Listeners registered for this phase (snapshot).
+        let ls: Vec<(Value, bool, bool, Option<Value>)> = it
+            .listeners
+            .iter()
+            .filter(|l| l.target == cur && &*l.ty == ty && (phase == 2 || l.capture == (phase == 1)))
+            .map(|l| (l.f.clone(), l.once, l.passive, l.signal.clone()))
+            .collect();
+        let mut fs: Vec<(Value, bool, bool)> = Vec::new();
+        for (f, once, passive, signal) in ls {
+            if let Some(s) = &signal {
+                if it.get(s, "aborted")?.truthy() {
+                    it.listeners.retain(|l| !(l.target == cur && strict_eq(&l.f, &f)));
+                    continue;
+                }
+            }
+            if once {
+                it.listeners.retain(|l| !(l.target == cur && &*l.ty == ty && strict_eq(&l.f, &f)));
+            }
+            fs.push((f, passive, false));
+        }
+        // onclick-style handlers (property or attribute), not in capture.
+        if phase != 1 {
+            let prop = it.get(&cv, &format!("on{ty}")).unwrap_or_default();
+            if Interp::is_callable(&prop) {
+                fs.push((prop, false, true));
+            }
+        }
+        for (f, passive, is_attr) in fs {
             it.steps = 0;
+            if let Value::Obj(eo) = &ev {
+                Interp::set_hidden(eo, "@@passive", Value::Bool(passive));
+            }
             let r = if Interp::is_callable(&f) {
                 it.call(&f, cv.clone(), std::slice::from_ref(&ev))
             } else {
@@ -1128,7 +1239,7 @@ fn dispatch_obj(it: &mut Interp, target: u32, ty: &str, ev: Value) -> R<bool> {
                 it.call(&h, f.clone(), std::slice::from_ref(&ev))
             };
             match r {
-                Ok(Value::Bool(false)) => {
+                Ok(Value::Bool(false)) if is_attr => {
                     it.put(&ev, "defaultPrevented", Value::Bool(true))?;
                 }
                 Ok(_) => {}
@@ -1138,16 +1249,40 @@ fn dispatch_obj(it: &mut Interp, target: u32, ty: &str, ev: Value) -> R<bool> {
                 }
             }
             it.run_microtasks();
+            if it.get(&ev, "@@stopImmediate")?.truthy() {
+                break;
+            }
         }
         if it.get(&ev, "cancelBubble")?.truthy() {
             break;
         }
     }
+    it.put(&ev, "eventPhase", Value::Num(0.0))?;
     Ok(it.get(&ev, "defaultPrevented")?.truthy())
 }
 
+fn ev_stop_immediate(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    it.put(&t, "cancelBubble", Value::Bool(true))?;
+    if let Value::Obj(o) = &t {
+        Interp::set_hidden(o, "@@stopImmediate", Value::Bool(true));
+    }
+    Ok(Value::Undef)
+}
+
+fn ev_composed_path(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    match it.get(&t, "@@path")? {
+        v @ Value::Obj(_) => Ok(v),
+        _ => Ok(it.array(Vec::new())),
+    }
+}
+
 fn ev_prevent_default(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    // Passive listeners can't cancel; neither can non-cancelable events.
+    if it.get(&t, "@@passive")?.truthy() || !it.get(&t, "cancelable")?.truthy() {
+        return Ok(Value::Undef);
+    }
     it.put(&t, "defaultPrevented", Value::Bool(true))?;
+    it.put(&t, "returnValue", Value::Bool(false))?;
     Ok(Value::Undef)
 }
 fn ev_stop(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
@@ -1703,6 +1838,7 @@ pub fn install(it: &mut Interp) {
         ("querySelectorAll", n_query_selector_all),
         ("getElementsByClassName", n_by_class),
         ("getElementsByTagName", n_by_tag),
+        ("getElementsByName", n_by_name),
         ("closest", n_closest),
         ("matches", n_matches),
         ("insertAdjacentHTML", n_insert_adjacent_html),
@@ -1756,8 +1892,11 @@ pub fn install(it: &mut Interp) {
     let ev = it.new_obj(obj_proto.clone(), Kind::Plain);
     it.def_method(&ev, "preventDefault", ev_prevent_default);
     it.def_method(&ev, "stopPropagation", ev_stop);
-    it.def_method(&ev, "stopImmediatePropagation", ev_stop);
-    it.def_method(&ev, "composedPath", |it, _, _| Ok(it.array(Vec::new())));
+    it.def_method(&ev, "stopImmediatePropagation", ev_stop_immediate);
+    it.def_method(&ev, "composedPath", ev_composed_path);
+    for (k, v) in [("NONE", 0.0), ("CAPTURING_PHASE", 1.0), ("AT_TARGET", 2.0), ("BUBBLING_PHASE", 3.0)] {
+        Interp::set_hidden(&ev, k, Value::Num(v));
+    }
     it.p.event = Some(ev.clone());
 
     let g = it.global.clone();
