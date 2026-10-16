@@ -230,6 +230,10 @@ pub enum Prop {
     ScaleP,
     TransformOriginX,
     TransformOriginY,
+    WordBreak,
+    OverflowWrap,
+    TextOverflow,
+    LineClamp,
     BgSizeX,
     BgSizeY,
     BgPosX,
@@ -1123,7 +1127,7 @@ fn logical_props(name: &str, value: &str) -> Option<Vec<(String, String)>> {
 fn inherited(p: Prop) -> bool {
     matches!(
         p,
-        Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | BorderCollapse
+        Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | BorderCollapse | WordBreak | OverflowWrap
     )
 }
 
@@ -1167,6 +1171,31 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
                 if let Some(t) = transform_prop(name, &lower) {
                     push!(match name { "translate" => TranslateP, "rotate" => RotateP, _ => ScaleP }, t);
                 }
+                return;
+            }
+            "word-break" => {
+                let n = match lower.as_str() {
+                    "break-all" => 1.0,
+                    "keep-all" => 2.0,
+                    "break-word" => {
+                        push!(OverflowWrap, Value::Num(1.0));
+                        0.0
+                    }
+                    _ => 0.0,
+                };
+                push!(WordBreak, Value::Num(n));
+                return;
+            }
+            "overflow-wrap" | "word-wrap" => {
+                push!(OverflowWrap, Value::Num(if matches!(lower.as_str(), "anywhere" | "break-word") { 1.0 } else { 0.0 }));
+                return;
+            }
+            "text-overflow" => {
+                push!(TextOverflow, Value::Num(if lower.contains("ellipsis") { 1.0 } else { 0.0 }));
+                return;
+            }
+            "line-clamp" | "-webkit-line-clamp" => {
+                push!(LineClamp, Value::Num(lower.parse::<f32>().unwrap_or(0.0).max(0.0)));
                 return;
             }
             "transform-origin" => {
@@ -2099,7 +2128,9 @@ fn parse_more(name: &str, v: &str, orig: &str, important: bool, out: &mut Vec<De
     match name {
         "display" => {
             let k = match v {
-                "flex" | "-webkit-flex" | "-ms-flexbox" | "-webkit-box" | "block flex" => Kw::Flex,
+                "flex" | "-webkit-flex" | "-ms-flexbox" | "block flex" => Kw::Flex,
+                // Today -webkit-box is mostly the -webkit-line-clamp idiom.
+                "-webkit-box" => Kw::FlowRoot,
                 "inline-flex" | "-webkit-inline-flex" | "-ms-inline-flexbox" | "-webkit-inline-box" | "inline flex" => Kw::InlineFlex,
                 "grid" | "-ms-grid" | "block grid" => Kw::Grid,
                 "inline-grid" | "-ms-inline-grid" | "inline grid" => Kw::InlineGrid,

@@ -1724,6 +1724,7 @@ impl<'a> Engine<'a> {
             width: w,
             align: cst.align,
             baseline: None,
+            line_bottoms: Vec::new(),
         };
         for it in &items {
             match *it {
@@ -1801,16 +1802,47 @@ impl<'a> Engine<'a> {
                         if ws == we && !lb.has_content && collapsible {
                             continue;
                         }
-                        let word_w = self.f.measure(face, fs, &t[ws..we]);
-                        let sp_w = (se - we) as f32 * space_w;
-                        self.begin_line(&mut lb, w, cx, cy, word_w);
-                        if wraps && lb.has_content && we > ws && lb.x + word_w > lb.width + 0.01 {
-                            self.end_line(id, &mut lb, false, w, cx, cy);
+                        // Break opportunities inside the run (hyphens, CJK, ...).
+                        let mut cuts = if wraps && we > ws { word_breaks(&t[ws..we], st.word_break) } else { Vec::new() };
+                        cuts.push(we - ws);
+                        let mut ps = ws;
+                        for (ci, &cut) in cuts.iter().enumerate() {
+                            let pe = ws + cut;
+                            let last = ci + 1 == cuts.len();
+                            let (sp_bytes, sp_w) = if last { (se - we, (se - we) as f32 * space_w) } else { (0, 0.0) };
+                            let seg_end = if last { se } else { pe };
+                            let word_w = self.f.measure(face, fs, &t[ps..pe]);
                             self.begin_line(&mut lb, w, cx, cy, word_w);
+                            if wraps && lb.has_content && pe > ps && lb.x + word_w > lb.width + 0.01 {
+                                self.end_line(id, &mut lb, false, w, cx, cy);
+                                self.begin_line(&mut lb, w, cx, cy, word_w);
+                            }
+                            if wraps && st.wrap_anywhere && word_w > lb.width - lb.x + 0.01 && pe > ps {
+                                // overflow-wrap: split the run where it overflows.
+                                let mut cs = ps;
+                                let mut acc = 0.0;
+                                for (off, ch) in t[ps..pe].char_indices() {
+                                    let at = ps + off;
+                                    let cw = self.f.measure(face, fs, &t[at..at + ch.len_utf8()]);
+                                    if acc + cw > lb.width - lb.x + 0.01 && at > cs {
+                                        lb.add_text(start + cs as u32, start + at as u32, acc, 0.0, 0, node, link, bg);
+                                        lb.asc = lb.asc.max(asc);
+                                        lb.desc = lb.desc.max(desc);
+                                        self.end_line(id, &mut lb, false, w, cx, cy);
+                                        self.begin_line(&mut lb, w, cx, cy, cw);
+                                        cs = at;
+                                        acc = 0.0;
+                                    }
+                                    acc += cw;
+                                }
+                                lb.add_text(start + cs as u32, start + seg_end as u32, acc, sp_w, sp_bytes as u32, node, link, bg);
+                            } else {
+                                lb.add_text(start + ps as u32, start + seg_end as u32, word_w, sp_w, sp_bytes as u32, node, link, bg);
+                            }
+                            lb.asc = lb.asc.max(asc);
+                            lb.desc = lb.desc.max(desc);
+                            ps = pe;
                         }
-                        lb.add_text(start + ws as u32, start + se as u32, word_w, sp_w, (se - we) as u32, node, link, bg);
-                        lb.asc = lb.asc.max(asc);
-                        lb.desc = lb.desc.max(desc);
                     }
                 }
             }
@@ -1825,6 +1857,11 @@ impl<'a> Engine<'a> {
         bx.items = items;
         bx.frags = lb.frags;
         bx.baseline = lb.baseline;
+        // -webkit-line-clamp: the box is as tall as its first N lines.
+        let clamp = cst.line_clamp as usize;
+        if clamp > 0 && lb.line_bottoms.len() > clamp {
+            return lb.line_bottoms[clamp - 1];
+        }
         lb.y
     }
 
@@ -2678,6 +2715,47 @@ struct LineBuilder {
     width: f32,
     align: Align,
     baseline: Option<f32>,
+    /// Bottom of each finished line.
+    line_bottoms: Vec<f32>,
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32, 0x2E80..=0x9FFF | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFF00..=0xFFEF | 0x20000..=0x2FFFF)
+}
+
+/// Characters that may not start a line (closing punctuation, small kana).
+fn no_break_before(c: char) -> bool {
+    ")]}!?,.:;\u{3001}\u{3002}\u{FF0C}\u{FF0E}\u{FF09}\u{300D}\u{300F}\u{3011}\u{3009}\u{300B}\u{FF01}\u{FF1F}\u{FF1A}\u{FF1B}\u{30FC}\u{30FB}\u{3005}\u{3041}\u{3043}\u{3045}\u{3047}\u{3049}\u{3063}\u{3083}\u{3085}\u{3087}\u{30A1}\u{30A3}\u{30A5}\u{30A7}\u{30A9}\u{30C3}\u{30E3}\u{30E5}\u{30E7}".contains(c)
+}
+
+/// Characters that may not end a line (opening punctuation).
+fn no_break_after(c: char) -> bool {
+    "([{\u{FF08}\u{300C}\u{300E}\u{3010}\u{3008}\u{300A}".contains(c)
+}
+
+/// Byte offsets inside a space-free run where a line may break.
+fn word_breaks(word: &str, word_break: u8) -> Vec<usize> {
+    let mut out = Vec::new();
+    let mut prev: Option<char> = None;
+    let mut before_prev: Option<char> = None;
+    for (i, c) in word.char_indices() {
+        if let Some(p) = prev {
+            let ok = if word_break == 1 {
+                !no_break_before(c)
+            } else {
+                let hyphen = matches!(p, '-' | '\u{2010}' | '\u{2012}' | '\u{2013}' | '\u{2014}') && before_prev.is_some_and(|b| b.is_alphanumeric()) && !c.is_ascii_digit() && c != '-';
+                let soft = matches!(p, '\u{200B}' | '\u{AD}');
+                let cjk = word_break != 2 && (is_cjk(p) || is_cjk(c)) && !no_break_before(c) && !no_break_after(p);
+                hyphen || soft || cjk
+            };
+            if ok {
+                out.push(i);
+            }
+        }
+        before_prev = prev;
+        prev = Some(c);
+    }
+    out
 }
 
 impl LineBuilder {
@@ -2745,6 +2823,7 @@ impl LineBuilder {
             self.baseline = Some(self.y + baseline);
         }
         self.y += self.asc + self.desc;
+        self.line_bottoms.push(self.y);
         self.x = 0.0;
         self.line_start = self.frags.len();
         self.asc = self.strut.0;

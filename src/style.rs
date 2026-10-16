@@ -341,6 +341,14 @@ pub struct Style {
     pub x_rotate: Option<Rc<[Tf]>>,
     pub x_scale: Option<Rc<[Tf]>>,
     pub tf_origin: [Len; 2],
+    /// word-break: 0 normal, 1 break-all, 2 keep-all (inherited).
+    pub word_break: u8,
+    /// overflow-wrap: anywhere / break-word (inherited).
+    pub wrap_anywhere: bool,
+    /// text-overflow: ellipsis.
+    pub ellipsis: bool,
+    /// -webkit-line-clamp (0 = none).
+    pub line_clamp: u16,
 }
 
 /// A resolved transform step: a translation (percentages of the border box)
@@ -460,6 +468,10 @@ pub const INITIAL: Style = Style {
     x_rotate: None,
     x_scale: None,
     tf_origin: [Len::Pct(50.0), Len::Pct(50.0)],
+    word_break: 0,
+    wrap_anywhere: false,
+    ellipsis: false,
+    line_clamp: 0,
 };
 
 impl Style {
@@ -484,6 +496,8 @@ impl Style {
             hidden: p.hidden,
             collapse: p.collapse,
             spacing: p.spacing,
+            word_break: p.word_break,
+            wrap_anywhere: p.wrap_anywhere,
             vars: p.vars.clone(),
             ..INITIAL
         }
@@ -585,6 +599,10 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         VerticalAlign => d.valign = s.valign,
         BoxSizing => d.border_box = s.border_box,
         BorderCollapse => d.collapse = s.collapse,
+        WordBreak => d.word_break = s.word_break,
+        OverflowWrap => d.wrap_anywhere = s.wrap_anywhere,
+        TextOverflow => d.ellipsis = s.ellipsis,
+        LineClamp => d.line_clamp = s.line_clamp,
         BorderSpacing => d.spacing = s.spacing,
         Width => d.width = s.width,
         Height => d.height = s.height,
@@ -909,6 +927,16 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                 TranslateP => s.x_translate = ops,
                 RotateP => s.x_rotate = ops,
                 _ => s.x_scale = ops,
+            }
+        }
+        WordBreak | OverflowWrap | TextOverflow | LineClamp => {
+            if let Value::Num(n) = v {
+                match d.prop {
+                    WordBreak => s.word_break = n as u8,
+                    OverflowWrap => s.wrap_anywhere = n > 0.0,
+                    TextOverflow => s.ellipsis = n > 0.0,
+                    _ => s.line_clamp = n.min(1000.0) as u16,
+                }
             }
         }
         TransformOriginX | TransformOriginY => {

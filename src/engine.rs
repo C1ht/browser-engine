@@ -1389,6 +1389,30 @@ mod tests {
     }
 
     #[test]
+    fn line_breaking() {
+        let p = page_from(
+            "<!doctype html><style>body { margin: 0; font-size: 16px } div { width: 100px }
+               #url { overflow-wrap: anywhere } #nowrap { width: 60px }
+               #ell { width: 60px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis }
+               #clamp { -webkit-line-clamp: 2; display: -webkit-box; overflow: hidden; line-height: 20px }</style>
+               <div id=cjk>\u{4ECA}\u{65E5}\u{306F}\u{3044}\u{3044}\u{5929}\u{6C17}\u{3067}\u{3059}\u{306D}\u{3002}\u{660E}\u{65E5}\u{3082}\u{6674}\u{308C}\u{308B}\u{3067}\u{3057}\u{3087}\u{3046}\u{3002}</div>
+               <div id=url>https://example.com/a/very/long/path/that/never/ends</div>
+               <div id=hy>well-known-hyphenated-compound</div>
+               <div id=ell>a long sentence that overflows</div>
+               <div id=clamp>one two three four five six seven eight nine ten eleven twelve</div>",
+        );
+        let rect = |id: &str| p.tree.node_rects()[&node_by_id(&p, id)];
+        // CJK breaks between characters, so it wraps onto several lines within 100px.
+        assert!(rect("cjk")[3] > 30.0 && rect("cjk")[2] <= 100.0, "{:?}", rect("cjk"));
+        assert!(rect("url")[3] > 30.0, "long URL wraps with overflow-wrap: anywhere");
+        assert!(rect("hy")[3] > 30.0, "breaks after hyphens");
+        let clamp = node_by_id(&p, "clamp");
+        let cb = p.tree.boxes.iter().find(|b| b.node == clamp && !b.anon).unwrap();
+        assert_eq!(cb.h, 40.0, "line-clamp: 2 lines");
+        assert!(p.dl.extra.contains('\u{2026}'), "ellipsis emitted");
+    }
+
+    #[test]
     fn stacking_order() {
         let p = page_from(
             r#"<!doctype html><style>body { margin: 0 } div { box-sizing: border-box }

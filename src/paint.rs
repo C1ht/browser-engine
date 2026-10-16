@@ -685,6 +685,31 @@ impl Builder<'_> {
                         self.rect(x, y - a * fs, w, (a + d) * fs, bg);
                     }
                     let color = self.fade(ts.color);
+                    let right = cx + b.w;
+                    if st.ellipsis && clipped && x + w > right + 0.5 && end > start {
+                        // text-overflow: ellipsis
+                        let text = &self.tree.text[start as usize..end as usize];
+                        let ew = self.f.measure(face, fs, "\u{2026}");
+                        let avail = right - x - ew;
+                        let mut cut = 0;
+                        let mut acc = 0.0;
+                        for (i, ch) in text.char_indices() {
+                            let cw = self.f.measure(face, fs, &text[i..i + ch.len_utf8()]);
+                            if acc + cw > avail {
+                                break;
+                            }
+                            acc += cw;
+                            cut = i + ch.len_utf8();
+                        }
+                        if x < right {
+                            let s0 = self.dl.extra.len() as u32;
+                            self.dl.extra.push_str(text[..cut].trim_end());
+                            self.dl.extra.push('\u{2026}');
+                            let e0 = self.dl.extra.len() as u32;
+                            self.push(DItem::Text { x, y, start: s0, end: e0, src: 1, face, size: fs, color });
+                        }
+                        continue;
+                    }
                     if end > start {
                         self.push(DItem::Text { x, y, start, end, src: 0, face, size: fs, color });
                     }
