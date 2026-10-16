@@ -1389,6 +1389,25 @@ mod tests {
     }
 
     #[test]
+    fn percentage_heights() {
+        let p = page_from(
+            r#"<!doctype html><style>html, body { height: 100%; margin: 0 } #half { height: 50% }
+               #inner { height: 25% } #auto > div { height: 50% } #abs { position: absolute; top: 10px; bottom: 90px; left: 0; width: 10px }
+               #abs > div { height: 50% } #min { min-height: 10% }</style>
+               <div id=half><div id=inner></div></div><div id=auto><div id=nope>x</div></div>
+               <div id=abs><div id=absc></div></div><div id=min></div>"#,
+        );
+        let h = |id: &str| p.tree.node_rects()[&node_by_id(&p, id)][3];
+        assert_eq!(h("half"), 300.0);
+        assert_eq!(h("inner"), 75.0);
+        // A percentage of an auto-height parent behaves as auto.
+        assert!(h("nope") < 40.0);
+        assert_eq!(h("abs"), 500.0);
+        assert_eq!(h("absc"), 250.0);
+        assert_eq!(h("min"), 60.0);
+    }
+
+    #[test]
     fn pseudo_elements() {
         let p = page_from(
             r#"<!doctype html><style>

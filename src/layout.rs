@@ -397,6 +397,12 @@ struct Engine<'a> {
     links: Vec<String>,
     contains_block: Vec<bool>,
     ws_space: bool,
+    /// Definite content height of the current containing block (for
+    /// percentage heights), or None when it depends on content.
+    avail_h: Option<f32>,
+    /// A definite height imposed on the next block laid out (absolutely
+    /// positioned boxes with top + bottom).
+    abs_h: Option<f32>,
     vw: f32,
     vh: f32,
     bfcs: Vec<Bfc>,
@@ -417,6 +423,8 @@ pub fn layout(doc: &Document, styles: &[Style], vw: f32, vh: f32, res: &Resource
         links: Vec::new(),
         contains_block: vec![false; doc.nodes.len()],
         ws_space: true,
+        avail_h: Some(vh),
+        abs_h: None,
         vw,
         vh,
         bfcs: Vec::new(),
@@ -1016,6 +1024,17 @@ impl<'a> Engine<'a> {
     // ------------------------------------------------------------- helpers
 
     #[inline]
+    /// A height (or min/max height) in px, if definite: percentages need a
+    /// definite containing block height.
+    fn resolve_h(&self, l: Len) -> Option<f32> {
+        match l {
+            Len::Auto => None,
+            Len::Px(v) => Some(v),
+            other if other.parts()[0] == 0.0 => Some(other.px(0.0)),
+            other => self.avail_h.map(|b| other.px(b)),
+        }
+    }
+
     fn st(&self, id: u32) -> &'a Style {
         let styles: &'a [Style] = self.styles;
         &styles[self.boxes[id as usize].node as usize]
@@ -1313,7 +1332,7 @@ impl<'a> Engine<'a> {
                 Mode::Forced(fw) if st.width.is_auto() => Some(fw - pb_h),
                 _ => (!st.width.is_auto()).then(|| st.width.px(cb_w) - adj_h),
             };
-            let spec_h = st.height.fixed().map(|h| h - adj_v);
+            let spec_h = self.resolve_h(st.height).map(|h| h - adj_v);
             let (mut w, mut h) = match (spec_w, spec_h) {
                 (Some(w), Some(h)) => (w, h),
                 (Some(w), None) => (w, ratio.map_or(nh, |r| w * r)),
@@ -1341,7 +1360,7 @@ impl<'a> Engine<'a> {
                     h = ratio.map_or(h, |r| w * r);
                 }
             }
-            if let Some(mx) = st.max_h.fixed() {
+            if let Some(mx) = self.resolve_h(st.max_h) {
                 let mx = mx - adj_v;
                 if h > mx {
                     h = mx;
@@ -1400,6 +1419,11 @@ impl<'a> Engine<'a> {
         if new_bfc {
             self.bfcs.push(Bfc::default());
         }
+        // This box's definite content height is the base for its children's
+        // percentage heights.
+        let forced = self.abs_h.take();
+        let def_h = if anon { self.avail_h } else { forced.or_else(|| self.resolve_h(st.height).map(|h| (h - adj_v).max(0.0))) };
+        let saved_avail = std::mem::replace(&mut self.avail_h, def_h);
         let mut content_h = match kind {
             Kind::Flex => self.layout_flex(id, w),
             Kind::Grid => self.layout_grid(id, w),
@@ -1410,16 +1434,17 @@ impl<'a> Engine<'a> {
             let bfc = self.bfcs.pop().unwrap();
             content_h = content_h.max(bfc.bottom());
         }
+        self.avail_h = saved_avail;
 
-        let mut h = match st.height.fixed() {
-            Some(h) if !anon => (h - adj_v).max(0.0),
+        let mut h = match def_h {
+            Some(h) if !anon => h,
             _ => content_h,
         };
         if !anon {
-            if let Some(mh) = st.max_h.fixed() {
+            if let Some(mh) = self.resolve_h(st.max_h) {
                 h = h.min(mh - adj_v);
             }
-            if let Some(mh) = st.min_h.fixed() {
+            if let Some(mh) = self.resolve_h(st.min_h) {
                 h = h.max(mh - adj_v);
             }
         }
@@ -1433,7 +1458,8 @@ impl<'a> Engine<'a> {
         if !self.boxes[id as usize].anon && matches!(st.position, Pos::Relative | Pos::Sticky) {
             let [t, r, b, l] = st.inset;
             let dx = if !l.is_auto() { l.px(cb_w) } else if !r.is_auto() { -r.px(cb_w) } else { 0.0 };
-            let dy = if !t.is_auto() { t.px(0.0) } else if !b.is_auto() { -b.px(0.0) } else { 0.0 };
+            let base = self.avail_h.unwrap_or(0.0);
+            let dy = if !t.is_auto() { t.px(base) } else if !b.is_auto() { -b.px(base) } else { 0.0 };
             // Sticky elements stay in flow.
             self.boxes[id as usize].rel = if st.position == Pos::Relative { (dx, dy) } else { (0.0, 0.0) };
         }
@@ -1570,7 +1596,16 @@ impl<'a> Engine<'a> {
             } else {
                 Mode::Fit
             };
+            if st.height.is_auto() && !t.is_auto() && !bt.is_auto() {
+                // top + bottom define the height.
+                let pbv = st.padding[0].px(pw) + st.padding[2].px(pw) + st.bw[0] + st.bw[2];
+                let mv = st.margin[0].px(pw) + st.margin[2].px(pw);
+                self.abs_h = Some((ph - t.px(ph) - bt.px(ph) - mv - pbv).max(0.0));
+            }
+            let saved = std::mem::replace(&mut self.avail_h, Some(ph));
             self.layout_block(a, pw, mode, 0.0, 0.0);
+            self.avail_h = saved;
+            self.abs_h = None;
             if st.height.is_auto() && !t.is_auto() && !bt.is_auto() {
                 let b = &mut self.boxes[a as usize];
                 let pbv = b.p[0] + b.p[2] + b.b[0] + b.b[2];
@@ -1804,7 +1839,9 @@ impl<'a> Engine<'a> {
         let gap_cross = if row { st.row_gap.px(w) } else { st.col_gap.px(w) };
         let cb = &self.boxes[id as usize];
         let pb_v = cb.p[0] + cb.p[2] + cb.b[0] + cb.b[2];
-        let spec_h = st.height.fixed().map(|h| (h - if st.border_box { pb_v } else { 0.0 }).max(0.0));
+        // (layout_block made this container's definite height the current one)
+        let _ = pb_v;
+        let spec_h = self.avail_h.filter(|_| !self.boxes[id as usize].anon);
         let main_size = if row { Some(w) } else { spec_h };
         let cross_size = if row { spec_h } else { Some(w) };
 
@@ -2530,7 +2567,7 @@ impl<'a> Engine<'a> {
             }
             let rst = self.st(r);
             if !self.boxes[r as usize].anon {
-                if let Some(h) = rst.height.fixed() {
+                if let Some(h) = self.resolve_h(rst.height) {
                     row_h = row_h.max(h);
                 }
             }
@@ -2568,7 +2605,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let h = match st.height.fixed() {
+        let h = match self.resolve_h(st.height) {
             Some(h) => y.max(h - p[0] - p[2] - b[0] - b[2]),
             None => y,
         };
