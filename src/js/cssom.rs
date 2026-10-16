@@ -30,7 +30,12 @@ fn with_rules<T>(it: &mut Interp, r: SheetRef, f: impl FnOnce(&mut Vec<String>) 
                 it.doc.text_content(n, &mut s);
                 s
             } else {
-                String::new()
+                // A <link>ed sheet: the fetched text, when the engine has it.
+                let href = it.doc.attr(n, crate::atom::k::href).unwrap_or("").trim().to_owned();
+                match &it.layout_src {
+                    Some(src) => src.css.get(&crate::net::resolve(&src.base, &href)).cloned().unwrap_or_default(),
+                    None => String::new(),
+                }
             };
             let entry = it.doc.cssom.entry(n).or_insert_with(|| SheetData { base: String::new(), rules: Vec::new(), init: false });
             if !entry.init || entry.base != text {

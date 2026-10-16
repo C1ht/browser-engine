@@ -2291,6 +2291,32 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
 /// Extra UA rules for documents without a doctype (as in quirks.css).
 pub const QUIRKS_CSS: &str = "table { text-align: left; font-size: medium; font-weight: normal;     font-style: normal; line-height: normal; white-space: normal }";
 
+thread_local! {
+    /// The last cascade built for a page's sheets (forced layouts and
+    /// relayouts reuse it while the CSS and viewport are unchanged).
+    static CASCADE_CACHE: std::cell::RefCell<Option<(u64, Rc<Cascade>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `build_cascade`, reusing the previous result for identical inputs.
+pub fn cached_cascade(author_sheets: &[(String, String)], media: &Media, quirks: bool) -> Rc<Cascade> {
+    use std::hash::{Hash, Hasher};
+    let mut h = crate::fx::FxHasher::default();
+    for (text, base) in author_sheets {
+        text.hash(&mut h);
+        base.hash(&mut h);
+    }
+    media.vw.to_bits().hash(&mut h);
+    media.vh.to_bits().hash(&mut h);
+    quirks.hash(&mut h);
+    let key = h.finish();
+    if let Some(c) = CASCADE_CACHE.with(|c| c.borrow().as_ref().filter(|(k, _)| *k == key).map(|(_, c)| c.clone())) {
+        return c;
+    }
+    let cas = Rc::new(build_cascade(author_sheets, media, quirks));
+    CASCADE_CACHE.with(|c| *c.borrow_mut() = Some((key, cas.clone())));
+    cas
+}
+
 /// Author stylesheets as (css text, base url).
 pub fn build_cascade(author_sheets: &[(String, String)], media: &Media, quirks: bool) -> Cascade {
     css::reset_layers();

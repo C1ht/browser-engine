@@ -22,6 +22,8 @@ pub struct Token {
     pub tok: Tok,
     /// A line terminator precedes this token (for automatic semicolons).
     pub nl: bool,
+    /// Character offset in the source (for error messages).
+    pub pos: u32,
 }
 
 const PUNCTS: &[&str] = &[
@@ -51,6 +53,12 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
     let mut i = 0;
     let mut out: Vec<Token> = Vec::with_capacity(src.len() / 3);
     let mut nl = false;
+    // Whether each open `(` starts an if / while / for / with condition and
+    // each open `{` a block (not an object literal): a regex can follow the
+    // `)` / `}` that closes one (`if (x) /re/.test(s)`, `{ ... } /re/`).
+    let mut parens: Vec<bool> = Vec::new();
+    let mut braces: Vec<bool> = Vec::new();
+    let mut closed_stmt = false;
     while i < n {
         let c = chars[i];
         // whitespace / newlines
@@ -120,7 +128,7 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
                 }
             }
             Tok::Ident(s.into())
-        } else if c == '/' && regex_allowed(out.last()) {
+        } else if c == '/' && (regex_allowed(out.last()) || (closed_stmt && matches!(out.last().map(|t| &t.tok), Some(Tok::Punct(")" | "}"))))) {
             let mut j = i + 1;
             let mut class = false;
             while j < n && (chars[j] != '/' || class) {
@@ -158,10 +166,25 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
             i += p.chars().count();
             Tok::Punct(p)
         };
-        out.push(Token { tok, nl });
+        match &tok {
+            Tok::Punct("(") => parens.push(matches!(out.last().map(|t| &t.tok), Some(Tok::Ident(k)) if matches!(&**k, "if" | "while" | "for" | "with"))),
+            Tok::Punct("{") => braces.push(match out.last().map(|t| &t.tok) {
+                None => true,
+                Some(Tok::Punct(p)) => matches!(*p, ")" | "=>" | ";" | "{" | "}"),
+                Some(Tok::Ident(k)) => matches!(&**k, "else" | "do" | "try" | "finally"),
+                _ => false,
+            }),
+            _ => {}
+        }
+        closed_stmt = match &tok {
+            Tok::Punct(")") => parens.pop().unwrap_or(false),
+            Tok::Punct("}") => braces.pop().unwrap_or(false),
+            _ => false,
+        };
+        out.push(Token { tok, nl, pos: start as u32 });
         nl = false;
     }
-    out.push(Token { tok: Tok::Eof, nl: true });
+    out.push(Token { tok: Tok::Eof, nl: true, pos: n as u32 });
     Ok(out)
 }
 

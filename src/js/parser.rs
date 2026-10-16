@@ -211,8 +211,26 @@ fn bound_names(p: &Pattern, out: &mut Vec<Name>) {
     }
 }
 
+/// Replace an error's `@@offset` marker with the line, column and source text.
+fn locate(src: &str, e: String) -> String {
+    let Some(i) = e.rfind("@@") else { return e };
+    let Ok(pos) = e[i + 2..].trim().parse::<usize>() else { return e };
+    let chars: Vec<char> = src.chars().collect();
+    let pos = pos.min(chars.len());
+    let line = chars[..pos].iter().filter(|&&c| c == '\n').count() + 1;
+    let line_start = chars[..pos].iter().rposition(|&c| c == '\n').map_or(0, |p| p + 1);
+    let from = pos.saturating_sub(40).max(line_start);
+    let to = (pos + 40).min(chars.len());
+    let snip: String = chars[from..to].iter().map(|&c| if c == '\n' { ' ' } else { c }).collect();
+    format!("{}(line {line}, col {}: `{snip}`)", &e[..i], pos - line_start + 1)
+}
+
 /// Parse an ES module.
 pub fn parse_module(src: &str) -> PResult<(Vec<Stmt>, ModuleInfo)> {
+    parse_module_inner(src).map_err(|e| locate(src, e))
+}
+
+fn parse_module_inner(src: &str) -> PResult<(Vec<Stmt>, ModuleInfo)> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {} at {}", e.0, e.1))?;
     // Top-level await is allowed in modules.
     let mut p = Parser { toks, i: 0, in_func: true, in_gen: false, module: Some(ModuleInfo::default()), strict: true };
@@ -226,6 +244,10 @@ pub fn parse_module(src: &str) -> PResult<(Vec<Stmt>, ModuleInfo)> {
 pub type PResult<T> = Result<T, String>;
 
 pub fn parse_program(src: &str) -> PResult<Vec<Stmt>> {
+    parse_program_inner(src).map_err(|e| locate(src, e))
+}
+
+fn parse_program_inner(src: &str) -> PResult<Vec<Stmt>> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {} at {}", e.0, e.1))?;
     let mut p = Parser { toks, i: 0, in_func: false, in_gen: false, module: None, strict: false };
     p.strict = p.use_strict_directive();
@@ -300,7 +322,12 @@ impl Parser {
         }
     }
     fn err<T>(&self, msg: &str) -> PResult<T> {
-        Err(format!("SyntaxError: {msg} near {:?} (token {})", self.peek(), self.i))
+        Err(format!("SyntaxError: {msg} near {:?} @@{}", self.peek(), self.pos()))
+    }
+
+    /// Source offset of the current token.
+    fn pos(&self) -> u32 {
+        self.toks.get(self.i).or(self.toks.last()).map_or(0, |t| t.pos)
     }
     fn expect(&mut self, p: &str) -> PResult<()> {
         if self.eat(p) {
@@ -1275,7 +1302,7 @@ impl Parser {
                 }
                 _ => Expr::Ident(w),
             },
-            t => return Err(format!("SyntaxError: unexpected token {t:?}")),
+            t => return Err(format!("SyntaxError: unexpected token {t:?} @@{}", self.toks.get(self.i.saturating_sub(1)).map_or(0, |t| t.pos))),
         })
     }
 

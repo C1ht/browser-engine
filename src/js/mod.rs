@@ -2839,7 +2839,7 @@ thread_local! {
 }
 
 /// The innermost traced JS calls, as `name(params)` with a body snippet.
-fn trace_stack() -> String {
+pub(crate) fn trace_stack() -> String {
     TRACE_STACK.with(|s| {
         s.borrow()
             .iter()
@@ -2850,7 +2850,7 @@ fn trace_stack() -> String {
                     Pattern::Ident(n) => n.to_string(),
                     _ => "_".into(),
                 }).collect();
-                let body: String = format!("{:?}", d.body).chars().take(90).collect();
+                let body: String = format!("{:?}", d.body).chars().take(std::env::var("BOLT_TRACE_BODY").ok().and_then(|v| v.parse().ok()).unwrap_or(90)).collect();
                 format!("
       at {}({}) {body}", d.name.as_deref().unwrap_or("<anon>"), params.join(","))
             })
@@ -2858,7 +2858,7 @@ fn trace_stack() -> String {
     })
 }
 
-fn trace_on() -> bool {
+pub(crate) fn trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("BOLT_JS_TRACE").is_some())
 }

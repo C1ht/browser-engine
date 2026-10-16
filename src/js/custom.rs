@@ -196,6 +196,9 @@ fn ce_define(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
         return Err(builtins::make_error_value("SyntaxError", &format!("Failed to execute 'define': \"{name}\" is not a valid custom element name")));
     }
     if it.ce_defs.iter().any(|d| d.name == name) {
+        if crate::js::trace_on() {
+            it.log(&format!("[trace] customElements.define('{name}') again{}", crate::js::trace_stack()));
+        }
         return Err(builtins::make_error_value("NotSupportedError", &format!("the name \"{name}\" has already been used with this registry")));
     }
     let ctor = arg(a, 1);

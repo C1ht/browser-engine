@@ -21,8 +21,16 @@ pub fn make_error_value(name: &str, msg: &str) -> Value {
     // Callers without interpreter access: the prototype is attached lazily
     // via `name`; `instanceof` works for errors made through constructors.
     ERR_PROTOS.with(|p| {
-        let proto = p.borrow().get(name).cloned().or_else(|| p.borrow().get("Error").cloned());
+        let known = p.borrow().get(name).cloned();
+        // Names that aren't ECMAScript error types (NotSupportedError,
+        // InvalidStateError, ...) are DOMExceptions.
+        let dom = known.is_none();
+        let proto = known.or_else(|| p.borrow().get("DOMException").cloned()).or_else(|| p.borrow().get("Error").cloned());
         let o = Rc::new(RefCell::new(Obj { props: Props::default(), proto, kind: Kind::Error }));
+        if dom {
+            Interp::set_hidden(&o, "name", Value::str(name));
+            Interp::set_hidden(&o, "code", Value::Num(dom_exception_code(name)));
+        }
         Interp::set_hidden(&o, "message", Value::str(msg));
         Interp::set_hidden(&o, "stack", Value::str(&format!("{name}: {msg}")));
         Value::Obj(o)
@@ -295,7 +303,7 @@ pub fn install(it: &mut Interp) {
             "RangeError" => |it, t, a| error_named(it, t, a, "RangeError"),
             "EvalError" => |it, t, a| error_named(it, t, a, "EvalError"),
             "URIError" => |it, t, a| error_named(it, t, a, "URIError"),
-            _ => |it, t, a| error_named(it, t, a, "DOMException"),
+            _ => dom_exception_ctor,
         };
         ctor(it, name, f, &proto);
         ERR_PROTOS.with(|p| p.borrow_mut().insert(name.into(), proto.clone()));
@@ -2203,6 +2211,48 @@ fn error_named(it: &mut Interp, _: Value, a: &[Value], name: &str) -> R<Value> {
         Interp::set_hidden(o, "cause", cause);
     }
     Ok(e)
+}
+/// `new DOMException(message, name)`.
+fn dom_exception_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let msg = match arg(a, 0) {
+        Value::Undef => Rc::from(""),
+        v => it.to_str(&v)?,
+    };
+    let name = match arg(a, 1) {
+        Value::Undef => Rc::from("Error"),
+        v => it.to_str(&v)?,
+    };
+    let e = make_error_value("DOMException", &msg);
+    if let Value::Obj(o) = &e {
+        Interp::set_hidden(o, "name", Value::Str(name.clone()));
+        Interp::set_hidden(o, "code", Value::Num(dom_exception_code(&name)));
+    }
+    Ok(e)
+}
+
+/// Legacy DOMException codes by name (0 for newer names).
+fn dom_exception_code(name: &str) -> f64 {
+    match name {
+        "IndexSizeError" => 1.0,
+        "HierarchyRequestError" => 3.0,
+        "WrongDocumentError" => 4.0,
+        "InvalidCharacterError" => 5.0,
+        "NoModificationAllowedError" => 7.0,
+        "NotFoundError" => 8.0,
+        "NotSupportedError" => 9.0,
+        "InvalidStateError" => 11.0,
+        "SyntaxError" => 12.0,
+        "InvalidModificationError" => 13.0,
+        "NamespaceError" => 14.0,
+        "InvalidAccessError" => 15.0,
+        "SecurityError" => 18.0,
+        "NetworkError" => 19.0,
+        "AbortError" => 20.0,
+        "QuotaExceededError" => 22.0,
+        "TimeoutError" => 23.0,
+        "DataCloneError" => 25.0,
+        _ => 0.0,
+    }
 }
 fn error_ctor(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     error_named(it, t, a, "Error")

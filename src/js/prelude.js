@@ -620,6 +620,76 @@
     });
   })();
 
+  // Newer ECMAScript library functions.
+  var def = function (o, name, f) { if (!(name in o)) Object.defineProperty(o, name, { value: f, writable: true, configurable: true, enumerable: false }); };
+  def(Object, 'hasOwn', function (o, k) { return Object.prototype.hasOwnProperty.call(o, k); });
+  def(Object, 'getOwnPropertyDescriptors', function (o) {
+    var out = {};
+    var keys = Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols ? Object.getOwnPropertySymbols(o) : []);
+    keys.forEach(function (k) { var d = Object.getOwnPropertyDescriptor(o, k); if (d) out[k] = d; });
+    return out;
+  });
+  def(Object, 'groupBy', function (items, f) {
+    var out = Object.create(null), i = 0;
+    for (var x of items) { var k = f(x, i++); (out[k] || (out[k] = [])).push(x); }
+    return out;
+  });
+  def(Map, 'groupBy', function (items, f) {
+    var out = new Map(), i = 0;
+    for (var x of items) { var k = f(x, i++); if (!out.has(k)) out.set(k, []); out.get(k).push(x); }
+    return out;
+  });
+  def(Promise, 'withResolvers', function () {
+    var r = {};
+    r.promise = new Promise(function (res, rej) { r.resolve = res; r.reject = rej; });
+    return r;
+  });
+  def(Array, 'fromAsync', async function (items, f) {
+    var out = [], i = 0;
+    if (items[Symbol.asyncIterator]) { for await (var x of items) out.push(f ? await f(x, i++) : x); }
+    else { for (var y of Array.from(items)) { var v = await y; out.push(f ? await f(v, i++) : v); } }
+    return out;
+  });
+  def(String.prototype, 'isWellFormed', function () { return !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(this); });
+  def(String.prototype, 'toWellFormed', function () { return String(this).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(^|[^\uD800-\uDBFF])[\uDC00-\uDFFF]/g, function (m, p) { return (p || '') + '�'; }); });
+  def(Math, 'expm1', function (x) { return Math.exp(x) - 1; });
+  def(Math, 'log1p', function (x) { return Math.log(1 + x); });
+  var SP = Set.prototype;
+  def(SP, 'union', function (o) { var r = new Set(this); for (var x of o.keys ? o.keys() : o) r.add(x); return r; });
+  def(SP, 'intersection', function (o) { var r = new Set(); for (var x of this) if (o.has(x)) r.add(x); return r; });
+  def(SP, 'difference', function (o) { var r = new Set(); for (var x of this) if (!o.has(x)) r.add(x); return r; });
+  def(SP, 'symmetricDifference', function (o) { var r = new Set(this); for (var x of o.keys ? o.keys() : o) { if (this.has(x)) r['delete'](x); else r.add(x); } return r; });
+  def(SP, 'isSubsetOf', function (o) { for (var x of this) if (!o.has(x)) return false; return true; });
+  def(SP, 'isSupersetOf', function (o) { for (var x of o.keys ? o.keys() : o) if (!this.has(x)) return false; return true; });
+  def(SP, 'isDisjointFrom', function (o) { for (var x of this) if (o.has(x)) return false; return true; });
+  if (typeof AggregateError === 'undefined') {
+    window.AggregateError = function AggregateError(errors, message) {
+      var e = new Error(message);
+      Object.setPrototypeOf(e, AggregateError.prototype);
+      e.errors = Array.from(errors || []);
+      return e;
+    };
+    AggregateError.prototype = Object.create(Error.prototype, { name: { value: 'AggregateError', writable: true, configurable: true }, constructor: { value: AggregateError, writable: true, configurable: true } });
+  }
+  def(Error, 'captureStackTrace', function (o) { if (o && typeof o === 'object' && !('stack' in o)) o.stack = String(o); });
+
+  // requestIdleCallback: runs soon after, with an IdleDeadline (up to 50ms).
+  (function () {
+    var timer = setTimeout, clear = clearTimeout;
+    window.requestIdleCallback = function (cb, opts) {
+      return timer(function () {
+        var start = performance.now();
+        cb({ didTimeout: false, timeRemaining: function () { return Math.max(0, 50 - (performance.now() - start)); } });
+      }, 1);
+    };
+    window.cancelIdleCallback = function (id) { clear(id); };
+  })();
+
+  if (typeof PerformanceObserver !== 'undefined' && !PerformanceObserver.supportedEntryTypes) {
+    PerformanceObserver.supportedEntryTypes = ['element', 'event', 'first-input', 'largest-contentful-paint',
+      'layout-shift', 'longtask', 'mark', 'measure', 'navigation', 'paint', 'resource'];
+  }
+
   // Objects are never collected while reachable from here, so a WeakRef
   // always derefs and finalizers never run.
   if (typeof WeakRef === 'undefined') {

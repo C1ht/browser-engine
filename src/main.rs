@@ -303,6 +303,24 @@ fn screenshot(a: &Args, out: &str) {
             break;
         }
     }
+    // BOLT_SCROLL_THROUGH: scroll down the page a viewport at a time (as a
+    // reader would), so scroll-triggered content gets revealed.
+    if std::env::var_os("BOLT_SCROLL_THROUGH").is_some() {
+        let mut y = 0.0;
+        while y < page.tree.height {
+            y += vh * 0.8;
+            page.set_scroll(y);
+            for _ in 0..10 {
+                now += 16.0;
+                page.tick(now);
+            }
+        }
+        page.set_scroll(0.0);
+        for _ in 0..10 {
+            now += 16.0;
+            page.tick(now);
+        }
+    }
     let t_fonts = Instant::now();
     page.load_fonts_blocking(w as f32, vh);
     let fonts_ms = ms(t_fonts);

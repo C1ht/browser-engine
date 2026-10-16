@@ -550,8 +550,11 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
 fn is_proto_method(it: &Interp, o: &ObjRef, key: &str) -> bool {
     let mut cur = o.borrow().proto.clone();
     while let Some(p) = cur {
-        if p.borrow().props.get(key).is_some() {
-            return true;
+        if let Some(prop) = p.borrow().props.get(key) {
+            // The DOM accessors installed on Node.prototype stand for this
+            // very layer; they don't shadow it.
+            let native = |f: &Option<Value>| matches!(f, Some(Value::Obj(fo)) if fo.borrow().props.get("@@nativeAccessor").is_some());
+            return !(native(&prop.get) || native(&prop.set));
         }
         cur = p.borrow().proto.clone();
     }

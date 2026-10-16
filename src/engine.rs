@@ -129,12 +129,18 @@ fn collect_sheets(doc: &Document, base: &str, css: &FxHashMap<String, String>, m
                 }
             } else if e.tag == k::link {
                 if let Some(u) = stylesheet_link(e, base) {
-                    match css.get(&u) {
-                        Some(t) => out.push((t.clone(), u.clone())),
-                        None => missing.push(u.clone()),
-                    }
-                    if let Some(d) = doc.cssom.get(&n) {
-                        out.push((d.rules.join("\n"), u));
+                    match (css.get(&u), doc.cssom.get(&n)) {
+                        // Read / edited through the CSSOM: its rules replace
+                        // the fetched text.
+                        (Some(t), Some(d)) if d.init && d.base == *t => out.push((d.rules.join("\n"), u)),
+                        (Some(t), d) => {
+                            out.push((t.clone(), u.clone()));
+                            // Rules inserted before the text was known.
+                            if let Some(d) = d.filter(|d| d.base.is_empty() && !d.rules.is_empty()) {
+                                out.push((d.rules.join("\n"), u));
+                            }
+                        }
+                        (None, _) => missing.push(u.clone()),
                     }
                 }
             }
@@ -307,7 +313,7 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
 pub fn script_layout(doc: &Document, src: &js::LayoutSrc, vw: f32, vh: f32) -> (FxHashMap<NodeId, [f32; 4]>, FxHashMap<NodeId, [f32; 4]>, Vec<Style>) {
     let mut missing = Vec::new();
     let sheets = collect_sheets(doc, &src.base, &src.css, &mut missing);
-    let cas = style::build_cascade(&sheets, &Media { vw, vh }, doc.quirks);
+    let cas = style::cached_cascade(&sheets, &Media { vw, vh }, doc.quirks);
     css::set_base(&src.base);
     let styles = style::compute(doc, &cas, vw, vh);
     let mut res = Resources::default();
@@ -663,7 +669,7 @@ pub enum Click {
 #[allow(clippy::too_many_arguments)]
 pub fn render(doc: &Document, sheets: &[(String, String)], base: &str, res: &mut Resources, vw: f32, vh: f32, t: &mut Timings) -> (Vec<Style>, LayoutTree, DisplayList) {
     let t0 = Instant::now();
-    let cas = style::build_cascade(sheets, &Media { vw, vh }, doc.quirks);
+    let cas = style::cached_cascade(sheets, &Media { vw, vh }, doc.quirks);
     t.css = ms(t0);
     let t0 = Instant::now();
     css::set_base(base);
@@ -907,7 +913,7 @@ impl Page {
         it.doc = std::mem::take(&mut self.doc);
         // Event handlers and timers get a leash; generous, since a killed
         // task (half-rendered component) is worse than a slow one.
-        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(2500));
+        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(5000));
         let focus_before = it.doc.focus;
         let r = f(it);
         it.run_microtasks();
