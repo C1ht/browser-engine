@@ -40,6 +40,8 @@ pub enum Value {
     Content(u32),
     /// transform / translate / rotate / scale: index into the transform table.
     Transform(u32),
+    /// animation-name list: index into the name-list table.
+    Names(u32),
     /// grid-template-areas: index into the areas table.
     Areas(u32),
     /// An identifier (interned), e.g. a grid area name.
@@ -230,6 +232,9 @@ pub enum Prop {
     ScaleP,
     TransformOriginX,
     TransformOriginY,
+    AnimName,
+    AnimFill,
+    AnimIter,
     WordBreak,
     OverflowWrap,
     TextOverflow,
@@ -367,6 +372,8 @@ pub struct Stylesheet {
     pub rules: Vec<StyleRule>,
     pub decls: Vec<Decl>,
     pub raws: Vec<Raw>,
+    /// @keyframes: (name, decls range of the final keyframe).
+    pub keyframes: Vec<(Rc<str>, u32, u32)>,
 }
 
 /// (property name, unparsed value)
@@ -1170,6 +1177,42 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             "translate" | "rotate" | "scale" => {
                 if let Some(t) = transform_prop(name, &lower) {
                     push!(match name { "translate" => TranslateP, "rotate" => RotateP, _ => ScaleP }, t);
+                }
+                return;
+            }
+            "animation" | "animation-name" | "animation-fill-mode" | "animation-iteration-count" => {
+                let (mut names, mut fill, mut finite) = (Vec::new(), false, true);
+                for part in split_top(value, b',') {
+                    let mut name = None;
+                    for tok in part.split_whitespace() {
+                        let t = tok.to_ascii_lowercase();
+                        let is_time = t.ends_with("ms") || (t.ends_with('s') && t[..t.len() - 1].parse::<f32>().is_ok());
+                        match t.as_str() {
+                            "forwards" | "both" => fill = true,
+                            "infinite" => finite = false,
+                            "none" | "backwards" | "normal" | "reverse" | "alternate" | "alternate-reverse" | "running" | "paused" | "linear" | "ease"
+                            | "ease-in" | "ease-out" | "ease-in-out" | "step-start" | "step-end" | "initial" | "inherit" => {}
+                            _ if is_time || t.parse::<f32>().is_ok() || t.starts_with("cubic-bezier(") || t.starts_with("steps(") || t.ends_with(')') => {}
+                            _ if name.is_none() => name = Some(tok.trim_matches(|c| c == '"' || c == '\'').to_owned()),
+                            _ => {}
+                        }
+                    }
+                    names.extend(name);
+                }
+                if matches!(name, "animation" | "animation-name") {
+                    let list: Rc<[Rc<str>]> = names.into_iter().map(Rc::from).collect();
+                    let i = NAME_LISTS.with(|t| {
+                        let mut t = t.borrow_mut();
+                        t.push(list);
+                        t.len() as u32 - 1
+                    });
+                    push!(AnimName, Value::Names(i));
+                }
+                if matches!(name, "animation" | "animation-fill-mode") {
+                    push!(AnimFill, Value::Num(fill as u8 as f32));
+                }
+                if matches!(name, "animation" | "animation-iteration-count") {
+                    push!(AnimIter, Value::Num(finite as u8 as f32));
                 }
                 return;
             }
@@ -2528,6 +2571,14 @@ thread_local! {
     static TRANSFORMS: RefCell<Vec<Rc<[TfOp]>>> = const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    static NAME_LISTS: RefCell<Vec<Rc<[Rc<str>]>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn name_list(i: u32) -> Rc<[Rc<str>]> {
+    NAME_LISTS.with(|t| t.borrow()[i as usize].clone())
+}
+
 pub fn transform_ops(i: u32) -> Rc<[TfOp]> {
     TRANSFORMS.with(|t| t.borrow()[i as usize].clone())
 }
@@ -3173,6 +3224,23 @@ fn parse_rules_in(s: &str, sheet: &mut Stylesheet, media: &Media, ctx: &RuleCtx)
                     }
                 }
                 "font-face" => parse_font_face(inner),
+                "keyframes" | "-webkit-keyframes" | "-moz-keyframes" => {
+                    let kname: Rc<str> = Rc::from(prelude.trim().trim_matches(|c| c == '"' || c == '\''));
+                    // Only the final keyframe is used (the end state of
+                    // animations that fill forwards).
+                    let ib = inner.as_bytes();
+                    let mut k = 0;
+                    while let Some(open) = find_top(ib, k, b"{") {
+                        let close = match_brace(ib, open);
+                        let sel = inner[k..open].trim().trim_start_matches(['}', ';']).trim().to_ascii_lowercase();
+                        if sel.split(',').any(|s| matches!(s.trim(), "to" | "100%")) {
+                            let start = sheet.decls.len() as u32;
+                            parse_declarations(&inner[open + 1..close.min(inner.len())], &mut sheet.decls, &mut sheet.raws);
+                            sheet.keyframes.push((kname.clone(), start, sheet.decls.len() as u32));
+                        }
+                        k = close + 1;
+                    }
+                }
                 "supports" if supports(prelude) => parse_rules_in(inner, sheet, media, ctx),
                 "layer" => parse_rules_in(inner, sheet, media, &ctx.sub_layer(prelude)),
                 "scope" | "document" | "-moz-document" | "starting-style" => {}

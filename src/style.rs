@@ -349,6 +349,10 @@ pub struct Style {
     pub ellipsis: bool,
     /// -webkit-line-clamp (0 = none).
     pub line_clamp: u16,
+    /// animation-name, and whether it fills forwards with a finite count.
+    pub anim_names: Option<Rc<[Rc<str>]>>,
+    pub anim_fill: bool,
+    pub anim_finite: bool,
 }
 
 /// A resolved transform step: a translation (percentages of the border box)
@@ -472,6 +476,9 @@ pub const INITIAL: Style = Style {
     wrap_anywhere: false,
     ellipsis: false,
     line_clamp: 0,
+    anim_names: None,
+    anim_fill: false,
+    anim_finite: true,
 };
 
 impl Style {
@@ -603,6 +610,9 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         OverflowWrap => d.wrap_anywhere = s.wrap_anywhere,
         TextOverflow => d.ellipsis = s.ellipsis,
         LineClamp => d.line_clamp = s.line_clamp,
+        AnimName => d.anim_names = s.anim_names.clone(),
+        AnimFill => d.anim_fill = s.anim_fill,
+        AnimIter => d.anim_finite = s.anim_finite,
         BorderSpacing => d.spacing = s.spacing,
         Width => d.width = s.width,
         Height => d.height = s.height,
@@ -929,6 +939,14 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                 _ => s.x_scale = ops,
             }
         }
+        AnimName => {
+            s.anim_names = match v {
+                Value::Names(i) => Some(css::name_list(i)),
+                _ => None,
+            }
+        }
+        AnimFill => s.anim_fill = matches!(v, Value::Num(n) if n > 0.0),
+        AnimIter => s.anim_finite = matches!(v, Value::Num(n) if n > 0.0),
         WordBreak | OverflowWrap | TextOverflow | LineClamp => {
             if let Value::Num(n) = v {
                 match d.prop {
@@ -1307,6 +1325,8 @@ pub struct Cascade {
     by_class: FxHashMap<Atom, Vec<u32>>,
     by_tag: FxHashMap<Atom, Vec<u32>>,
     universal: Vec<u32>,
+    /// @keyframes name -> decls of its final keyframe.
+    keyframes: FxHashMap<Rc<str>, (u32, u32)>,
 }
 
 impl Cascade {
@@ -1320,6 +1340,9 @@ impl Cascade {
             }
             d
         }));
+        for (name, s, e) in sheet.keyframes {
+            self.keyframes.insert(name, (s + off, e + off));
+        }
         for r in sheet.rules {
             let idx = self.rules.len() as u32;
             let subj = &r.sel.comps[0];
@@ -1985,6 +2008,18 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
             for d in inline_decls.iter().filter(|d| !d.important) {
                 apply_decl(s, ps, d, &ctx, pass, &inline_raws, true, &mut scratch);
             }
+            // The end state of animations that fill forwards.
+            if pass == Pass::Rest && s.anim_fill && s.anim_finite {
+                if let Some(names) = s.anim_names.clone() {
+                    for n in names.iter() {
+                        if let Some(&(a, b)) = cas.keyframes.get(n) {
+                            for d in &cas.decls[a as usize..b as usize] {
+                                apply_decl(s, ps, d, &ctx, pass, raws, false, &mut scratch);
+                            }
+                        }
+                    }
+                }
+            }
             // !important
             for (_, ds) in rules().filter(|r| r.important).map(decls) {
                 for d in ds.iter().filter(|d| d.important) {
@@ -2085,6 +2120,33 @@ mod tests {
         assert_eq!(st[p2 as usize].font_size, 32.0);
         assert_eq!(st[p3 as usize].color, 0xff000000);
         assert_eq!(st[p1 as usize].display, Display::Block);
+    }
+
+    #[test]
+    fn animation_end_state() {
+        let doc = html::parse(
+            r#"<!doctype html><style>
+            @keyframes fadeIn { from { opacity: 0 } to { opacity: 1; color: rgb(1, 2, 3) } }
+            @keyframes spin { to { color: red } }
+            .f { opacity: 0; animation: fadeIn .3s ease-out .1s 1 forwards }
+            .g { opacity: 0; animation-name: fadeIn; animation-fill-mode: both }
+            .s { color: rgb(9, 9, 9); animation: spin 1s linear infinite forwards }
+            .n { opacity: 0; animation: fadeIn 1s }
+            </style><p class=f id=f>f</p><p class=g id=g>g</p><p class=s id=s>s</p><p class=n id=n>n</p>"#,
+        );
+        let m = Media { vw: 800.0, vh: 600.0 };
+        let sheets = crate::engine::sheets_for(&doc, "", &mut Default::default());
+        let cas = build_cascade(&sheets, &m, doc.quirks);
+        let st = compute(&doc, &cas, 800.0, 600.0);
+        let by = |id: &str| {
+            let a = crate::atom::lookup(id).unwrap();
+            &st[(0..doc.nodes.len() as u32).find(|&n| doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap() as usize]
+        };
+        assert_eq!(by("f").opacity, 1.0);
+        assert_eq!(by("f").color & 0xFFFFFF, 0x010203);
+        assert_eq!(by("g").opacity, 1.0);
+        assert_eq!(by("s").color & 0xFFFFFF, 0x090909, "infinite animations keep the base style");
+        assert_eq!(by("n").opacity, 0.0, "no fill: the element's own style");
     }
 
     #[test]
