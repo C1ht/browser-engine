@@ -82,6 +82,16 @@ fn base_of(doc: &Document, url: &str) -> String {
     doc.base_href().map(|b| net::resolve(url, &b)).unwrap_or_else(|| url.to_owned())
 }
 
+/// The element a URL's fragment names (`:target`), or NONE.
+fn target_of(doc: &Document, url: &str) -> NodeId {
+    let frag = url.split_once('#').map(|(_, f)| net::percent_decode(f)).unwrap_or_default();
+    if frag.is_empty() {
+        return NONE;
+    }
+    let a = crate::atom::lookup(&frag);
+    doc.find(|e| (a.is_some() && e.id == a) || (e.tag == k::a && e.attr(k::name) == Some(frag.as_str())))
+}
+
 fn print_only(media: Option<&str>) -> bool {
     media.is_some_and(|m| {
         let m = m.to_ascii_lowercase();
@@ -147,16 +157,104 @@ fn collect_sheets(doc: &Document, base: &str, css: &FxHashMap<String, String>, m
 /// haven't been downloaded yet (e.g. added by a script).
 pub fn sheets_for(doc: &Document, base: &str, css: &mut FxHashMap<String, String>) -> Vec<(String, String)> {
     let mut missing = Vec::new();
-    let sheets = collect_sheets(doc, base, css, &mut missing);
-    if missing.is_empty() {
-        return sheets;
+    let mut sheets = collect_sheets(doc, base, css, &mut missing);
+    if !missing.is_empty() {
+        fetch_css(&mut missing, css);
+        sheets = collect_sheets(doc, base, css, &mut Vec::new());
     }
-    missing.sort();
-    missing.dedup();
-    for (u, b) in missing.iter().zip(net::fetch_many(&missing)) {
+    expand_imports(sheets, css, 0)
+}
+
+fn fetch_css(urls: &mut Vec<String>, css: &mut FxHashMap<String, String>) {
+    urls.sort();
+    urls.dedup();
+    for (u, b) in urls.iter().zip(net::fetch_many(urls)) {
         css.insert(u.clone(), b.map(|b| net::decode(&b)).unwrap_or_default());
     }
-    collect_sheets(doc, base, css, &mut Vec::new())
+}
+
+/// The leading `@import` rules of a sheet: (absolute url, media) and the
+/// rest of the text.
+fn split_imports<'a>(text: &'a str, base: &str) -> (Vec<(String, String)>, &'a str) {
+    let mut out = Vec::new();
+    let mut rest = text;
+    loop {
+        let t = rest.trim_start();
+        if let Some(c) = t.strip_prefix("/*") {
+            rest = c.find("*/").map_or("", |e| &c[e + 2..]);
+            continue;
+        }
+        let lower = t.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
+        if lower.starts_with("@charset") {
+            rest = t.find(';').map_or("", |e| &t[e + 1..]);
+            continue;
+        }
+        if !lower.starts_with("@import") {
+            return (out, t);
+        }
+        let Some(end) = t.find(';') else { return (out, "") };
+        let stmt = t[7..end].trim();
+        rest = &t[end + 1..];
+        let (url, media) = if let Some(u) = stmt.strip_prefix("url(") {
+            let close = u.find(')').unwrap_or(u.len());
+            (u[..close].trim().trim_matches(|c| c == '"' || c == '\''), u.get(close + 1..).unwrap_or(""))
+        } else if let Some(q) = stmt.chars().next().filter(|c| *c == '"' || *c == '\'') {
+            let s = &stmt[1..];
+            let close = s.find(q).unwrap_or(s.len());
+            (&s[..close], s.get(close + 1..).unwrap_or(""))
+        } else {
+            continue;
+        };
+        // layer(...) / supports(...) conditions before the media list.
+        let mut media = media.trim();
+        if media.starts_with("layer") {
+            media = media.find(')').map_or(media.trim_start_matches("layer"), |e| &media[e + 1..]).trim();
+        }
+        if let Some(s) = media.strip_prefix("supports(") {
+            let close = s.rfind(')').unwrap_or(s.len());
+            if !css::supports(&format!("({})", &s[..close])) {
+                continue;
+            }
+            media = s.get(close + 1..).unwrap_or("").trim();
+        }
+        out.push((net::resolve(base, url), media.to_owned()));
+    }
+}
+
+/// Replace sheets' `@import` rules by the imported sheets (fetched as needed).
+fn expand_imports(sheets: Vec<(String, String)>, css: &mut FxHashMap<String, String>, depth: u32) -> Vec<(String, String)> {
+    let mut missing: Vec<String> = Vec::new();
+    for (text, base) in &sheets {
+        if text.contains("@import") {
+            missing.extend(split_imports(text, base).0.into_iter().map(|(u, _)| u).filter(|u| !css.contains_key(u)));
+        }
+    }
+    if !missing.is_empty() {
+        fetch_css(&mut missing, css);
+    }
+    let mut out = Vec::with_capacity(sheets.len());
+    for (text, base) in sheets {
+        if depth > 4 || !text.contains("@import") {
+            out.push((text, base));
+            continue;
+        }
+        let (imports, rest) = split_imports(&text, &base);
+        if imports.is_empty() {
+            out.push((text, base));
+            continue;
+        }
+        let imported: Vec<(String, String)> = imports
+            .into_iter()
+            .map(|(u, media)| {
+                let t = css.get(&u).cloned().unwrap_or_default();
+                let t = if media.is_empty() { t } else { format!("@media {media} {{\n{t}\n}}") };
+                (t, u)
+            })
+            .collect();
+        out.extend(expand_imports(imported, css, depth + 1));
+        out.push((rest.to_owned(), base));
+    }
+    out
 }
 
 /// Fetch a document and its stylesheets (in parallel).
@@ -531,6 +629,8 @@ impl Page {
         let mut res = Resources::default();
         Self::collect_img_src(&doc, &base, &mut res);
         let mut css = l.css;
+        let mut doc = doc;
+        doc.target = target_of(&doc, &l.url);
         let sheets = sheets_for(&doc, &base, &mut css);
         let (styles, tree, dl) = render(&doc, &sheets, &base, &mut res, vw, vh, &mut t);
         let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, vw, vh };
@@ -578,6 +678,54 @@ impl Page {
             return false;
         }
         self.with_js(|it| it.check_geometry()).unwrap_or(false)
+    }
+
+    /// The pointer moved over `node` (`down`: button pressed). Updates
+    /// :hover / :active, fires mouse / pointer events. Returns true if the
+    /// page changed.
+    pub fn set_pointer(&mut self, node: Option<NodeId>, down: bool) -> bool {
+        let el = node.map_or(NONE, |n| if self.doc.elem(n).is_some() { n } else { self.doc.parent(n) });
+        let active = if down { el } else { NONE };
+        let (old_hover, old_active) = (self.doc.hover, self.doc.active);
+        if el == old_hover && active == old_active {
+            return false;
+        }
+        let before = self.layouts;
+        self.doc.hover = el;
+        self.doc.active = active;
+        // (node, type, bubbles)
+        let mut evs: Vec<(NodeId, &'static str, bool)> = Vec::new();
+        if el != old_hover {
+            if old_hover != NONE {
+                evs.extend([(old_hover, "pointerout", true), (old_hover, "mouseout", true), (old_hover, "pointerleave", false), (old_hover, "mouseleave", false)]);
+            }
+            if el != NONE {
+                evs.extend([(el, "pointerover", true), (el, "mouseover", true), (el, "pointerenter", false), (el, "mouseenter", false)]);
+            }
+        }
+        if active != old_active {
+            if active != NONE {
+                evs.extend([(active, "pointerdown", true), (active, "mousedown", true)]);
+            } else if el != NONE {
+                evs.extend([(el, "pointerup", true), (el, "mouseup", true)]);
+            }
+        }
+        let restyle = css::hover_rules_seen();
+        if let Some(it) = &mut self.js {
+            it.dirty |= restyle;
+            self.with_js(|it| {
+                for (n, ty, bubbles) in evs {
+                    if bubbles {
+                        js::dombind::dispatch(it, n, ty, |_, _| {});
+                    } else {
+                        js::dombind::dispatch_nobubble(it, n, ty);
+                    }
+                }
+            });
+        } else if restyle {
+            self.relayout(self.vw, self.vh);
+        }
+        self.layouts != before
     }
 
     /// The browser scrolled the page.
@@ -648,6 +796,7 @@ impl Page {
         self.url_events.append(&mut it.url_events);
         if self.url != it.url {
             self.url = it.url.clone();
+            self.doc.target = target_of(&self.doc, &self.url);
             if self.doc.base_href().is_none() {
                 self.base = self.url.clone();
             }

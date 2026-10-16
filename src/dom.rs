@@ -152,6 +152,11 @@ pub struct Document {
     pub quirks: bool,
     /// The focused element (for `:focus`), or NONE.
     pub focus: NodeId,
+    /// Element under the pointer (`:hover`), pressed (`:active`), and the
+    /// URL fragment's target (`:target`).
+    pub hover: NodeId,
+    pub active: NodeId,
+    pub target: NodeId,
 }
 
 impl Document {
@@ -180,6 +185,9 @@ impl Document {
             scripts: Vec::new(),
             quirks: true,
             focus: NONE,
+            hover: NONE,
+            active: NONE,
+            target: NONE,
         }
     }
 

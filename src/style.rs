@@ -1177,6 +1177,8 @@ struct CRule {
     slotted: bool,
     /// Pseudo-element the rule styles: 0 none, 1 ::before, 2 ::after.
     pe: u8,
+    /// Cascade layer rank (css::UNLAYERED for unlayered rules).
+    layer: u16,
 }
 
 pub const LEVEL_UA: u8 = 0;
@@ -1229,7 +1231,7 @@ impl Cascade {
                 Pseudo::After => Some(2),
                 _ => None,
             });
-            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom, important, font, host, slotted, pe: pe.unwrap_or(0) });
+            self.rules.push(CRule { sel: r.sel, start, end, level, order: idx, custom, important, font, host, slotted, pe: pe.unwrap_or(0), layer: r.layer });
         }
     }
 
@@ -1359,8 +1361,61 @@ fn match_compound(c: &Compound, doc: &Document, id: NodeId) -> bool {
             },
             Pseudo::Disabled => matches!(el.tag, k::input | k::button | k::select | k::textarea | k::option | k::fieldset) && el.attr(k::disabled).is_some(),
             Pseudo::PlaceholderShown => crate::forms::placeholder_shown(doc, id),
-            Pseudo::Not(list) => !list.iter().any(|c| match_compound(c, doc, id)),
-            Pseudo::Is(list) => list.iter().any(|c| match_compound(c, doc, id)),
+            Pseudo::Not(list) => !list.iter().any(|s| match_from(s, 0, doc, id)),
+            Pseudo::Is(list, _) => list.iter().any(|s| match_from(s, 0, doc, id)),
+            Pseudo::Has(list) => list.iter().any(|(comb, s)| match comb {
+                Some(Comb::Child) => doc.children(id).any(|c| doc.elem(c).is_some() && match_from(s, 0, doc, c)),
+                Some(Comb::Next) => {
+                    let n = doc.next_element(id);
+                    n != NONE && match_from(s, 0, doc, n)
+                }
+                Some(Comb::Subsequent) => {
+                    let mut n = doc.next_element(id);
+                    while n != NONE && !match_from(s, 0, doc, n) {
+                        n = doc.next_element(n);
+                    }
+                    n != NONE
+                }
+                _ => has_descendant(doc, id, s),
+            }),
+            Pseudo::NthOfType(a, b) | Pseudo::NthLastOfType(a, b) => {
+                let last = matches!(p, Pseudo::NthLastOfType(..));
+                let mut idx = 1;
+                let mut s = if last { doc.next_element(id) } else { doc.prev_element(id) };
+                while s != NONE {
+                    if doc.tag(s) == Some(el.tag) {
+                        idx += 1;
+                    }
+                    s = if last { doc.next_element(s) } else { doc.prev_element(s) };
+                }
+                nth(*a, *b, idx)
+            }
+            Pseudo::OnlyOfType => {
+                let same = |mut s: NodeId, fwd: bool| {
+                    while s != NONE {
+                        if doc.tag(s) == Some(el.tag) {
+                            return true;
+                        }
+                        s = if fwd { doc.next_element(s) } else { doc.prev_element(s) };
+                    }
+                    false
+                };
+                !same(doc.prev_element(id), false) && !same(doc.next_element(id), true)
+            }
+            Pseudo::Hover => doc.hover != NONE && doc.contains(id, doc.hover),
+            Pseudo::Active => doc.active != NONE && doc.contains(id, doc.active),
+            Pseudo::Target => doc.target == id,
+            Pseudo::Enabled => matches!(el.tag, k::input | k::button | k::select | k::textarea | k::option | k::fieldset) && el.attr(k::disabled).is_none(),
+            Pseudo::Required | Pseudo::Optional => {
+                let req = matches!(el.tag, k::input | k::select | k::textarea) && crate::atom::lookup("required").is_some_and(|a| el.attr(a).is_some());
+                if matches!(p, Pseudo::Required) { req } else { matches!(el.tag, k::input | k::select | k::textarea) && !req }
+            }
+            Pseudo::ReadOnly | Pseudo::ReadWrite => {
+                let editable = (matches!(el.tag, k::input | k::textarea) && el.attr(k::readonly).is_none() && el.attr(k::disabled).is_none())
+                    || crate::atom::lookup("contenteditable").and_then(|a| el.attr(a)).is_some_and(|v| v != "false");
+                editable == matches!(p, Pseudo::ReadWrite)
+            }
+            Pseudo::Always => true,
             Pseudo::Before | Pseudo::After => true,
             Pseudo::Host(list) => doc.shadows.contains_key(&id) && (list.is_empty() || list.iter().any(|c| match_compound(c, doc, id))),
             Pseudo::Slotted(list) => doc.shadows.contains_key(&doc.parent(id)) && list.iter().any(|c| match_compound(c, doc, id)),
@@ -1440,6 +1495,19 @@ fn shadow_cascade(doc: &Document, root: NodeId, media: &Media) -> Rc<Cascade> {
         c.insert(key, cas.clone());
         cas
     })
+}
+
+fn has_descendant(doc: &Document, root: NodeId, s: &Selector) -> bool {
+    let mut stack: Vec<NodeId> = doc.children(root).collect();
+    while let Some(n) = stack.pop() {
+        if doc.elem(n).is_some() {
+            if match_from(s, 0, doc, n) {
+                return true;
+            }
+            stack.extend(doc.children(n));
+        }
+    }
+    false
 }
 
 fn match_from(sel: &Selector, idx: usize, doc: &Document, id: NodeId) -> bool {
@@ -1728,7 +1796,7 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
         consider(&cas.universal);
         matched.sort_unstable_by_key(|&ri| {
             let r = &cas.rules[ri as usize];
-            (r.level, r.sel.spec, r.order)
+            (r.level, r.layer, r.sel.spec, r.order)
         });
 
         // `:host` rules of this element's shadow tree and `::slotted` rules
@@ -1839,7 +1907,7 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
             }
             list.sort_unstable_by_key(|&ri| {
                 let r = &cas.rules[ri as usize];
-                (r.level, r.sel.spec, r.order)
+                (r.level, r.layer, r.sel.spec, r.order)
             });
             let parent = styles[id].clone();
             let mut ps = Style::inherit(&parent);
@@ -1866,6 +1934,7 @@ pub const QUIRKS_CSS: &str = "table { text-align: left; font-size: medium; font-
 
 /// Author stylesheets as (css text, base url).
 pub fn build_cascade(author_sheets: &[(String, String)], media: &Media, quirks: bool) -> Cascade {
+    css::reset_layers();
     let mut cas = Cascade::default();
     cas.add_sheet(css::parse_stylesheet(UA_CSS, media, ""), LEVEL_UA);
     if quirks {
@@ -1902,6 +1971,54 @@ mod tests {
         assert_eq!(st[p2 as usize].font_size, 32.0);
         assert_eq!(st[p3 as usize].color, 0xff000000);
         assert_eq!(st[p1 as usize].display, Display::Block);
+    }
+
+    #[test]
+    fn modern_css() {
+        let doc = html::parse(
+            r#"<!doctype html><style>
+            @layer base, theme;
+            @layer theme { #a { color: rgb(0, 0, 255) } }
+            @layer base { #a { color: rgb(255, 0, 0) } }
+            #b { color: green } @layer theme { #b { color: red } }
+            .card { & .title { color: oklch(62.8% 0.2577 29.23) } &:first-child { padding-left: 7px } }
+            @supports (display: grid) and (not (foo: bar)) { #c { color: #010203 } }
+            @supports (backdrop-filter: blur(2px)) { #c { color: red } }
+            @media (width>=500px) and (not (hover: none)) { #d { color: rgb(4, 5, 6) } }
+            @media (forced-colors: active) { #d { color: red } }
+            li:nth-of-type(2) { color: color-mix(in srgb, rgb(255, 0, 0), rgb(0, 0, 255)) }
+            ul:has(> .x) { margin-inline: 3px 4px } :is(ul .x, ol .y) { color: hwb(120 0% 0%) }
+            p { color: rgb(9, 9, 9) } :where(div) p { color: red }
+            .u { color: blue } .u span { color: unset }
+            </style>
+            <div id=a>a</div><div id=b>b</div><div class=card><p class=title id=t>t</p></div>
+            <div id=c>c</div><div id=d>d</div>
+            <ul id=l><li>1</li><span class=x>x</span><li id=li2>2</li></ul><p id=p>p</p><div class=u><span id=s>s</span></div>"#,
+        );
+        let m = Media { vw: 800.0, vh: 600.0 };
+        let sheets = crate::engine::sheets_for(&doc, "", &mut Default::default());
+        let cas = build_cascade(&sheets, &m, doc.quirks);
+        let st = compute(&doc, &cas, 800.0, 600.0);
+        let by = |id: &str| {
+            let a = crate::atom::lookup(id).unwrap();
+            &st[(0..doc.nodes.len() as u32).find(|&n| doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap() as usize]
+        };
+        let rgb = |id: &str| by(id).color & 0xFFFFFF;
+        assert_eq!(rgb("a"), 0x0000FF, "later layer wins");
+        assert_eq!(rgb("b"), 0x008000, "unlayered beats layered");
+        let t = rgb("t");
+        assert!((t >> 16) > 0xF0 && (t & 0xFFFF) < 0x1010, "oklch red: {t:06x}");
+        assert_eq!(rgb("c"), 0x010203);
+        assert_eq!(rgb("d"), 0x040506);
+        assert_eq!(rgb("li2"), 0x800080);
+        assert_eq!(rgb("p"), 0x090909, ":where has zero specificity");
+        assert_eq!(rgb("s"), 0x0000FF, "unset inherits color");
+        assert_eq!(by("l").margin[3], Len::Px(3.0));
+        assert_eq!(by("l").margin[1], Len::Px(4.0));
+        let x = doc.find(|e| e.classes.contains(&crate::atom::intern("x")));
+        assert_eq!(st[x as usize].color & 0xFFFFFF, 0x00FF00);
+        let title = doc.find(|e| e.id == crate::atom::lookup("t"));
+        let _ = title;
     }
 
     #[test]

@@ -294,8 +294,24 @@ pub enum Pseudo {
     Checked,
     Disabled,
     PlaceholderShown,
-    Not(Vec<Compound>),
-    Is(Vec<Compound>),
+    Not(Vec<Selector>),
+    /// :is() (false) / :where() (true: zero specificity).
+    Is(Vec<Selector>, bool),
+    /// :has(<relative selector list>).
+    Has(Vec<(Option<Comb>, Selector)>),
+    NthOfType(i32, i32),
+    NthLastOfType(i32, i32),
+    OnlyOfType,
+    Hover,
+    Active,
+    Target,
+    Enabled,
+    Required,
+    Optional,
+    ReadOnly,
+    ReadWrite,
+    /// Always matches (`:defined`, `:valid`, `:dir(ltr)` ...).
+    Always,
     /// `::before` / `::after`: the rule styles that pseudo-element.
     Before,
     After,
@@ -330,6 +346,8 @@ pub struct StyleRule {
     pub sel: Selector,
     pub start: u32,
     pub end: u32,
+    /// Cascade layer rank (UNLAYERED outside @layer).
+    pub layer: u16,
 }
 
 #[derive(Default)]
@@ -545,49 +563,220 @@ pub fn parse_color(t: &str) -> Option<u32> {
     }
     let lower = t.to_ascii_lowercase();
     if let Some(p) = lower.find('(') {
-        let f = &lower[..p];
-        let inner = lower[p + 1..].trim_end_matches(')');
-        let parts: Vec<&str> = inner
-            .split(|c: char| c == ',' || c == '/' || c.is_whitespace())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if parts.len() < 3 {
+        if !lower.ends_with(')') {
             return None;
         }
-        let alpha = parts.get(3).map_or(Some(1.0), |a| {
-            if let Some(p) = a.strip_suffix('%') {
-                p.parse::<f32>().ok().map(|v| v / 100.0)
-            } else {
-                a.parse::<f32>().ok()
-            }
-        })?;
-        let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
-        let (r, g, b) = match f {
-            "rgb" | "rgba" => {
-                let ch = |s: &str| -> Option<u32> {
-                    let v = if let Some(p) = s.strip_suffix('%') {
-                        p.parse::<f32>().ok()? * 2.55
-                    } else {
-                        s.parse::<f32>().ok()?
-                    };
-                    Some(v.round().clamp(0.0, 255.0) as u32)
-                };
-                (ch(parts[0])?, ch(parts[1])?, ch(parts[2])?)
-            }
-            "hsl" | "hsla" => {
-                let h = parts[0].trim_end_matches("deg").parse::<f32>().ok()? / 360.0;
-                let s = parts[1].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
-                let l = parts[2].trim_end_matches('%').parse::<f32>().ok()? / 100.0;
-                hsl(h.rem_euclid(1.0), s.clamp(0.0, 1.0), l.clamp(0.0, 1.0))
-            }
-            _ => return None,
-        };
-        return Some(a << 24 | r << 16 | g << 8 | b);
+        return color_fn(&lower[..p], &lower[p + 1..lower.len() - 1]);
+    }
+    if let Some(c) = system_color(&lower) {
+        return Some(0xFF00_0000 | c);
     }
     if lower == "transparent" {
         return Some(0);
     }
     named_color(&lower).map(|c| 0xFF00_0000 | c)
+}
+
+fn system_color(n: &str) -> Option<u32> {
+    Some(match n {
+        "canvas" | "field" | "window" | "buttonhighlight" => 0xFFFFFF,
+        "canvastext" | "fieldtext" | "buttontext" | "windowtext" | "menutext" => 0x000000,
+        "linktext" => 0x0000EE,
+        "visitedtext" => 0x551A8B,
+        "activetext" => 0xFF0000,
+        "buttonface" | "buttonborder" | "threedface" => 0xEFEFEF,
+        "graytext" => 0x808080,
+        "highlight" | "selecteditem" | "accentcolor" => 0x0075FF,
+        "highlighttext" | "selecteditemtext" | "accentcolortext" => 0xFFFFFF,
+        "mark" => 0xFFFF00,
+        "marktext" => 0x000000,
+        _ => return None,
+    })
+}
+
+/// Split a function's arguments at top-level commas.
+fn split_top_commas(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0, 0);
+    for (i, c) in s.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(s[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(s[start..].trim());
+    out
+}
+
+/// A number or percentage (`pct` = the value of 100%); `none` is 0.
+fn cnum(s: &str, pct: f32) -> Option<f32> {
+    if s == "none" {
+        return Some(0.0);
+    }
+    match s.strip_suffix('%') {
+        Some(p) => Some(p.parse::<f32>().ok()? * pct / 100.0),
+        None => s.parse::<f32>().ok(),
+    }
+}
+
+/// A hue in degrees.
+fn hue(s: &str) -> Option<f32> {
+    if s == "none" {
+        return Some(0.0);
+    }
+    let (v, mul) = if let Some(v) = s.strip_suffix("deg") {
+        (v, 1.0)
+    } else if let Some(v) = s.strip_suffix("grad") {
+        (v, 0.9)
+    } else if let Some(v) = s.strip_suffix("rad") {
+        (v, 180.0 / std::f32::consts::PI)
+    } else if let Some(v) = s.strip_suffix("turn") {
+        (v, 360.0)
+    } else {
+        (s, 1.0)
+    };
+    Some((v.parse::<f32>().ok()? * mul).rem_euclid(360.0))
+}
+
+fn srgb_encode(c: f32) -> u32 {
+    let c = c.clamp(0.0, 1.0);
+    let v = if c <= 0.003_130_8 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 };
+    (v * 255.0).round().clamp(0.0, 255.0) as u32
+}
+
+fn oklab_rgb(l: f32, a: f32, b: f32) -> (u32, u32, u32) {
+    let l_ = l + 0.396_337_78 * a + 0.215_803_76 * b;
+    let m_ = l - 0.105_561_346 * a - 0.063_854_17 * b;
+    let s_ = l - 0.089_484_18 * a - 1.291_485_5 * b;
+    let (l3, m3, s3) = (l_ * l_ * l_, m_ * m_ * m_, s_ * s_ * s_);
+    (
+        srgb_encode(4.076_741_7 * l3 - 3.307_711_6 * m3 + 0.230_969_94 * s3),
+        srgb_encode(-1.268_438 * l3 + 2.609_757_4 * m3 - 0.341_319_38 * s3),
+        srgb_encode(-0.004_196_086_3 * l3 - 0.703_418_6 * m3 + 1.707_614_7 * s3),
+    )
+}
+
+/// CIE Lab (D50) to sRGB.
+fn lab_rgb(l: f32, a: f32, b: f32) -> (u32, u32, u32) {
+    let fy = (l + 16.0) / 116.0;
+    let (fx, fz) = (fy + a / 500.0, fy - b / 200.0);
+    let inv = |t: f32| if t > 6.0 / 29.0 { t * t * t } else { 3.0 * (6.0f32 / 29.0).powi(2) * (t - 4.0 / 29.0) };
+    let (x, y, z) = (inv(fx) * 0.964_22, inv(fy), inv(fz) * 0.825_21);
+    (
+        srgb_encode(3.133_856 * x - 1.616_866_7 * y - 0.490_614_6 * z),
+        srgb_encode(-0.978_768_4 * x + 1.916_141_5 * y + 0.033_454 * z),
+        srgb_encode(0.071_945_3 * x - 0.228_991_4 * y + 1.405_242_7 * z),
+    )
+}
+
+/// rgb() / hsl() / hwb() / lab() / lch() / oklab() / oklch() / color() /
+/// color-mix() / light-dark(), lowercased.
+fn color_fn(f: &str, inner: &str) -> Option<u32> {
+    match f {
+        "light-dark" => return parse_color(split_top_commas(inner).first()?),
+        "color-mix" => {
+            let args = split_top_commas(inner);
+            if args.len() != 3 || !args[0].starts_with("in ") {
+                return None;
+            }
+            let part = |s: &str| -> Option<(u32, Option<f32>)> {
+                let s = s.trim();
+                match s.rfind(' ') {
+                    Some(i) if s.ends_with('%') => {
+                        let p = s[i + 1..].trim_end_matches('%').parse::<f32>().ok()?;
+                        Some((parse_color(&s[..i])?, Some(p / 100.0)))
+                    }
+                    _ => Some((parse_color(s)?, None)),
+                }
+            };
+            let ((c1, p1), (c2, p2)) = (part(args[1])?, part(args[2])?);
+            let (w1, w2) = match (p1, p2) {
+                (Some(a), Some(b)) => (a, b),
+                (Some(a), None) => (a, 1.0 - a),
+                (None, Some(b)) => (1.0 - b, b),
+                (None, None) => (0.5, 0.5),
+            };
+            let total = (w1 + w2).max(1e-6);
+            let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as f32;
+            let (a1, a2) = (ch(c1, 24) / 255.0, ch(c2, 24) / 255.0);
+            let alpha = (a1 * w1 + a2 * w2) / total;
+            let mix = |sh: u32| -> u32 {
+                if alpha <= 0.0 {
+                    return 0;
+                }
+                (((ch(c1, sh) * a1 * w1 + ch(c2, sh) * a2 * w2) / total) / alpha).round().clamp(0.0, 255.0) as u32
+            };
+            let a = (alpha * total.min(1.0) * 255.0).round() as u32;
+            return Some(a << 24 | mix(16) << 16 | mix(8) << 8 | mix(0));
+        }
+        _ => {}
+    }
+    if inner.trim_start().starts_with("from ") {
+        return None; // relative color syntax
+    }
+    let parts: Vec<&str> = inner.split(|c: char| c == ',' || c == '/' || c.is_whitespace()).filter(|s| !s.is_empty()).collect();
+    let (args, alpha_s) = if f == "color" {
+        if parts.len() < 4 {
+            return None;
+        }
+        (&parts[1..4], parts.get(4))
+    } else {
+        if parts.len() < 3 {
+            return None;
+        }
+        (&parts[..3], parts.get(3))
+    };
+    let alpha = match alpha_s {
+        Some(a) => cnum(a, 1.0)?,
+        None => 1.0,
+    };
+    let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u32;
+    let (r, g, b) = match f {
+        "rgb" | "rgba" => {
+            let ch = |s: &str| -> Option<u32> { Some(cnum(s, 255.0)?.round().clamp(0.0, 255.0) as u32) };
+            (ch(args[0])?, ch(args[1])?, ch(args[2])?)
+        }
+        "hsl" | "hsla" => {
+            let h = hue(args[0])? / 360.0;
+            let s = cnum(args[1].trim_end_matches('%'), 1.0)? / 100.0;
+            let l = cnum(args[2].trim_end_matches('%'), 1.0)? / 100.0;
+            hsl(h, s.clamp(0.0, 1.0), l.clamp(0.0, 1.0))
+        }
+        "hwb" => {
+            let h = hue(args[0])? / 360.0;
+            let w = cnum(args[1].trim_end_matches('%'), 1.0)? / 100.0;
+            let bl = cnum(args[2].trim_end_matches('%'), 1.0)? / 100.0;
+            if w + bl >= 1.0 {
+                let g = (w / (w + bl) * 255.0).round() as u32;
+                (g, g, g)
+            } else {
+                let (r, g, b) = hsl(h, 1.0, 0.5);
+                let f = |c: u32| ((c as f32 / 255.0 * (1.0 - w - bl) + w) * 255.0).round() as u32;
+                (f(r), f(g), f(b))
+            }
+        }
+        "lab" => lab_rgb(cnum(args[0], 100.0)?, cnum(args[1], 125.0)?, cnum(args[2], 125.0)?),
+        "lch" => {
+            let (l, c, h) = (cnum(args[0], 100.0)?, cnum(args[1], 150.0)?, hue(args[2])?.to_radians());
+            lab_rgb(l, c * h.cos(), c * h.sin())
+        }
+        "oklab" => oklab_rgb(cnum(args[0], 1.0)?, cnum(args[1], 0.4)?, cnum(args[2], 0.4)?),
+        "oklch" => {
+            let (l, c, h) = (cnum(args[0], 1.0)?, cnum(args[1], 0.4)?, hue(args[2])?.to_radians());
+            oklab_rgb(l, c * h.cos(), c * h.sin())
+        }
+        "color" => {
+            let ch = |s: &str| -> Option<u32> { Some((cnum(s, 1.0)? * 255.0).round().clamp(0.0, 255.0) as u32) };
+            (ch(args[0])?, ch(args[1])?, ch(args[2])?)
+        }
+        _ => return None,
+    };
+    Some(a << 24 | r << 16 | g << 8 | b)
 }
 
 fn hsl(h: f32, s: f32, l: f32) -> (u32, u32, u32) {
@@ -865,7 +1054,78 @@ fn push4(out: &mut Vec<Decl>, props: [Prop; 4], vals: &[Value], important: bool)
 }
 
 /// Parse one `name: value` declaration, appending longhands to `out`.
+/// Physical equivalents of a logical property (horizontal, left-to-right).
+fn logical_props(name: &str, value: &str) -> Option<Vec<(String, String)>> {
+    let pair = |a: &str, b: &str| -> Vec<(String, String)> {
+        let parts = split_top(value.trim(), b' ').into_iter().filter(|p| !p.trim().is_empty()).collect::<Vec<_>>();
+        let (v1, v2) = match parts.as_slice() {
+            [x, y, ..] => (x.trim().to_owned(), y.trim().to_owned()),
+            _ => (value.trim().to_owned(), value.trim().to_owned()),
+        };
+        vec![(a.to_owned(), v1), (b.to_owned(), v2)]
+    };
+    let one = |a: &str| vec![(a.to_owned(), value.to_owned())];
+    let both = |a: &str, b: &str| vec![(a.to_owned(), value.to_owned()), (b.to_owned(), value.to_owned())];
+    Some(match name {
+        "margin-inline" => pair("margin-left", "margin-right"),
+        "margin-block" => pair("margin-top", "margin-bottom"),
+        "padding-inline" => pair("padding-left", "padding-right"),
+        "padding-block" => pair("padding-top", "padding-bottom"),
+        "inset-inline" => pair("left", "right"),
+        "inset-block" => pair("top", "bottom"),
+        "inset-inline-start" => one("left"),
+        "inset-inline-end" => one("right"),
+        "inset-block-start" => one("top"),
+        "inset-block-end" => one("bottom"),
+        "inline-size" => one("width"),
+        "block-size" => one("height"),
+        "min-inline-size" => one("min-width"),
+        "max-inline-size" => one("max-width"),
+        "min-block-size" => one("min-height"),
+        "max-block-size" => one("max-height"),
+        "border-inline" => both("border-left", "border-right"),
+        "border-block" => both("border-top", "border-bottom"),
+        "border-inline-start" => one("border-left"),
+        "border-inline-end" => one("border-right"),
+        "border-block-start" => one("border-top"),
+        "border-block-end" => one("border-bottom"),
+        "border-inline-width" => pair("border-left-width", "border-right-width"),
+        "border-inline-color" => pair("border-left-color", "border-right-color"),
+        "border-inline-style" => pair("border-left-style", "border-right-style"),
+        "border-block-width" => pair("border-top-width", "border-bottom-width"),
+        "border-block-color" => pair("border-top-color", "border-bottom-color"),
+        "border-block-style" => pair("border-top-style", "border-bottom-style"),
+        "border-inline-start-width" => one("border-left-width"),
+        "border-inline-end-width" => one("border-right-width"),
+        "border-block-start-width" => one("border-top-width"),
+        "border-block-end-width" => one("border-bottom-width"),
+        "border-inline-start-color" => one("border-left-color"),
+        "border-inline-end-color" => one("border-right-color"),
+        "border-block-start-color" => one("border-top-color"),
+        "border-block-end-color" => one("border-bottom-color"),
+        "border-start-start-radius" => one("border-top-left-radius"),
+        "border-start-end-radius" => one("border-top-right-radius"),
+        "border-end-start-radius" => one("border-bottom-left-radius"),
+        "border-end-end-radius" => one("border-bottom-right-radius"),
+        _ => return None,
+    })
+}
+
+/// Properties whose value inherits by default (for `unset`).
+fn inherited(p: Prop) -> bool {
+    matches!(
+        p,
+        Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | BorderCollapse
+    )
+}
+
 pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<Decl>) {
+    if let Some(list) = logical_props(name, value) {
+        for (n, v) in list {
+            parse_property(&n, &v, important, out);
+        }
+        return;
+    }
     let lower = value.trim().to_ascii_lowercase();
     let v = lower.as_str();
     macro_rules! push {
@@ -874,11 +1134,19 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
         };
     }
 
+    // `unset` / `revert`: inherit for inherited properties, else initial.
+    let unset = matches!(v, "unset" | "revert" | "revert-layer");
     let global = match v {
         "inherit" => Some(Value::Inherit),
         "initial" | "unset" | "revert" | "revert-layer" => Some(Value::Initial),
         _ => None,
     };
+    macro_rules! push_global {
+        ($p:expr, $g:expr) => {{
+            let p = $p;
+            push!(p, if unset && inherited(p) { Value::Inherit } else { $g })
+        }};
+    }
     if global.is_none() && name == "content" {
         if let Some(c) = content_value(value) {
             push!(Content, c);
@@ -898,14 +1166,14 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             "font" => &[FontSize, FontWeight, FontStyle, FontFamily, LineHeight],
             _ => match simple_prop(name) {
                 Some(p) => {
-                    push!(p, g);
+                    push_global!(p, g);
                     return;
                 }
                 None => return,
             },
         };
         for &p in props {
-            push!(p, g);
+            push_global!(p, g);
         }
         return;
     }
@@ -2554,7 +2822,116 @@ fn background(orig: &str, important: bool, out: &mut Vec<Decl>) {
     }
 }
 
+thread_local! {
+    /// Cascade layer names in order of first appearance (for the whole
+    /// cascade being built; see `reset_layers`).
+    static LAYERS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Start a new cascade: forget layer order.
+pub fn reset_layers() {
+    LAYERS.with(|l| l.borrow_mut().clear());
+}
+
+/// The rank of layer `name` (registering it). Unlayered rules use UNLAYERED.
+fn layer_rank(name: &str) -> u16 {
+    LAYERS.with(|l| {
+        let mut l = l.borrow_mut();
+        match l.iter().position(|n| n == name) {
+            Some(i) => i as u16,
+            None => {
+                l.push(name.to_owned());
+                (l.len() - 1).min(u16::MAX as usize - 1) as u16
+            }
+        }
+    })
+}
+
+/// Rules outside any @layer win over layered ones.
+pub const UNLAYERED: u16 = u16::MAX;
+
+/// Rule-parsing context: enclosing layer and nesting.
+#[derive(Clone)]
+struct RuleCtx {
+    /// Full name of the enclosing layer ("" = none).
+    layer: String,
+}
+
+impl RuleCtx {
+    fn rank(&self) -> u16 {
+        if self.layer.is_empty() { UNLAYERED } else { layer_rank(&self.layer) }
+    }
+    fn sub_layer(&self, name: &str) -> RuleCtx {
+        let name = if name.is_empty() {
+            LAYERS.with(|l| format!("#anon{}", l.borrow().len()))
+        } else {
+            name.to_owned()
+        };
+        RuleCtx { layer: if self.layer.is_empty() { name } else { format!("{}.{name}", self.layer) } }
+    }
+}
+
+/// Evaluate an @supports condition.
+pub fn supports(cond: &str) -> bool {
+    let c = cond.trim();
+    if c.is_empty() {
+        return false;
+    }
+    if let Some(rest) = c.strip_prefix("not ").or_else(|| c.strip_prefix("not(").map(|_| &c[3..])) {
+        return !supports(rest);
+    }
+    let ands = split_words_top(c, "and");
+    if ands.len() > 1 {
+        return ands.iter().all(|p| supports(p));
+    }
+    let ors = split_words_top(c, "or");
+    if ors.len() > 1 {
+        return ors.iter().any(|p| supports(p));
+    }
+    let lower = c.to_ascii_lowercase();
+    for (f, ok) in [("selector(", true), ("font-tech(", false), ("font-format(", true)] {
+        if lower.starts_with(f) {
+            let Some(close) = match_paren(c, f.len() - 1) else { return false };
+            let arg = &c[f.len()..close];
+            return ok && (f != "selector(" || !parse_selector_list(arg).is_empty());
+        }
+    }
+    if c.starts_with('(') {
+        let Some(close) = match_paren(c, 0) else { return false };
+        if close + 1 != c.len() {
+            return false;
+        }
+        let inner = c[1..close].trim();
+        if inner.starts_with('(') || inner.starts_with("not") || inner.starts_with("selector(") {
+            return supports(inner);
+        }
+        let Some((name, value)) = inner.split_once(':') else { return false };
+        let name = name.trim().to_ascii_lowercase();
+        if name.starts_with("--") {
+            return true;
+        }
+        let name = name.strip_prefix("-webkit-").unwrap_or(&name);
+        let mut out = Vec::new();
+        parse_property(name, value.trim(), false, &mut out);
+        return !out.is_empty();
+    }
+    false
+}
+
+/// Combine a nested selector with its parent (CSS nesting).
+fn nest_selector(parent: &str, child: &str) -> String {
+    if child.contains('&') {
+        child.replace('&', parent)
+    } else {
+        format!("{parent} {child}")
+    }
+}
+
 fn parse_rules(s: &str, sheet: &mut Stylesheet, media: &Media) {
+    parse_rules_in(s, sheet, media, &RuleCtx { layer: String::new() });
+}
+
+fn parse_rules_in(s: &str, sheet: &mut Stylesheet, media: &Media, ctx: &RuleCtx) {
     let b = s.as_bytes();
     let n = b.len();
     let mut i = 0;
@@ -2572,20 +2949,33 @@ fn parse_rules(s: &str, sheet: &mut Stylesheet, media: &Media) {
             }
             let name = s[i + 1..j].to_ascii_lowercase();
             let Some(pos) = find_top(b, j, b";{") else { break };
+            let prelude = s[j..pos].trim();
             if b[pos] == b';' {
+                if name == "layer" {
+                    // `@layer a, b;` fixes the order of layers.
+                    for l in prelude.split(',') {
+                        ctx.sub_layer(l.trim()).rank();
+                    }
+                }
                 i = pos + 1;
                 continue;
             }
             let end = match_brace(b, pos);
-            let prelude = &s[j..pos];
             let inner = &s[pos + 1..end.min(n)];
             match name.as_str() {
-                "media" if eval_media(prelude, media) => parse_rules(inner, sheet, media),
-                "font-face" => parse_font_face(inner),
-                "supports" if !prelude.contains("not") => parse_rules(inner, sheet, media),
-                "layer" | "container" | "scope" | "document" | "-moz-document" => {
-                    parse_rules(inner, sheet, media)
+                "media" if eval_media(prelude, media) => parse_rules_in(inner, sheet, media, ctx),
+                "container" => {
+                    // Approximation: the container is the viewport.
+                    let cond = prelude.trim_start_matches(|c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_').trim();
+                    let cond = if prelude.starts_with('(') || prelude.starts_with("not") { prelude } else { cond };
+                    if cond.is_empty() || eval_media(cond, media) {
+                        parse_rules_in(inner, sheet, media, ctx);
+                    }
                 }
+                "font-face" => parse_font_face(inner),
+                "supports" if supports(prelude) => parse_rules_in(inner, sheet, media, ctx),
+                "layer" => parse_rules_in(inner, sheet, media, &ctx.sub_layer(prelude)),
+                "scope" | "document" | "-moz-document" | "starting-style" => {}
                 _ => {}
             }
             i = end + 1;
@@ -2596,18 +2986,66 @@ fn parse_rules(s: &str, sheet: &mut Stylesheet, media: &Media) {
         let prelude = &s[i..brace];
         let body = &s[brace + 1..end.min(n)];
         i = end + 1;
+        parse_style_rule(prelude, body, sheet, media, ctx);
+    }
+}
+
+/// A style rule; nested rules (CSS nesting) are flattened.
+fn parse_style_rule(prelude: &str, body: &str, sheet: &mut Stylesheet, media: &Media, ctx: &RuleCtx) {
+    let rank = ctx.rank();
+    let emit = |sheet: &mut Stylesheet, prelude: &str, decls: &str| {
         let sels = parse_selector_list(prelude);
         if sels.is_empty() {
-            continue;
+            return;
         }
         let start = sheet.decls.len() as u32;
-        parse_declarations(body, &mut sheet.decls, &mut sheet.raws);
+        parse_declarations(decls, &mut sheet.decls, &mut sheet.raws);
         let end = sheet.decls.len() as u32;
         if end > start {
             for sel in sels {
-                sheet.rules.push(StyleRule { sel, start, end });
+                sheet.rules.push(StyleRule { sel, start, end, layer: rank });
             }
         }
+    };
+    let bb = body.as_bytes();
+    if find_top(bb, 0, b"{").is_none() {
+        emit(sheet, prelude, body);
+        return;
+    }
+    // Declarations first, then nested rules (in order).
+    let mut decls = String::new();
+    let mut nested: Vec<(&str, &str)> = Vec::new();
+    let mut i = 0;
+    while i < bb.len() {
+        let end = find_top(bb, i, b";{").unwrap_or(bb.len());
+        if end < bb.len() && bb[end] == b'{' {
+            let close = match_brace(bb, end);
+            nested.push((body[i..end].trim(), &body[end + 1..close.min(bb.len())]));
+            i = close + 1;
+        } else {
+            decls.push_str(&body[i..end.min(bb.len())]);
+            decls.push(';');
+            i = end + 1;
+        }
+    }
+    emit(sheet, prelude, &decls);
+    let parents: Vec<&str> = split_top(prelude, b',').into_iter().map(str::trim).filter(|p| !p.is_empty()).collect();
+    for (pre, inner) in nested {
+        if let Some(at) = pre.strip_prefix('@') {
+            let (name, cond) = at.split_once(|c: char| c.is_whitespace() || c == '(').map_or((at, ""), |(a, _)| (a, &at[a.len()..]));
+            let ok = match name.to_ascii_lowercase().as_str() {
+                "media" => eval_media(cond.trim(), media),
+                "supports" => supports(cond.trim()),
+                "container" | "layer" | "scope" => true,
+                _ => false,
+            };
+            if ok {
+                parse_style_rule(prelude, inner, sheet, media, ctx);
+            }
+            continue;
+        }
+        let sel: Vec<String> = split_top(pre, b',').into_iter().flat_map(|c| parents.iter().map(move |p| nest_selector(p, c.trim()))).collect();
+        parse_style_rule(&sel.join(", "), inner, sheet, media, ctx);
     }
 }
 
@@ -2626,66 +3064,209 @@ fn media_px(v: &str) -> f32 {
 }
 
 fn eval_media_one(p: &str, m: &Media) -> bool {
+    let p = p.trim();
+    // `a or b` at the top level (media queries level 4).
+    if p.contains(" or ") {
+        return split_words_top(p, "or").iter().any(|q| eval_media_one(q, m));
+    }
     let (neg, p) = match p.strip_prefix("not ") {
         Some(r) => (true, r.trim()),
         None => (false, p),
     };
     let p = p.strip_prefix("only ").unwrap_or(p).trim();
     let ty = p.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
-    let mut ok = matches!(ty, "" | "screen" | "all" | "and");
+    let mut ok = matches!(ty, "" | "screen" | "all" | "and" | "not");
     let mut rest = p;
     while ok {
         let Some(open) = rest.find('(') else { break };
-        let Some(close) = rest[open..].find(')') else { break };
-        let f = &rest[open + 1..open + close];
-        rest = &rest[open + close + 1..];
-        let r = if let Some((name, val)) = f.split_once(':') {
-            let val = val.trim();
-            match name.trim() {
-                "min-width" => m.vw >= media_px(val),
-                "max-width" => m.vw <= media_px(val),
-                "min-height" => m.vh >= media_px(val),
-                "max-height" => m.vh <= media_px(val),
-                "prefers-color-scheme" => val == "light",
-                "prefers-reduced-motion" => val == "no-preference",
-                "prefers-contrast" => val == "no-preference",
-                "orientation" => (val == "landscape") == (m.vw >= m.vh),
-                "hover" | "any-hover" => val == "hover",
-                "pointer" | "any-pointer" => val == "fine",
-                "min-resolution" | "-webkit-min-device-pixel-ratio" | "min--moz-device-pixel-ratio" => {
-                    media_px(val) <= 1.0
-                }
-                _ => true,
-            }
-        } else if f.contains('<') || f.contains('>') {
-            // Range syntax: (width >= 600px), (400px < width < 800px)
-            let dim = if f.contains("height") { m.vh } else { m.vw };
-            let norm = f.replace("width", " W ").replace("height", " W ");
-            let toks: Vec<&str> = norm.split_whitespace().collect();
-            let mut res = true;
-            for w in toks.windows(3) {
-                let (a, op, b) = (w[0], w[1], w[2]);
-                let (l, r) = match (a, b) {
-                    ("W", v) => (dim, media_px(v)),
-                    (v, "W") => (media_px(v), dim),
-                    _ => continue,
-                };
-                res &= match op {
-                    ">=" => l >= r,
-                    "<=" => l <= r,
-                    ">" => l > r,
-                    "<" => l < r,
-                    "=" => l == r,
-                    _ => true,
-                };
-            }
-            res
+        let Some(close) = match_paren(rest, open) else { break };
+        // `not (feature)` inside a condition
+        let negate = rest[..open].trim_end().ends_with("not");
+        let f = rest[open + 1..close].trim();
+        rest = &rest[close + 1..];
+        let r = if f.starts_with('(') || f.starts_with("not ") || f.contains(" or ") {
+            eval_media_one(f, m)
         } else {
-            true
+            media_feature(f, m)
         };
-        ok &= r;
+        ok &= r != negate;
     }
     ok != neg
+}
+
+/// Split at top-level occurrences of the word `w`.
+fn split_words_top<'a>(s: &'a str, w: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let (mut depth, mut start) = (0i32, 0);
+    let b = s.as_bytes();
+    let pat = format!(" {w} ");
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 && s[i..].starts_with(&pat) => {
+                out.push(s[start..i].trim());
+                i += pat.len();
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(s[start..].trim());
+    out
+}
+
+fn match_paren(s: &str, open: usize) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in s[open..].char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(open + i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn media_ratio(v: &str) -> f32 {
+    match v.split_once('/') {
+        Some((a, b)) => a.trim().parse::<f32>().unwrap_or(0.0) / b.trim().parse::<f32>().unwrap_or(1.0).max(1e-6),
+        None => v.trim().parse().unwrap_or(0.0),
+    }
+}
+
+fn media_resolution(v: &str) -> f32 {
+    let v = v.trim();
+    if let Some(n) = v.strip_suffix("dppx").or_else(|| v.strip_suffix('x')) {
+        n.parse().unwrap_or(1.0)
+    } else if let Some(n) = v.strip_suffix("dpi") {
+        n.parse::<f32>().unwrap_or(96.0) / 96.0
+    } else if let Some(n) = v.strip_suffix("dpcm") {
+        n.parse::<f32>().unwrap_or(37.8) * 2.54 / 96.0
+    } else {
+        v.parse().unwrap_or(1.0)
+    }
+}
+
+/// One media feature test, e.g. `min-width: 600px`, `width >= 600px`, `hover`.
+fn media_feature(f: &str, m: &Media) -> bool {
+    // Value of a feature by name, for range comparisons.
+    let value = |name: &str| -> Option<f32> {
+        Some(match name {
+            "width" | "device-width" => m.vw,
+            "height" | "device-height" => m.vh,
+            "aspect-ratio" | "device-aspect-ratio" => m.vw / m.vh.max(1.0),
+            "resolution" => 1.0,
+            "color" => 8.0,
+            "monochrome" | "color-index" | "grid" => 0.0,
+            _ => return None,
+        })
+    };
+    let parse_val = |name: &str, v: &str| -> f32 {
+        match name {
+            "aspect-ratio" | "device-aspect-ratio" => media_ratio(v),
+            "resolution" => media_resolution(v),
+            "color" | "monochrome" | "color-index" | "grid" => v.trim().parse().unwrap_or(0.0),
+            _ => media_px(v),
+        }
+    };
+    if f.contains(['<', '>', '=']) && !f.contains(':') {
+        // Range syntax: (width >= 600px), (400px < width <= 800px)
+        let mut toks: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut chars = f.chars().peekable();
+        while let Some(c) = chars.next() {
+            if matches!(c, '<' | '>' | '=') {
+                if !cur.trim().is_empty() {
+                    toks.push(cur.trim().to_owned());
+                }
+                cur.clear();
+                let mut op = c.to_string();
+                if chars.peek() == Some(&'=') {
+                    op.push(chars.next().unwrap());
+                }
+                toks.push(op);
+            } else {
+                cur.push(c);
+            }
+        }
+        if !cur.trim().is_empty() {
+            toks.push(cur.trim().to_owned());
+        }
+        let name = toks.iter().find(|t| value(t).is_some()).cloned();
+        let Some(name) = name else { return false };
+        let dim = value(&name).unwrap_or(0.0);
+        let mut res = true;
+        for w in toks.windows(3) {
+            let (a, op, b) = (&w[0], w[1].as_str(), &w[2]);
+            let (l, r) = if *a == name {
+                (dim, parse_val(&name, b))
+            } else if *b == name {
+                (parse_val(&name, a), dim)
+            } else {
+                continue;
+            };
+            res &= match op {
+                ">=" => l >= r,
+                "<=" => l <= r,
+                ">" => l > r,
+                "<" => l < r,
+                "=" => (l - r).abs() < 0.01,
+                _ => true,
+            };
+        }
+        return res;
+    }
+    let (name, val) = match f.split_once(':') {
+        Some((n, v)) => (n.trim(), Some(v.trim())),
+        None => (f.trim(), None),
+    };
+    let Some(val) = val else {
+        // Boolean context: true unless the feature's value is 0 / none.
+        return match name {
+            "hover" | "any-hover" | "pointer" | "any-pointer" | "color" | "width" | "height" | "aspect-ratio" | "resolution" | "scripting" | "update" | "orientation" => true,
+            _ => false,
+        };
+    };
+    if let Some(base) = name.strip_prefix("min-") {
+        if let Some(v) = value(base).or_else(|| (base == "device-pixel-ratio").then_some(1.0)) {
+            return v >= parse_val(base, val) - 0.001;
+        }
+    }
+    if let Some(base) = name.strip_prefix("max-") {
+        if let Some(v) = value(base).or_else(|| (base == "device-pixel-ratio").then_some(1.0)) {
+            return v <= parse_val(base, val) + 0.001;
+        }
+    }
+    match name {
+        "-webkit-min-device-pixel-ratio" | "min--moz-device-pixel-ratio" => media_resolution(val) <= 1.0,
+        "-webkit-max-device-pixel-ratio" | "max--moz-device-pixel-ratio" => media_resolution(val) >= 1.0,
+        "prefers-color-scheme" => val == "light",
+        "prefers-reduced-motion" | "prefers-reduced-transparency" | "prefers-reduced-data" | "prefers-contrast" => val == "no-preference",
+        "orientation" => (val == "landscape") == (m.vw >= m.vh),
+        "hover" | "any-hover" => val == "hover",
+        "pointer" | "any-pointer" => val == "fine",
+        "display-mode" => val == "browser",
+        "forced-colors" | "inverted-colors" => val == "none",
+        "scripting" => val == "enabled",
+        "update" => val == "fast",
+        "dynamic-range" | "video-dynamic-range" => val == "standard",
+        "color-gamut" => val == "srgb",
+        "overflow-block" => val == "scroll",
+        "overflow-inline" => val == "scroll",
+        _ => match value(name) {
+            Some(v) => (v - parse_val(name, val)).abs() < 0.5,
+            None => false,
+        },
+    }
 }
 
 // ---------------------------------------------------------- selector parsing
@@ -2751,6 +3332,38 @@ fn split_top(s: &str, sep: u8) -> Vec<&str> {
 
 pub fn parse_selector_list(s: &str) -> Vec<Selector> {
     split_top(s, b',').into_iter().filter_map(|p| parse_selector(p.trim())).collect()
+}
+
+thread_local! {
+    /// A stylesheet used :hover / :active (the page restyles on pointer moves).
+    static HOVER_RULES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn hover_rules_seen() -> bool {
+    HOVER_RULES.with(|h| h.get())
+}
+
+fn max_spec(list: &[Selector]) -> u32 {
+    list.iter().map(|s| s.spec).max().unwrap_or(0)
+}
+
+fn compound_spec(c: &Compound) -> u32 {
+    let mut spec = if c.id.is_some() { 1 << 16 } else { 0 };
+    spec += ((c.classes.len() + c.attrs.len()) as u32) << 8;
+    if c.tag.is_some() {
+        spec += 1;
+    }
+    for p in &c.pseudos {
+        spec += match p {
+            Pseudo::Is(_, true) | Pseudo::Always => 0,
+            Pseudo::Is(l, false) | Pseudo::Not(l) => max_spec(l),
+            Pseudo::Has(l) => l.iter().map(|(_, s)| s.spec).max().unwrap_or(0),
+            Pseudo::Before | Pseudo::After => 1,
+            Pseudo::Host(l) | Pseudo::Slotted(l) => (1 << 8) + l.iter().map(compound_spec).max().unwrap_or(0),
+            _ => 1 << 8,
+        };
+    }
+    spec
 }
 
 fn parse_compound_list(s: &str) -> Option<Vec<Compound>> {
@@ -2891,15 +3504,54 @@ fn parse_compound(s: &str, mut i: usize) -> Option<(Compound, usize)> {
                         "checked" => Pseudo::Checked,
                         "disabled" => Pseudo::Disabled,
                         "placeholder-shown" => Pseudo::PlaceholderShown,
-                        "not" => parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Not),
-                        "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => {
-                            parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Is)
+                        "not" => {
+                            let l = parse_selector_list(arg);
+                            if l.is_empty() { Pseudo::Never } else { Pseudo::Not(l) }
                         }
+                        "is" | "where" | "matches" | "-webkit-any" | "-moz-any" => {
+                            let l = parse_selector_list(arg);
+                            if l.is_empty() { Pseudo::Never } else { Pseudo::Is(l, name == "where") }
+                        }
+                        "has" => {
+                            let mut rel = Vec::new();
+                            for part in split_top(arg, b',') {
+                                let p = part.trim();
+                                let (comb, rest) = match p.as_bytes().first() {
+                                    Some(b'>') => (Some(Comb::Child), &p[1..]),
+                                    Some(b'+') => (Some(Comb::Next), &p[1..]),
+                                    Some(b'~') => (Some(Comb::Subsequent), &p[1..]),
+                                    _ => (None, p),
+                                };
+                                if let Some(sel) = parse_selector(rest.trim()) {
+                                    rel.push((comb, sel));
+                                }
+                            }
+                            if rel.is_empty() { Pseudo::Never } else { Pseudo::Has(rel) }
+                        }
+                        "nth-of-type" => parse_nth(arg).map_or(Pseudo::Never, |(a, b)| Pseudo::NthOfType(a, b)),
+                        "nth-last-of-type" => parse_nth(arg).map_or(Pseudo::Never, |(a, b)| Pseudo::NthLastOfType(a, b)),
+                        "only-of-type" => Pseudo::OnlyOfType,
+                        "hover" => {
+                            HOVER_RULES.with(|h| h.set(true));
+                            Pseudo::Hover
+                        }
+                        "active" => {
+                            HOVER_RULES.with(|h| h.set(true));
+                            Pseudo::Active
+                        }
+                        "target" => Pseudo::Target,
+                        "enabled" => Pseudo::Enabled,
+                        "required" => Pseudo::Required,
+                        "optional" => Pseudo::Optional,
+                        "read-only" | "-moz-read-only" => Pseudo::ReadOnly,
+                        "read-write" | "-moz-read-write" => Pseudo::ReadWrite,
+                        "scope" => Pseudo::Root,
+                        "dir" if arg.trim() == "ltr" => Pseudo::Always,
+                        "defined" | "valid" | "user-valid" | "in-range" | "lang" => Pseudo::Always,
                         "before" => Pseudo::Before,
                         "after" => Pseudo::After,
                         "host" | "host-context" if arg.trim().is_empty() => Pseudo::Host(Vec::new()),
                         "host" | "host-context" => parse_compound_list(arg).map_or(Pseudo::Never, Pseudo::Host),
-                        "enabled" | "defined" => continue,
                         _ => Pseudo::Never,
                     }
                 };
@@ -2951,16 +3603,7 @@ fn parse_selector(s: &str) -> Option<Selector> {
     }
     comps.reverse();
     combs.reverse();
-    let mut spec = 0u32;
-    for c in &comps {
-        if c.id.is_some() {
-            spec += 1 << 16;
-        }
-        spec += ((c.classes.len() + c.attrs.len() + c.pseudos.len()) as u32) << 8;
-        if c.tag.is_some() {
-            spec += 1;
-        }
-    }
+    let spec = comps.iter().map(compound_spec).sum();
     // Ancestor atoms: compounds reachable from the subject via child/descendant.
     let mut ancestor_atoms = Vec::new();
     for (idx, comb) in combs.iter().enumerate() {

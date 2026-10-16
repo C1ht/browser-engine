@@ -858,6 +858,14 @@ impl Browser {
                 self.hover = hover.clone();
                 dirty = true;
             }
+            // :hover / :active and mouse events.
+            let under = match (mouse, &self.page) {
+                (Some((mx, my)), Some(p)) if my as usize >= BAR => p.tree.node_at(mx, my - BAR as f32 + self.scroll.round()),
+                _ => None,
+            };
+            if self.page.as_mut().is_some_and(|p| p.set_pointer(under, down)) {
+                dirty = true;
+            }
             if clicked {
                 if let Some((mx, my)) = mouse {
                     if (my as usize) < BAR {
