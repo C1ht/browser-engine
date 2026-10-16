@@ -511,14 +511,16 @@ fn obj_define_property(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let set = it.get(&d, "set")?;
     let enumerable = it.get(&d, "enumerable")?.truthy();
     if let Value::Obj(ob) = &o {
-        if Interp::is_callable(&get) || Interp::is_callable(&set) {
+        // (Check callability before borrowing: the accessor may be `o` itself.)
+        let (has_get, has_set) = (Interp::is_callable(&get), Interp::is_callable(&set));
+        if has_get || has_set {
             let mut b = ob.borrow_mut();
             let prev = b.props.get(&key).cloned();
             let mut p = prev.unwrap_or(Prop { v: Value::Undef, get: None, set: None, enumerable });
-            if Interp::is_callable(&get) {
+            if has_get {
                 p.get = Some(get);
             }
-            if Interp::is_callable(&set) {
+            if has_set {
                 p.set = Some(set);
             }
             b.props.insert(key, p);

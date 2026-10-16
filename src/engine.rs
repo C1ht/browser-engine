@@ -178,7 +178,7 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
     let script_urls: Vec<String> = doc
         .scripts
         .iter()
-        .filter(|&&s| is_js(&doc, s))
+        .filter(|&&s| matches!(script_kind(&doc, s), ScriptKind::Classic | ScriptKind::Module))
         .filter_map(|&s| doc.attr(s, k::src))
         .map(|h| net::resolve(&base, h.trim()))
         .collect();
@@ -190,12 +190,59 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
     Ok(Loaded { url, html, css, doc, scripts, fetch_ms: fetch_html + ms(t), parse_ms })
 }
 
-/// Is this <script> classic JavaScript we should run?
-fn is_js(doc: &Document, s: NodeId) -> bool {
-    match doc.attr(s, k::type_).map(|t| t.trim().to_ascii_lowercase()) {
-        None => true,
-        Some(t) => t.is_empty() || t.contains("javascript") || t.contains("ecmascript"),
+#[derive(Clone, Copy, PartialEq)]
+enum ScriptKind {
+    Classic,
+    Module,
+    ImportMap,
+    /// Data blocks (`type=application/json`...) and `nomodule` fallbacks.
+    Other,
+}
+
+fn script_kind(doc: &Document, s: NodeId) -> ScriptKind {
+    let nomodule = crate::atom::lookup("nomodule").is_some_and(|a| doc.attr(s, a).is_some());
+    match doc.attr(s, k::type_).map(|t| t.trim().to_ascii_lowercase()).as_deref() {
+        Some("module") => ScriptKind::Module,
+        Some("importmap") => ScriptKind::ImportMap,
+        _ if nomodule => ScriptKind::Other,
+        None | Some("") => ScriptKind::Classic,
+        Some(t) if t.contains("javascript") || t.contains("ecmascript") || t == "text/jscript" => ScriptKind::Classic,
+        _ => ScriptKind::Other,
     }
+}
+
+fn has_attr(doc: &Document, s: NodeId, name: &str) -> bool {
+    crate::atom::lookup(name).is_some_and(|a| doc.attr(s, a).is_some())
+}
+
+/// Run one `<script>` element (classic or module).
+fn run_script_node(it: &mut js::Interp, s: NodeId, kind: ScriptKind, sources: &FxHashMap<String, String>, base: &str) {
+    let src = it.doc.attr(s, k::src).map(|v| net::resolve(base, v.trim()));
+    let inline = || {
+        let mut c = String::new();
+        it.doc.text_content(s, &mut c);
+        c
+    };
+    if kind == ScriptKind::Module {
+        match src {
+            Some(url) => {
+                if let Some(code) = sources.get(&url) {
+                    it.module_sources.insert(url.clone(), code.clone());
+                }
+                it.run_module(&url, None);
+            }
+            None => {
+                let code = inline();
+                it.run_module(base, Some(code));
+            }
+        }
+        return;
+    }
+    let code = match src {
+        Some(url) => sources.get(&url).cloned().unwrap_or_default(),
+        None => inline(),
+    };
+    run_one(it, &code);
 }
 
 /// Wall-clock budget for running a page's scripts at load.
@@ -216,20 +263,35 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, ba
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
     it.deadline = Some(t0 + std::time::Duration::from_millis(SCRIPT_BUDGET as u64));
+    // Parser-blocking classic scripts run in order; `defer` and module
+    // scripts after them (in order), then `async` ones.
+    let (mut deferred, mut later) = (Vec::new(), Vec::new());
     for s in scripts {
-        if !is_js(&it.doc, s) || ms(t0) > SCRIPT_BUDGET {
-            continue;
-        }
-        let code = match it.doc.attr(s, k::src) {
-            Some(src) => sources.get(&net::resolve(base, src.trim())).cloned().unwrap_or_default(),
-            None => {
+        let kind = script_kind(&it.doc, s);
+        let external = it.doc.attr(s, k::src).is_some();
+        match kind {
+            ScriptKind::ImportMap => {
                 let mut c = String::new();
                 it.doc.text_content(s, &mut c);
-                c
+                it.add_import_map(&c, base);
             }
-        };
-        run_one(&mut it, &code);
-        run_pending(&mut it, &t0);
+            ScriptKind::Other => {}
+            _ if has_attr(&it.doc, s, "async") && (external || kind == ScriptKind::Module) => later.push((s, kind)),
+            ScriptKind::Module => deferred.push((s, kind)),
+            ScriptKind::Classic if external && has_attr(&it.doc, s, "defer") => deferred.push((s, kind)),
+            ScriptKind::Classic => {
+                if ms(t0) <= SCRIPT_BUDGET {
+                    run_script_node(&mut it, s, kind, sources, base);
+                    run_pending(&mut it, &t0);
+                }
+            }
+        }
+    }
+    for (s, kind) in deferred.into_iter().chain(later) {
+        if ms(t0) <= SCRIPT_BUDGET {
+            run_script_node(&mut it, s, kind, sources, base);
+            run_pending(&mut it, &t0);
+        }
     }
     js::dombind::dispatch(&mut it, 0, "DOMContentLoaded", |_, _| {});
     js::dombind::dispatch(&mut it, js::WINDOW, "load", |_, _| {});

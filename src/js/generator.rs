@@ -69,6 +69,36 @@ impl Interp {
         Some(Value::Obj(promise))
     }
 
+    /// Run `job` like an async function body (it may `await`); returns the
+    /// promise for its result.
+    pub(crate) fn start_job(&mut self, job: Box<dyn FnOnce(&mut Interp) -> R<Value>>) -> Value {
+        if !coro::supported() {
+            // The body can't suspend; run it to completion now.
+            return match job(self) {
+                Ok(v) => builtins::promise_resolved(self, v),
+                Err(e) => builtins::promise_rejected(self, e),
+            };
+        }
+        let ip: *mut Interp = self;
+        let co = coro::Co::new(Box::new(move |first| {
+            // SAFETY: as in `make_coro`.
+            let it = unsafe { &mut *ip };
+            match first {
+                Resume::Next(_) => job(it),
+                Resume::Throw(e) => Err(e),
+                Resume::Return(v) => Ok(v),
+            }
+        }));
+        let promise = builtins::new_promise(self);
+        let Some(co) = co else {
+            return builtins::promise_rejected(self, type_error("could not start coroutine"));
+        };
+        let g = Gen { co: Some(co), coro: true, is_async: true, promise: Some(promise.clone()), ..Gen::default() };
+        let holder = self.new_obj(None, Kind::Generator(Box::new(g)));
+        self.co_drive(&holder, Resume::Next(Value::Undef));
+        Value::Obj(promise)
+    }
+
     /// Resume `holder`'s coroutine, tracking the running-coroutine stack and
     /// giving the body its own call depth.
     fn run_co(&mut self, holder: &ObjRef, co: &coro::Co, r: Resume) -> Out {

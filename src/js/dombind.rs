@@ -118,6 +118,20 @@ fn insert(it: &mut Interp, parent: NodeId, child: NodeId, before: NodeId) {
 }
 
 fn run_inserted_script(it: &mut Interp, s: NodeId) {
+    if it.doc.attr(s, k::type_).is_some_and(|t| t.trim().eq_ignore_ascii_case("module")) {
+        let base = it.url.clone();
+        match it.doc.attr(s, k::src) {
+            Some(src) => {
+                let url = crate::net::resolve(&base, src);
+                it.run_module(&url, None);
+            }
+            None => {
+                let code = text_of(it, s);
+                it.run_module(&base, Some(code));
+            }
+        }
+        return;
+    }
     if let Some(src) = it.doc.attr(s, k::src) {
         let url = crate::net::resolve(&it.url, src);
         it.pending_scripts.push(url);
@@ -399,6 +413,7 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "URL" | "documentURI" if doc_node => Value::str(&it.url),
         "cookie" if doc_node => Value::str(&it.cookie),
         "referrer" if doc_node => Value::str(""),
+        "domain" if doc_node => Value::str(&crate::js::web::parse_url(&it.url).map(|p| p.hostname).unwrap_or_default()),
         "characterSet" | "charset" if doc_node => Value::str("UTF-8"),
         "compatMode" if doc_node => Value::str(if it.doc.quirks { "BackCompat" } else { "CSS1Compat" }),
         "defaultView" if doc_node => Value::Obj(it.global.clone()),

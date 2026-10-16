@@ -8,6 +8,7 @@ pub mod coro;
 pub mod dombind;
 pub mod generator;
 pub mod iter;
+pub mod module;
 pub mod proxy;
 pub mod lexer;
 pub mod parser;
@@ -375,6 +376,13 @@ pub struct Interp {
     pub url_events: Vec<UrlEvent>,
     /// history.go(n) requested by a script.
     pub history_go: Option<i32>,
+    /// ES modules, by id; `module_map` maps URLs to ids.
+    pub modules: Vec<module::Module>,
+    pub module_map: FxHashMap<String, usize>,
+    /// Prefetched module sources by URL.
+    pub module_sources: FxHashMap<String, String>,
+    /// Import map entries (specifier or prefix -> URL), longest first.
+    pub import_map: Vec<(String, String)>,
     /// Generators / async calls whose coroutines are running, innermost last.
     pub co_stack: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
@@ -433,6 +441,10 @@ impl Interp {
             hist_pos: 0,
             url_events: Vec::new(),
             history_go: None,
+            modules: Vec::new(),
+            module_map: FxHashMap::default(),
+            module_sources: FxHashMap::default(),
+            import_map: Vec::new(),
             co_stack: Vec::new(),
             nav: None,
             submit_form: None,
@@ -1085,8 +1097,14 @@ impl Interp {
     pub fn lookup(&mut self, name: &str, env: &Env) -> R<Value> {
         let mut cur = Some(env);
         while let Some(s) = cur {
-            if let Some(v) = s.vars.borrow().get(name) {
-                return Ok(v.clone());
+            let found = s.vars.borrow().get(name).cloned();
+            if let Some(v) = found {
+                if let Value::Str(m) = &v {
+                    if m.starts_with(module::IMPORT_MARK) {
+                        return self.import_binding(m);
+                    }
+                }
+                return Ok(v);
             }
             cur = s.parent.as_ref();
         }
@@ -1923,6 +1941,11 @@ impl Interp {
                 let v = self.eval(x, env)?;
                 builtins::await_value(self, v)?
             }
+            Expr::ImportCall(x) => {
+                let spec = self.eval(x, env)?;
+                self.dynamic_import(spec, env)
+            }
+            Expr::ImportMeta => self.import_meta(env),
             Expr::Yield(arg, delegate) => {
                 let v = match arg {
                     Some(a) => self.eval(a, env)?,
@@ -2327,7 +2350,8 @@ fn expr_has_closure(e: &Expr) -> bool {
             PropDef::Getter(..) | PropDef::Setter(..) => true,
             PropDef::Spread(e) => expr_has_closure(e),
         }),
-        Expr::Unary(_, x) | Expr::Await(x) => expr_has_closure(x),
+        Expr::Unary(_, x) | Expr::Await(x) | Expr::ImportCall(x) => expr_has_closure(x),
+        Expr::ImportMeta => false,
         Expr::Yield(x, _) => x.as_deref().is_some_and(expr_has_closure),
         Expr::Update { target, .. } => expr_has_closure(target),
         Expr::Binary(_, a, b) | Expr::Logical(_, a, b) | Expr::Index(a, b, _) => expr_has_closure(a) || expr_has_closure(b),
@@ -2510,6 +2534,49 @@ mod tests {
                 "2 0 false",
                 "1,9,3 3,4,3,4 1,3",
                 "10,20,30 1,2 function",
+            ]
+        );
+    }
+
+    #[test]
+    fn es_modules() {
+        let dir = std::env::temp_dir().join(format!("bolt-modules-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        let files = [
+            ("main.js", r#"
+                import def, { count, inc, fromB as b } from './a.js';
+                import * as ns from './lib/all.js';
+                import { util } from 'lib/';
+                inc(); inc();
+                console.log(def(), count, b(), Object.keys(ns).join(), ns.c, util);
+                console.log(import.meta.url.endsWith('/main.js'), import.meta.resolve('./x.js').endsWith('/x.js'));
+                const dyn = await import('./lib/c.js');
+                console.log('dyn', dyn.c, dyn.default);
+                export const done = true;
+            "#),
+            ("a.js", "import { b } from './b.js';\nexport let count = 0;\nexport function inc() { count++; }\nexport function fromB() { return b(); }\nexport default function () { return 'def'; }\nexport { fromB as fromBAlias };\n"),
+            ("b.js", "import { count } from './a.js';\nexport function b() { return 'b sees ' + count; }\n"),
+            ("lib/all.js", "export * from './c.js';\nexport * as cns from './c.js';\nexport const own = 1;\n"),
+            ("lib/c.js", "await null;\nexport const c = 'C';\nexport default 'cdef';\n"),
+            ("lib/util.js", "export const util = 'U';\n"),
+        ];
+        for (name, src) in files {
+            std::fs::write(dir.join(name), src).unwrap();
+        }
+        let base = format!("file:///{}/", dir.display().to_string().replace('\\', "/").trim_start_matches('/'));
+        let mut it = Interp::new(Document::new(), &base, 800.0, 600.0);
+        it.add_import_map(&format!(r#"{{"imports": {{"lib/": "{base}lib/util.js?"}}}}"#), &base);
+        // `lib/` maps to a prefix: "lib/" -> ".../lib/util.js?" + "".
+        it.run_module(&format!("{base}main.js"), None);
+        it.run_microtasks();
+        it.run_timers(1e9);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            it.console,
+            vec![
+                "def 2 b sees 2 c,cns,own C U".to_string(),
+                "true true".to_string(),
+                "dyn C cdef".to_string(),
             ]
         );
     }

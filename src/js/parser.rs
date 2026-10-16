@@ -33,6 +33,10 @@ pub enum Expr {
     Index(Box<Expr>, Box<Expr>, bool),
     Seq(Vec<Expr>),
     Await(Box<Expr>),
+    /// `import(specifier)`.
+    ImportCall(Box<Expr>),
+    /// `import.meta`.
+    ImportMeta,
     /// `yield` / `yield*`
     Yield(Option<Box<Expr>>, bool),
     TaggedTemplate(Box<Expr>, Vec<Name>, Vec<Expr>),
@@ -146,13 +150,79 @@ pub struct Parser {
     in_func: bool,
     /// Inside a generator body (`yield` is an operator).
     in_gen: bool,
+    /// Parsing a module: import / export declarations are collected here.
+    module: Option<ModuleInfo>,
+}
+
+/// What a module imports and exports (its body has the `import` / `export`
+/// syntax stripped; exported declarations remain as plain statements).
+#[derive(Debug, Default)]
+pub struct ModuleInfo {
+    /// Module specifiers, in source order (deduplicated).
+    pub requests: Vec<Name>,
+    /// (imported name, local name, request index).
+    pub imports: Vec<(ImportName, Name, usize)>,
+    pub exports: Vec<ExportEntry>,
+}
+
+#[derive(Debug)]
+pub enum ImportName {
+    /// `import x from` (the "default" export).
+    Named(Name),
+    /// `import * as ns from`.
+    Namespace,
+}
+
+#[derive(Debug)]
+pub enum ExportEntry {
+    /// A binding of this module.
+    Local { local: Name, exported: Name },
+    /// `export { a as b } from "m"`; imported "*" = `export * as b from`.
+    Indirect { req: usize, imported: Name, exported: Name },
+    /// `export * from "m"`.
+    Star { req: usize },
+}
+
+/// The local binding `export default <expression>` creates.
+pub const DEFAULT_LOCAL: &str = "*default*";
+
+fn bound_names(p: &Pattern, out: &mut Vec<Name>) {
+    match p {
+        Pattern::Ident(n) => out.push(n.clone()),
+        Pattern::Expr(_) => {}
+        Pattern::Object(props, rest) => {
+            props.iter().for_each(|(_, p)| bound_names(p, out));
+            if let Some(r) = rest {
+                bound_names(r, out);
+            }
+        }
+        Pattern::Array(items, rest) => {
+            items.iter().flatten().for_each(|p| bound_names(p, out));
+            if let Some(r) = rest {
+                bound_names(r, out);
+            }
+        }
+        Pattern::Default(p, _) => bound_names(p, out),
+    }
+}
+
+/// Parse an ES module.
+pub fn parse_module(src: &str) -> PResult<(Vec<Stmt>, ModuleInfo)> {
+    let toks = tokenize(src).map_err(|e| format!("SyntaxError: {} at {}", e.0, e.1))?;
+    // Top-level await is allowed in modules.
+    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false, module: Some(ModuleInfo::default()) };
+    let mut out = Vec::new();
+    while !p.at_eof() {
+        out.push(p.statement()?);
+    }
+    Ok((out, p.module.take().unwrap_or_default()))
 }
 
 pub type PResult<T> = Result<T, String>;
 
 pub fn parse_program(src: &str) -> PResult<Vec<Stmt>> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {} at {}", e.0, e.1))?;
-    let mut p = Parser { toks, i: 0, in_func: false, in_gen: false };
+    let mut p = Parser { toks, i: 0, in_func: false, in_gen: false, module: None };
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.statement()?);
@@ -173,7 +243,7 @@ pub fn parse_function(params: &[&str], body: &str) -> PResult<Rc<FuncDef>> {
 
 fn parse_expr_src(src: &str) -> PResult<Expr> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {}", e.0))?;
-    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false };
+    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false, module: None };
     let e = p.expression(false)?;
     if !p.at_eof() {
         return Err("SyntaxError: junk in template expression".into());
@@ -403,8 +473,16 @@ impl Parser {
                     }
                     Ok(Stmt::Switch(d, cases))
                 }
-                "import" if !matches!(self.peek_at(1), Tok::Punct("(") | Tok::Punct(".")) => self.err("modules are not supported"),
-                "export" => self.err("modules are not supported"),
+                "import" if self.module.is_some() && !matches!(self.peek_at(1), Tok::Punct("(") | Tok::Punct(".")) => {
+                    self.next();
+                    self.import_decl()
+                }
+                "export" if self.module.is_some() => {
+                    self.next();
+                    self.export_decl()
+                }
+                "import" if !matches!(self.peek_at(1), Tok::Punct("(") | Tok::Punct(".")) => self.err("Cannot use import statement outside a module"),
+                "export" => self.err("Unexpected token 'export'"),
                 _ if matches!(self.peek_at(1), Tok::Punct(":")) && !matches!(&*w, "true" | "false" | "null" | "this") => {
                     self.next();
                     self.next();
@@ -420,6 +498,178 @@ impl Parser {
         let e = self.expression(false)?;
         self.semicolon()?;
         Ok(Stmt::Expr(e))
+    }
+
+    // --------------------------------------------------------------- modules
+
+    fn request(&mut self) -> PResult<usize> {
+        let spec = match self.next() {
+            Tok::Str(s) => s,
+            t => return Err(format!("SyntaxError: expected module specifier, got {t:?}")),
+        };
+        // Import attributes (`with { type: "json" }`) are ignored.
+        if (self.is_word("with") || self.is_word("assert")) && !self.nl_before() {
+            self.next();
+            self.expect("{")?;
+            let mut depth = 1;
+            while depth > 0 && !self.at_eof() {
+                match self.next() {
+                    Tok::Punct("{") => depth += 1,
+                    Tok::Punct("}") => depth -= 1,
+                    _ => {}
+                }
+            }
+        }
+        let m = self.module.as_mut().unwrap();
+        Ok(match m.requests.iter().position(|r| *r == spec) {
+            Some(i) => i,
+            None => {
+                m.requests.push(spec);
+                m.requests.len() - 1
+            }
+        })
+    }
+
+    /// An import / export binding name (identifier or string).
+    fn module_name(&mut self) -> PResult<Name> {
+        match self.next() {
+            Tok::Ident(s) | Tok::Str(s) => Ok(s),
+            t => Err(format!("SyntaxError: expected name, got {t:?}")),
+        }
+    }
+
+    fn import_decl(&mut self) -> PResult<Stmt> {
+        if matches!(self.peek(), Tok::Str(_)) {
+            self.request()?;
+            self.semicolon()?;
+            return Ok(Stmt::Empty);
+        }
+        let mut specs: Vec<(ImportName, Name)> = Vec::new();
+        if matches!(self.peek(), Tok::Ident(_)) {
+            let local = self.ident()?;
+            specs.push((ImportName::Named("default".into()), local));
+            self.eat(",");
+        }
+        if self.eat("*") {
+            if !self.eat_word("as") {
+                return self.err("expected 'as'");
+            }
+            specs.push((ImportName::Namespace, self.ident()?));
+        } else if self.eat("{") {
+            while !self.eat("}") {
+                let imported = self.module_name()?;
+                let local = if self.eat_word("as") { self.ident()? } else { imported.clone() };
+                specs.push((ImportName::Named(imported), local));
+                if !self.eat(",") {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+        }
+        if !self.eat_word("from") {
+            return self.err("expected 'from'");
+        }
+        let req = self.request()?;
+        self.semicolon()?;
+        let m = self.module.as_mut().unwrap();
+        for (name, local) in specs {
+            m.imports.push((name, local, req));
+        }
+        Ok(Stmt::Empty)
+    }
+
+    fn export_local(&mut self, local: Name, exported: Name) {
+        self.module.as_mut().unwrap().exports.push(ExportEntry::Local { local, exported });
+    }
+
+    fn export_decl(&mut self) -> PResult<Stmt> {
+        if self.eat("*") {
+            let exported = if self.eat_word("as") { Some(self.module_name()?) } else { None };
+            if !self.eat_word("from") {
+                return self.err("expected 'from'");
+            }
+            let req = self.request()?;
+            self.semicolon()?;
+            let e = match exported {
+                Some(exported) => ExportEntry::Indirect { req, imported: "*".into(), exported },
+                None => ExportEntry::Star { req },
+            };
+            self.module.as_mut().unwrap().exports.push(e);
+            return Ok(Stmt::Empty);
+        }
+        if self.eat_word("default") {
+            let is_async_fn = self.is_word("async") && matches!(self.peek_at(1), Tok::Ident(x) if &**x == "function") && !self.toks[self.i + 1].nl;
+            if self.is_word("function") || is_async_fn {
+                if is_async_fn {
+                    self.next();
+                }
+                self.next();
+                let f = self.function_rest(is_async_fn, false)?;
+                return Ok(match f.name.clone() {
+                    Some(n) => {
+                        self.export_local(n, "default".into());
+                        Stmt::Func(f)
+                    }
+                    None => {
+                        self.export_local(DEFAULT_LOCAL.into(), "default".into());
+                        Stmt::Var(VarKind::Let, vec![(Pattern::Ident(DEFAULT_LOCAL.into()), Some(Expr::Func(f)))])
+                    }
+                });
+            }
+            if self.eat_word("class") {
+                let c = self.class_rest(false)?;
+                return Ok(match c.name.clone() {
+                    Some(n) => {
+                        self.export_local(n, "default".into());
+                        Stmt::Class(c)
+                    }
+                    None => {
+                        self.export_local(DEFAULT_LOCAL.into(), "default".into());
+                        Stmt::Var(VarKind::Let, vec![(Pattern::Ident(DEFAULT_LOCAL.into()), Some(Expr::Class(c)))])
+                    }
+                });
+            }
+            let e = self.assign(false)?;
+            self.semicolon()?;
+            self.export_local(DEFAULT_LOCAL.into(), "default".into());
+            return Ok(Stmt::Var(VarKind::Let, vec![(Pattern::Ident(DEFAULT_LOCAL.into()), Some(e))]));
+        }
+        if self.eat("{") {
+            let mut names = Vec::new();
+            while !self.eat("}") {
+                let local = self.module_name()?;
+                let exported = if self.eat_word("as") { self.module_name()? } else { local.clone() };
+                names.push((local, exported));
+                if !self.eat(",") {
+                    self.expect("}")?;
+                    break;
+                }
+            }
+            if self.eat_word("from") {
+                let req = self.request()?;
+                for (imported, exported) in names {
+                    self.module.as_mut().unwrap().exports.push(ExportEntry::Indirect { req, imported, exported });
+                }
+            } else {
+                for (local, exported) in names {
+                    self.export_local(local, exported);
+                }
+            }
+            self.semicolon()?;
+            return Ok(Stmt::Empty);
+        }
+        let decl = self.statement()?;
+        let mut names = Vec::new();
+        match &decl {
+            Stmt::Var(_, ds) => ds.iter().for_each(|(p, _)| bound_names(p, &mut names)),
+            Stmt::Func(f) => names.extend(f.name.clone()),
+            Stmt::Class(c) => names.extend(c.name.clone()),
+            _ => return self.err("unexpected export"),
+        }
+        for n in names {
+            self.export_local(n.clone(), n);
+        }
+        Ok(decl)
     }
 
     fn block_body(&mut self) -> PResult<Vec<Stmt>> {
@@ -977,9 +1227,17 @@ impl Parser {
                 "import" => {
                     if self.eat(".") {
                         self.ident()?;
-                        Expr::Object(Vec::new())
+                        Expr::ImportMeta
                     } else {
-                        return self.err("dynamic import is not supported");
+                        self.expect("(")?;
+                        let spec = self.assign(false)?;
+                        // An options argument (import attributes) is ignored.
+                        if self.eat(",") && !self.is(")") {
+                            self.assign(false)?;
+                            self.eat(",");
+                        }
+                        self.expect(")")?;
+                        Expr::ImportCall(Box::new(spec))
                     }
                 }
                 _ => Expr::Ident(w),
