@@ -620,15 +620,20 @@ impl Builder<'_> {
             self.mark_after_decor = None;
             self.decor_mark = Some(self.target().len());
         }
-        let (px, py) = (bx + b.b[3], by + b.b[0]);
-        let cx = px + b.p[3];
-        let cy = py + b.p[0] + b.cell_off;
-        let clipped = !b.anon && st.overflow == Ovf::Hidden;
+        let (mut px, mut py) = (bx + b.b[3], by + b.b[0]);
+        let clipped = !b.anon && st.overflow != Ovf::Visible;
         if clipped {
             let (w, h) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
             self.push(DItem::Clip { x: px, y: py, w, h });
             self.clip_stack.push([px, py, w, h]);
+            // Scrolled content moves under the clip.
+            if let Some(&(sx, sy)) = self.tree.scroll.get(&b.node) {
+                px -= sx;
+                py -= sy;
+            }
         }
+        let cx = px + b.p[3];
+        let cy = py + b.p[0] + b.cell_off;
 
         if let Some(m) = &b.marker {
             let face = self.f.pick_style(st);

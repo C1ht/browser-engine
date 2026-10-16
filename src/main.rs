@@ -819,8 +819,16 @@ impl Browser {
                 }
             }
 
-            if let Some((_, dy)) = self.window.get_scroll_wheel() {
-                self.scroll -= dy * 5.0;
+            if let Some((dx, dy)) = self.window.get_scroll_wheel() {
+                // Scroll containers under the pointer scroll first.
+                let mouse = self.window.get_mouse_pos(MouseMode::Discard);
+                let inner = match (mouse, self.page.as_mut()) {
+                    (Some((mx, my)), Some(p)) if my as usize >= BAR => p.wheel(mx, my - BAR as f32 + self.scroll.round(), -dx * 5.0, -dy * 5.0),
+                    _ => false,
+                };
+                if !inner {
+                    self.scroll -= dy * 5.0;
+                }
                 dirty = true;
             }
 

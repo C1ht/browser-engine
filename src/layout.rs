@@ -89,6 +89,10 @@ pub struct LBox {
     pub baseline: Option<f32>,
     pub colspan: u32,
     pub cell_off: f32,
+    /// Extent of the content (for scroll containers): width, height of the
+    /// content box's overflow area.
+    pub scroll_w: f32,
+    pub scroll_h: f32,
     pub img: bool,
     pub repl: (f32, f32),
     pub link: u32,
@@ -117,7 +121,13 @@ impl LayoutTree {
         let b = &self.boxes[id as usize];
         let (bx, by) = (ox + b.x + b.rel.0, oy + b.y + b.rel.1);
         f(b, bx, by);
-        let (px, py) = (bx + b.b[3], by + b.b[0]);
+        let (mut px, mut py) = (bx + b.b[3], by + b.b[0]);
+        if !b.anon {
+            if let Some(&(sx, sy)) = self.scroll.get(&b.node) {
+                px -= sx;
+                py -= sy;
+            }
+        }
         let (cx, cy) = (px + b.p[3], py + b.p[0] + b.cell_off);
         for &c in &b.children {
             if !self.boxes[c as usize].abs {
@@ -239,6 +249,8 @@ pub struct LayoutTree {
     pub height: f32,
     /// ::before / ::after box ids -> the element they belong to.
     pub pseudo_owner: crate::fx::FxHashMap<NodeId, NodeId>,
+    /// Scroll offsets of scroll containers (element -> (x, y)).
+    pub scroll: crate::fx::FxHashMap<NodeId, (f32, f32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -457,7 +469,7 @@ pub fn layout(doc: &Document, styles: &[Style], vw: f32, vh: f32, res: &Resource
         }
     }
     let pseudo_owner = (doc.nodes.len()..styles.len()).map(|p| (p as NodeId, styles[p].owner)).collect();
-    LayoutTree { boxes: e.boxes, text: e.ltext, links: e.links, root, height, pseudo_owner }
+    LayoutTree { boxes: e.boxes, text: e.ltext, links: e.links, root, height, pseudo_owner, scroll: Default::default() }
 }
 
 impl<'a> Engine<'a> {
@@ -570,6 +582,8 @@ impl<'a> Engine<'a> {
             baseline: None,
             colspan: 1,
             cell_off: 0.0,
+            scroll_w: 0.0,
+            scroll_h: 0.0,
             img: false,
             repl: (0.0, 0.0),
             link: NO_LINK,
@@ -1472,6 +1486,9 @@ impl<'a> Engine<'a> {
             content_h = content_h.max(bfc.bottom());
         }
         self.avail_h = saved_avail;
+        if !anon && st.overflow != Ovf::Visible {
+            self.record_overflow(id, w, content_h);
+        }
 
         let mut h = match def_h {
             Some(h) if !anon => h,
@@ -1487,6 +1504,26 @@ impl<'a> Engine<'a> {
         }
         self.boxes[id as usize].h = h.max(0.0);
         self.after_layout(id, cb_w);
+    }
+
+    /// Content extent of a scroll container (its scrollWidth / scrollHeight
+    /// minus padding).
+    fn record_overflow(&mut self, id: u32, w: f32, content_h: f32) {
+        let b = &self.boxes[id as usize];
+        let (mut mw, mut mh) = (w, content_h);
+        for &c in b.children.iter().chain(&b.floats) {
+            let cb = &self.boxes[c as usize];
+            mw = mw.max(cb.x + cb.border_w() + cb.m[1]);
+            mh = mh.max(cb.y + cb.border_h() + cb.m[2]);
+        }
+        for f in &b.frags {
+            if let FragKind::Text { w: tw, .. } | FragKind::InlineBox { w: tw, .. } = f.kind {
+                mw = mw.max(f.x + tw);
+            }
+        }
+        let b = &mut self.boxes[id as usize];
+        b.scroll_w = mw;
+        b.scroll_h = mh;
     }
 
     /// Relative offsets, then absolutely positioned descendants.

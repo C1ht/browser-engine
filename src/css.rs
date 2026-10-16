@@ -235,6 +235,8 @@ pub enum Prop {
     AnimName,
     AnimFill,
     AnimIter,
+    OverflowX,
+    OverflowY,
     WordBreak,
     OverflowWrap,
     TextOverflow,
@@ -2231,13 +2233,23 @@ fn parse_more(name: &str, v: &str, orig: &str, important: bool, out: &mut Vec<De
             push!(Clear, kw(k));
         }
         "overflow" | "overflow-x" | "overflow-y" => {
-            let k = match v.split_whitespace().next().unwrap_or("") {
-                "hidden" | "clip" => Kw::Hidden,
-                "auto" | "scroll" | "overlay" => Kw::Scroll,
-                "visible" => Kw::Visible,
-                _ => return true,
+            let kw_of = |t: &str| match t {
+                "hidden" | "clip" => Some(Kw::Hidden),
+                "auto" | "scroll" | "overlay" => Some(Kw::Scroll),
+                "visible" => Some(Kw::Visible),
+                _ => None,
             };
-            push!(Overflow, kw(k));
+            let toks: Vec<&str> = v.split_whitespace().collect();
+            let Some(x) = toks.first().and_then(|t| kw_of(t)) else { return true };
+            let y = toks.get(1).and_then(|t| kw_of(t)).unwrap_or(x);
+            match name {
+                "overflow-x" => push!(OverflowX, kw(x)),
+                "overflow-y" => push!(OverflowY, kw(x)),
+                _ => {
+                    push!(OverflowX, kw(x));
+                    push!(OverflowY, kw(y));
+                }
+            }
         }
         "border-radius" | "-moz-border-radius" => {
             let first = v.split('/').next().unwrap_or("");

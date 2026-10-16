@@ -10,7 +10,7 @@ use crate::fx::FxHashMap;
 use crate::image::{self, Image};
 use crate::layout::{self, LayoutTree};
 use crate::paint::{self, DisplayList};
-use crate::style::{self, Display, Style};
+use crate::style::{self, Display, Ovf, Style};
 use crate::{html, js, net};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::rc::Rc;
@@ -529,6 +529,8 @@ pub struct Page {
     scroll_changed: bool,
     /// Layout changed since geometry observers were last checked.
     geo_dirty: bool,
+    /// Scroll offsets of scroll containers (element -> (x, y)).
+    pub elem_scroll: FxHashMap<NodeId, (f32, f32)>,
     vw: f32,
     vh: f32,
 }
@@ -633,7 +635,7 @@ impl Page {
         doc.target = target_of(&doc, &l.url);
         let sheets = sheets_for(&doc, &base, &mut css);
         let (styles, tree, dl) = render(&doc, &sheets, &base, &mut res, vw, vh, &mut t);
-        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, vw, vh };
+        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, elem_scroll: FxHashMap::default(), vw, vh };
         page.sync_js_geometry();
         page.script_requests();
         // Initial IntersectionObserver / ResizeObserver callbacks (lazy
@@ -665,7 +667,60 @@ impl Page {
             it.rects = self.tree.node_rects();
             it.vw = self.vw;
             it.vh = self.vh;
+            // scrollWidth / scrollHeight / clientWidth / clientHeight
+            it.scroll_metrics.clear();
+            for b in &self.tree.boxes {
+                if b.anon || it.scroll_metrics.contains_key(&b.node) {
+                    continue;
+                }
+                let (cw, ch) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
+                let (sw, sh) = (cw.max(b.scroll_w + b.p[1] + b.p[3]), ch.max(b.scroll_h + b.p[0] + b.p[2]));
+                it.scroll_metrics.insert(b.node, [sw, sh, cw, ch]);
+            }
+            it.elem_scroll = self.elem_scroll.clone();
             self.geo_dirty = true;
+        }
+    }
+
+    /// Rebuild the display list after scroll containers moved.
+    fn apply_elem_scroll(&mut self) {
+        self.tree.scroll = self.elem_scroll.clone();
+        self.dl = paint::build(&self.tree, &self.doc, &self.styles, &self.res);
+        if let Some(it) = &mut self.js {
+            it.rects = self.tree.node_rects();
+            it.elem_scroll = self.elem_scroll.clone();
+        }
+    }
+
+    /// Mouse wheel over page point (x, y): scroll the innermost scroll
+    /// container that can move. Returns false if none can (the page scrolls).
+    pub fn wheel(&mut self, x: f32, y: f32, dx: f32, dy: f32) -> bool {
+        let Some(mut n) = self.tree.node_at(x, y) else { return false };
+        loop {
+            if self.doc.elem(n).is_some() && self.styles.get(n as usize).is_some_and(|s| s.overflow == Ovf::Scroll) {
+                if let Some(b) = self.tree.boxes.iter().find(|b| b.node == n && !b.anon) {
+                    let (cw, ch) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
+                    let max = ((b.scroll_w + b.p[1] + b.p[3] - cw).max(0.0), (b.scroll_h + b.p[0] + b.p[2] - ch).max(0.0));
+                    let st = &self.styles[n as usize];
+                    let (ox, oy) = self.elem_scroll.get(&n).copied().unwrap_or((0.0, 0.0));
+                    let nx = if st.ovf_x == Ovf::Scroll { (ox + dx).clamp(0.0, max.0) } else { ox };
+                    let ny = if st.ovf_y == Ovf::Scroll { (oy + dy).clamp(0.0, max.1) } else { oy };
+                    if (nx, ny) != (ox, oy) {
+                        self.elem_scroll.insert(n, (nx, ny));
+                        self.apply_elem_scroll();
+                        let target = n;
+                        self.with_js(|it| {
+                            js::dombind::dispatch_nobubble(it, target, "scroll");
+                        });
+                        return true;
+                    }
+                }
+            }
+            let p = self.doc.parent(n);
+            if p == NONE || p == 0 {
+                return false;
+            }
+            n = p;
         }
     }
 
@@ -803,6 +858,10 @@ impl Page {
         }
         if let Some(n) = it.history_go.take() {
             self.history_go = Some(n);
+        }
+        if std::mem::take(&mut it.elem_scroll_dirty) {
+            self.elem_scroll = it.elem_scroll.clone();
+            self.apply_elem_scroll();
         }
     }
 
@@ -1197,6 +1256,10 @@ impl Page {
         self.styles = styles;
         self.tree = tree;
         self.dl = dl;
+        if !self.elem_scroll.is_empty() {
+            self.tree.scroll = self.elem_scroll.clone();
+            self.dl = paint::build(&self.tree, &self.doc, &self.styles, &self.res);
+        }
         self.layouts += 1;
         self.sync_js_geometry();
     }
@@ -1386,6 +1449,45 @@ mod tests {
         assert_eq!(p.title(), "host got it true");
         let text: String = p.tree.text.chars().filter(|c| !c.is_whitespace()).collect();
         assert!(text.contains("TitleinnerBody"), "{text}");
+    }
+
+    #[test]
+    fn scroll_containers() {
+        let mut p = page_from(
+            r#"<!doctype html><style>body { margin: 0 } #box { height: 100px; overflow-y: auto; width: 200px }
+               .row { height: 50px } #r3 { background: rgb(255, 0, 0) }</style>
+               <div id=box><div class=row></div><div class=row></div><div class=row id=r3></div><div class=row></div></div>
+               <p id=after>after</p>
+               <script>
+                 const b = document.getElementById('box');
+                 b.addEventListener('scroll', () => document.title += ' scrolled ' + b.scrollTop);
+               </script>"#,
+        );
+        p.with_js(|it| {
+            let _ = it.run_script("const bx = document.getElementById('box'); document.title = [bx.scrollHeight, bx.clientHeight, bx.scrollTop].join(',')");
+        });
+        assert_eq!(p.title(), "200,100,0");
+        // Content is clipped: #after starts right below the 100px box.
+        assert_eq!(p.tree.node_rects()[&node_by_id(&p, "after")][1], 116.0);
+        let (w, h) = (400, 300);
+        let paint_px = |p: &Page, x: usize, y: usize| {
+            let mut buf = vec![0u32; w * h];
+            let mut glyphs = crate::fonts::GlyphCache::default();
+            paint::paint(&p.dl, &p.tree.text, &mut glyphs, &mut buf, w, h, 0.0);
+            buf[y * w + x] & 0xFFFFFF
+        };
+        assert_eq!(paint_px(&p, 10, 50), 0xFFFFFF);
+        // Wheel over the box scrolls it (by up to 100px), not the page.
+        assert!(p.wheel(10.0, 50.0, 0.0, 80.0));
+        assert_eq!(paint_px(&p, 10, 50), 0xFF0000);
+        assert!(p.title().ends_with("scrolled 80"), "{}", p.title());
+        assert!(p.wheel(10.0, 50.0, 0.0, 80.0));
+        assert!(!p.wheel(10.0, 50.0, 0.0, 80.0), "at the end the page scrolls instead");
+        p.with_js(|it| {
+            let _ = it.run_script("document.getElementById('box').scrollTop = 0; document.title = 'top ' + document.getElementById('box').scrollTop");
+        });
+        assert_eq!(p.title(), "top 0");
+        assert_eq!(paint_px(&p, 10, 50), 0xFFFFFF);
     }
 
     #[test]

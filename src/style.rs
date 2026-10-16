@@ -254,7 +254,10 @@ pub struct Style {
     pub z: Option<i32>,
     pub float: Side,
     pub clear: Side,
+    /// Visible if both axes are; Scroll if either scrolls; else Hidden (clip).
     pub overflow: Ovf,
+    pub ovf_x: Ovf,
+    pub ovf_y: Ovf,
     pub flow_root: bool,
     /// top-left, top-right, bottom-right, bottom-left
     pub radius: [Len; 4],
@@ -400,6 +403,8 @@ pub const INITIAL: Style = Style {
     float: Side::None,
     clear: Side::None,
     overflow: Ovf::Visible,
+    ovf_x: Ovf::Visible,
+    ovf_y: Ovf::Visible,
     flow_root: false,
     radius: [Len::Px(0.0); 4],
     shadow: None,
@@ -540,6 +545,8 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         Float => d.float = s.float,
         Clear => d.clear = s.clear,
         Overflow => d.overflow = s.overflow,
+        OverflowX => d.ovf_x = s.ovf_x,
+        OverflowY => d.ovf_y = s.ovf_y,
         BoxShadow => d.shadow = s.shadow,
         Opacity => d.opacity = s.opacity,
         FlexDirection => d.flex_dir = s.flex_dir,
@@ -801,12 +808,26 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                 s.clear = side
             }
         }
-        Overflow => {
-            s.overflow = match kw {
+        Overflow | OverflowX | OverflowY => {
+            let o = match kw {
                 Some(Kw::Hidden) => Ovf::Hidden,
                 Some(Kw::Scroll) => Ovf::Scroll,
                 _ => Ovf::Visible,
+            };
+            match d.prop {
+                OverflowX => s.ovf_x = o,
+                OverflowY => s.ovf_y = o,
+                _ => {
+                    s.ovf_x = o;
+                    s.ovf_y = o;
+                }
             }
+            // A non-visible axis makes the other one auto.
+            s.overflow = match (s.ovf_x, s.ovf_y) {
+                (Ovf::Visible, Ovf::Visible) => Ovf::Visible,
+                (Ovf::Hidden, Ovf::Hidden) => Ovf::Hidden,
+                _ => Ovf::Scroll,
+            };
         }
         BoxShadow => {
             s.shadow = match v {

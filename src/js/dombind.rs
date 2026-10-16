@@ -401,8 +401,26 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             Some(v) => Value::str(&crate::net::resolve(&it.url, &v)),
             None => Value::str(""),
         },
+        "clientWidth" | "scrollWidth" | "clientHeight" | "scrollHeight" if id == it.doc.html || doc_node => Value::Num(match key {
+            "clientWidth" | "scrollWidth" => it.vw as f64,
+            "clientHeight" => it.vh as f64,
+            _ => it.rects.get(&it.doc.html).map_or(it.vh, |r| r[3].max(it.vh)) as f64,
+        }),
+        "scrollWidth" | "scrollHeight" | "clientWidth" | "clientHeight" if it.scroll_metrics.contains_key(&id) => {
+            let m = it.scroll_metrics[&id];
+            Value::Num(match key {
+                "scrollWidth" => m[0],
+                "scrollHeight" => m[1],
+                "clientWidth" => m[2],
+                _ => m[3],
+            } as f64)
+        }
         "offsetWidth" | "clientWidth" | "scrollWidth" => Value::Num(rect(it, id)[2] as f64),
         "offsetHeight" | "clientHeight" | "scrollHeight" => Value::Num(rect(it, id)[3] as f64),
+        "scrollTop" | "scrollLeft" if it.elem_scroll.contains_key(&id) => {
+            let (x, y) = it.elem_scroll[&id];
+            Value::Num(if key == "scrollTop" { y } else { x } as f64)
+        }
         "offsetLeft" => Value::Num(rect(it, id)[0] as f64),
         "offsetTop" => Value::Num(rect(it, id)[1] as f64),
         "scrollTop" if id == it.doc.html || id == it.doc.body || doc_node => Value::Num(it.scroll_y as f64),
@@ -584,6 +602,24 @@ pub fn set(it: &mut Interp, o: &ObjRef, key: &str, v: &Value) -> R<bool> {
         "title" if id == 0 => {
             let t = it.to_str(v)?;
             it.doc.set_title(&t);
+        }
+        "scrollTop" | "scrollLeft" => {
+            let n = it.to_num(v)? as f32;
+            if id == 0 || id == it.doc.html || id == it.doc.body {
+                if key == "scrollTop" {
+                    it.scroll_request = Some(n.max(0.0));
+                }
+            } else {
+                let m = it.scroll_metrics.get(&id).copied().unwrap_or([0.0; 4]);
+                let (mx, my) = ((m[0] - m[2]).max(0.0), (m[1] - m[3]).max(0.0));
+                let e = it.elem_scroll.entry(id).or_insert((0.0, 0.0));
+                if key == "scrollTop" {
+                    e.1 = n.clamp(0.0, my);
+                } else {
+                    e.0 = n.clamp(0.0, mx);
+                }
+                it.elem_scroll_dirty = true;
+            }
         }
         "adoptedStyleSheets" if id == 0 => crate::js::cssom::set_adopted(it, v)?,
         "adoptedStyleSheets" if it.doc.shadow_hosts.contains_key(&id) => {

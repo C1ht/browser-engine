@@ -406,6 +406,12 @@ pub struct Interp {
     pub scroll_y: f32,
     /// A scroll position requested by a script (`scrollTo`, ...).
     pub scroll_request: Option<f32>,
+    /// Element scroll offsets (scroll containers), synced with the page;
+    /// `elem_scroll_dirty` when a script changed them.
+    pub elem_scroll: FxHashMap<NodeId, (f32, f32)>,
+    pub elem_scroll_dirty: bool,
+    /// Per element: [scrollWidth, scrollHeight, clientWidth, clientHeight].
+    pub scroll_metrics: FxHashMap<NodeId, [f32; 4]>,
     /// Generators / async calls whose coroutines are running, innermost last.
     pub co_stack: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
@@ -479,6 +485,9 @@ impl Interp {
             ce_when: Vec::new(),
             scroll_y: 0.0,
             scroll_request: None,
+            elem_scroll: FxHashMap::default(),
+            elem_scroll_dirty: false,
+            scroll_metrics: FxHashMap::default(),
             co_stack: Vec::new(),
             nav: None,
             submit_form: None,
