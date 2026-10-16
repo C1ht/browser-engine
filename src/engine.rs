@@ -391,9 +391,28 @@ fn run_script_node(it: &mut js::Interp, s: NodeId, kind: ScriptKind, sources: &F
 }
 
 /// Wall-clock budget for running a page's scripts at load.
-const SCRIPT_BUDGET: f64 = 3000.0;
+const SCRIPT_BUDGET_MS: f64 = 3000.0;
+
+/// The load-time script budget (`BOLT_SCRIPT_BUDGET` ms overrides it).
+fn script_budget() -> f64 {
+    static B: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var("BOLT_SCRIPT_BUDGET").ok().and_then(|v| v.parse().ok()).unwrap_or(SCRIPT_BUDGET_MS))
+}
 /// How long the first paint may wait for scripts' network requests.
 const NET_WAIT: f64 = 1500.0;
+
+static INTERACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The interactive browser paints as soon as scripts have run; responses
+/// that arrive later are delivered by `Page::tick`. (Screenshots and
+/// benchmarks wait for startup requests instead.)
+pub fn set_interactive(on: bool) {
+    INTERACTIVE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn net_wait() -> f64 {
+    if INTERACTIVE.load(std::sync::atomic::Ordering::Relaxed) { 100.0 } else { NET_WAIT }
+}
 
 /// Run a page's scripts (in document order), load events and zero-delay timers.
 fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashMap<String, String>, url: &str, base: &str, vw: f32, vh: f32) -> (Document, Option<Box<js::Interp>>, f64) {
@@ -408,7 +427,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
     it.ready_state = "loading";
-    it.deadline = Some(t0 + std::time::Duration::from_millis(SCRIPT_BUDGET as u64));
+    it.deadline = Some(t0 + std::time::Duration::from_millis(script_budget() as u64));
     it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: css.clone(), base: base.to_owned() }));
     // Parser-blocking classic scripts run in order; `defer` and module
     // scripts after them (in order), then `async` ones.
@@ -427,7 +446,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
             ScriptKind::Module => deferred.push((s, kind)),
             ScriptKind::Classic if external && has_attr(&it.doc, s, "defer") => deferred.push((s, kind)),
             ScriptKind::Classic => {
-                if ms(t0) <= SCRIPT_BUDGET {
+                if ms(t0) <= script_budget() {
                     run_script_node(&mut it, s, kind, sources, base);
                     run_pending(&mut it, &t0);
                 }
@@ -435,7 +454,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
         }
     }
     for (s, kind) in deferred.into_iter().chain(later) {
-        if ms(t0) <= SCRIPT_BUDGET {
+        if ms(t0) <= script_budget() {
             run_script_node(&mut it, s, kind, sources, base);
             run_pending(&mut it, &t0);
         }
@@ -448,18 +467,25 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     js::dombind::dispatch_nobubble(&mut it, js::WINDOW, "load");
     js::dombind::dispatch_nobubble(&mut it, js::WINDOW, "pageshow");
     it.run_microtasks();
+    if profile_scripts() {
+        eprintln!("[profile] scripts + load events done at {:.0}ms", ms(t0));
+        js::prof::report();
+    }
     // Timers that fire "immediately" so the first paint includes their work.
     for _ in 0..5 {
-        if it.run_timers(1.0) == 0 || ms(t0) > SCRIPT_BUDGET {
+        if it.run_timers(1.0) == 0 || ms(t0) > script_budget() {
             break;
         }
         run_pending(&mut it, &t0);
     }
+    if profile_scripts() {
+        eprintln!("[profile] zero-delay timers done at {:.0}ms", ms(t0));
+    }
     // Let data requested at startup (fetch / XHR) arrive before the first
     // paint, within a bounded wait; later responses arrive via `tick`.
     let net_start = Instant::now();
-    while it.has_pending_requests() && ms(t0) < SCRIPT_BUDGET && ms(net_start) < NET_WAIT {
-        let left = (SCRIPT_BUDGET - ms(t0)).min(NET_WAIT - ms(net_start)).max(1.0);
+    while it.has_pending_requests() && ms(t0) < script_budget() && ms(net_start) < net_wait() {
+        let left = (script_budget() - ms(t0)).min(net_wait() - ms(net_start)).max(1.0);
         if it.poll_requests(Some(std::time::Duration::from_millis(left.min(50.0) as u64))) {
             run_pending(&mut it, &t0);
             for _ in 0..3 {
@@ -470,6 +496,10 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
         }
     }
     let elapsed = ms(t0);
+    if profile_scripts() {
+        eprintln!("[profile] timers + network done at {elapsed:.0}ms (pending requests: {})", it.has_pending_requests());
+        js::prof::report();
+    }
     it.dirty = false;
     let doc = std::mem::take(&mut it.doc);
     (doc, Some(it), elapsed)
@@ -480,10 +510,22 @@ fn run_one(it: &mut js::Interp, code: &str) {
         return;
     }
     it.steps = 0;
+    let t = Instant::now();
     if let Err(e) = it.run_script(code) {
         it.log(&e);
     }
+    let run = ms(t);
     it.run_microtasks();
+    if profile_scripts() {
+        let head: String = code.trim_start().chars().take(60).filter(|c| !c.is_control()).collect();
+        eprintln!("[profile] {run:.0}ms run + {:.0}ms microtasks, {} bytes: {head}", ms(t) - run, code.len());
+    }
+}
+
+/// `BOLT_PROFILE=1`: log how long each script takes.
+fn profile_scripts() -> bool {
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| std::env::var_os("BOLT_PROFILE").is_some())
 }
 
 /// Fetch and run scripts that were inserted by other scripts; they fire
@@ -491,7 +533,7 @@ fn run_one(it: &mut js::Interp, code: &str) {
 fn run_pending(it: &mut js::Interp, t0: &Instant) {
     for _ in 0..8 {
         let pending = std::mem::take(&mut it.pending_scripts);
-        if pending.is_empty() || ms(*t0) > SCRIPT_BUDGET {
+        if pending.is_empty() || ms(*t0) > script_budget() {
             return;
         }
         let urls: Vec<String> = pending.iter().map(|(u, _)| u.clone()).collect();
@@ -882,6 +924,16 @@ impl Page {
         }
         self.script_requests();
         Some(r)
+    }
+
+    /// Run a script against the live page (developer aid); returns the
+    /// completion value or the error, as text.
+    pub fn eval(&mut self, src: &str) -> Option<String> {
+        self.with_js(|it| {
+            let r = it.eval_str(src);
+            it.run_microtasks();
+            r
+        })
     }
 
     /// The DOM was changed outside scripts: run `f` (event dispatch), then
@@ -1958,4 +2010,10 @@ pub fn stress_page() -> String {
     }
     s.push_str("</body></html>");
     s
+}
+
+#[allow(dead_code)]
+fn _loaded_is_send() {
+    fn is_send<T: Send>() {}
+    is_send::<Loaded>();
 }

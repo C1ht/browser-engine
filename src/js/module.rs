@@ -175,6 +175,13 @@ impl Interp {
             return self.modules[id].promise.clone().unwrap_or(Value::Undef);
         }
         self.modules[id].state = ModState::Evaluated;
+        self.script_running += 1;
+        let r = self.evaluate_module_inner(id);
+        self.script_running -= 1;
+        r
+    }
+
+    fn evaluate_module_inner(&mut self, id: usize) -> Value {
         let mut waits = Vec::new();
         for d in self.modules[id].deps.clone() {
             let p = self.evaluate_module(d);

@@ -305,6 +305,8 @@ pub struct Style {
     pub transform: Transform,
     pub list: ListStyle,
     pub hidden: bool,
+    /// pointer-events: none (inherited).
+    pub no_pointer: bool,
     pub valign: VAlign,
     pub border_box: bool,
     pub collapse: bool,
@@ -446,6 +448,7 @@ pub const INITIAL: Style = Style {
     transform: Transform::None,
     list: ListStyle::Disc,
     hidden: false,
+    no_pointer: false,
     valign: VAlign::Baseline,
     border_box: false,
     collapse: false,
@@ -506,6 +509,7 @@ impl Style {
             transform: p.transform,
             list: p.list,
             hidden: p.hidden,
+            no_pointer: p.no_pointer,
             collapse: p.collapse,
             spacing: p.spacing,
             word_break: p.word_break,
@@ -610,6 +614,7 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         TextTransform => d.transform = s.transform,
         ListStyleType => d.list = s.list,
         Visibility => d.hidden = s.hidden,
+        PointerEvents => d.no_pointer = s.no_pointer,
         VerticalAlign => d.valign = s.valign,
         BoxSizing => d.border_box = s.border_box,
         BorderCollapse => d.collapse = s.collapse,
@@ -1126,6 +1131,7 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
             }
         }
         Visibility => s.hidden = kw == Some(Kw::Hidden),
+        PointerEvents => s.no_pointer = kw == Some(Kw::None),
         VerticalAlign => {
             s.valign = match kw {
                 Some(Kw::Top) => VAlign::Top,
@@ -2263,7 +2269,7 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
     put("flex-shrink", format!("{}", st.shrink));
     put("flex-basis", css_len(st.basis, bw));
     put("transform", if st.has_transform() { "matrix(1, 0, 0, 1, 0, 0)".into() } else { "none".into() });
-    put("pointer-events", "auto".into());
+    put("pointer-events", if st.no_pointer { "none" } else { "auto" }.into());
     put("cursor", "auto".into());
     put(
         "content",

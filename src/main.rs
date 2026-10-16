@@ -54,10 +54,14 @@ struct Args {
     iters: usize,
     /// Screenshot mode: focus the first text field and type this.
     typed: Option<String>,
+    /// Screenshot mode: scripts to run on the loaded page (results printed).
+    eval: Vec<String>,
+    /// Screenshot mode: print what's under these points.
+    probe: Vec<(f32, f32)>,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { url: "about:home".into(), bench: false, js: None, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30, typed: None };
+    let mut a = Args { url: "about:home".into(), bench: false, js: None, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30, typed: None, eval: Vec::new(), probe: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -69,6 +73,12 @@ fn parse_args() -> Args {
             "--width" => a.width = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.width),
             "--height" => a.height = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--type" => a.typed = it.next(),
+            "--eval" => a.eval.extend(it.next()),
+            "--probe" => {
+                if let Some((x, y)) = it.next().as_deref().and_then(|v| v.split_once(',')) {
+                    a.probe.push((x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0)));
+                }
+            }
             "--iters" => a.iters = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.iters),
             _ => a.url = net::normalize_input(&s),
         }
@@ -76,7 +86,49 @@ fn parse_args() -> Args {
     a
 }
 
+/// `BOLT_CRASH_TRACE=1`: on a crash (access violation, stack overflow),
+/// print the exception and a backtrace before dying.
+#[cfg(windows)]
+fn install_crash_trace() {
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        next: *mut ExceptionRecord,
+        address: *mut std::ffi::c_void,
+        nparams: u32,
+        info: [usize; 15],
+    }
+    #[repr(C)]
+    struct ExceptionPointers {
+        record: *mut ExceptionRecord,
+        context: *mut std::ffi::c_void,
+    }
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(first: u32, handler: unsafe extern "system" fn(*mut ExceptionPointers) -> i32) -> *mut std::ffi::c_void;
+        fn SetThreadStackGuarantee(size: *mut u32) -> i32;
+    }
+    unsafe extern "system" fn handler(p: *mut ExceptionPointers) -> i32 {
+        let rec = unsafe { &*(*p).record };
+        // Only fatal faults (not C++/debugger exceptions).
+        if matches!(rec.code, 0xC000_0005 | 0xC000_00FD | 0xC000_001D | 0xC000_0096) {
+            eprintln!("[crash] exception {:#x} at {:p} (info {:#x} {:#x})", rec.code, rec.address, rec.info[0], rec.info[1]);
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH
+    }
+    if std::env::var_os("BOLT_CRASH_TRACE").is_some() {
+        unsafe {
+            let mut g: u32 = 256 << 10;
+            SetThreadStackGuarantee(&mut g);
+            AddVectoredExceptionHandler(1, handler);
+        }
+    }
+}
+
 fn main() {
+    #[cfg(windows)]
+    install_crash_trace();
     // Deeply nested documents recurse in layout; give the engine a big stack.
     let h = std::thread::Builder::new()
         .stack_size(256 << 20)
@@ -150,14 +202,15 @@ fn dump(doc: &dom::Document, n: dom::NodeId, depth: usize) {
 
 /// Print the layout box tree (for debugging).
 fn dump_boxes(p: &Page, id: u32, depth: usize) {
-    if depth > 14 {
+    if depth > 80 {
         return;
     }
     let b = &p.tree.boxes[id as usize];
     let tag = p.doc.tag(b.node).map_or("#", atom::name);
+    let class = p.doc.elem(b.node).and_then(|e| e.attr(atom::k::class)).map(|c| format!(".{}", c.split_whitespace().collect::<Vec<_>>().join("."))).unwrap_or_default();
     println!(
-        "{}{:?}{} <{}> x={:.0} y={:.0} w={:.0} h={:.0} frags={}",
-        "  ".repeat(depth), b.kind, if b.anon { "(anon)" } else { "" }, tag, b.x, b.y, b.w, b.h, b.frags.len()
+        "{}{:?}{} <{}{}> n={} x={:.0} y={:.0} w={:.0} h={:.0} frags={}",
+        "  ".repeat(depth), b.kind, if b.anon { "(anon)" } else { "" }, tag, class, b.node, b.x, b.y, b.w, b.h, b.frags.len()
     );
     for &c in &b.children {
         dump_boxes(p, c, depth + 1);
@@ -240,12 +293,50 @@ fn screenshot(a: &Args, out: &str) {
     let t_imgs = Instant::now();
     page.load_images_blocking(w as f32, vh);
     eprintln!("[bolt] fetch {fetch_ms:.0}ms | page {page_ms:.0}ms (scripts {:.0}ms) | fonts {fonts_ms:.0}ms | images {:.0}ms", page.script_ms, ms(t_imgs));
+    for src in &a.eval {
+        println!("[eval] {}", page.eval(src).unwrap_or_else(|| "(no script engine)".into()));
+    }
+    for &(x, y) in &a.probe {
+        let mut n = page.tree.node_at(x, y).unwrap_or(dom::NONE);
+        let rects = page.tree.node_rects();
+        print!("[probe {x},{y}] n={n} nodes={} {:?}", page.doc.nodes.len(), rects.get(&n));
+        for (i, b) in page.tree.boxes.iter().enumerate().filter(|(_, b)| b.node == n || page.tree.pseudo_owner.get(&b.node) == Some(&n)) {
+            print!(" [box{i} node={} {:?} x={} y={} w={} h={} anon={}]", b.node, b.kind, b.x, b.y, b.w, b.h, b.anon);
+        }
+        while n != dom::NONE {
+            match page.doc.elem(n) {
+                Some(e) => {
+                    let mut d = crate::atom::name(e.tag).to_string();
+                    if let Some(id) = e.attr(atom::k::id) {
+                        d += &format!("#{id}");
+                    }
+                    if let Some(c) = e.attr(atom::k::class) {
+                        d += &format!(".{}", c.split_whitespace().take(3).collect::<Vec<_>>().join("."));
+                    }
+                    print!(" < {d}");
+                }
+                None if n == 0 => print!(" < #document"),
+                None => print!(" < #text"),
+            }
+            n = page.doc.parent(n);
+        }
+        println!();
+    }
     let h = if a.height == 0 { (page.tree.height.ceil() as usize).clamp(1, 16000) } else { a.height };
     if let Some(text) = &a.typed {
         let field = page.doc.preorder().into_iter().find(|&n| page.is_text_field_at(n) && page.doc.elem(n).is_some());
         if let Some(f) = field {
             page.set_focus(f);
-            page.key(Edit::Insert(text.clone()));
+            // A trailing "\n" (backslash, n) presses Enter and prints where it navigates.
+            let (text, enter) = match text.strip_suffix("\\n") {
+                Some(t) => (t, true),
+                None => (text.as_str(), false),
+            };
+            page.key(Edit::Insert(text.to_owned()));
+            if enter {
+                let nav = page.key(Edit::Enter);
+                println!("[enter] {:?}", nav.map(|n| n.url));
+            }
         }
     }
     let mut buf = vec![0u32; w * h];
@@ -324,10 +415,20 @@ struct Browser {
     blink: Instant,
     caret_on: bool,
     last_mouse: Option<(f32, f32)>,
+    /// A navigation whose network fetch and parse run on a background
+    /// thread (the window stays responsive meanwhile).
+    pending: Option<PendingLoad>,
+}
+
+struct PendingLoad {
+    url: String,
+    rx: std::sync::mpsc::Receiver<Result<engine::Loaded, String>>,
+    started: Instant,
 }
 
 impl Browser {
     fn run(url: &str, w: usize, h: usize) {
+        engine::set_interactive(true);
         let mut window = Window::new(
             "bolt",
             w,
@@ -363,6 +464,7 @@ impl Browser {
             blink: Instant::now(),
             caret_on: false,
             last_mouse: None,
+            pending: None,
         };
         b.navigate(url, true);
         b.event_loop();
@@ -397,10 +499,38 @@ impl Browser {
         self.url_input = url.clone();
         self.editing = false;
         self.window.set_title(&format!("Loading {url} — bolt"));
-        self.draw_chrome(true);
+        // Fetch and parse off the UI thread; `poll_load` finishes the job.
+        // A newer navigation replaces this one (its result is dropped).
+        let (tx, rx) = std::sync::mpsc::channel();
+        let req_url = url.clone();
+        std::thread::Builder::new()
+            .stack_size(64 << 20)
+            .spawn(move || {
+                let _ = tx.send(engine::load_req(&req_url, post.as_deref()));
+            })
+            .expect("spawn loader");
+        self.pending = Some(PendingLoad { url, rx, started: Instant::now() });
+        self.repaint();
         let _ = self.window.update_with_buffer(&self.buf, self.w, self.h);
+    }
 
-        match engine::load_req(&url, post.as_deref()) {
+    /// Finish a background navigation once its document has arrived.
+    /// Returns whether anything changed.
+    fn poll_load(&mut self) -> bool {
+        let Some(p) = &self.pending else { return false };
+        let result = match p.rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("loader failed".into()),
+        };
+        let url = self.pending.take().map(|p| p.url).unwrap_or_default();
+        self.window.set_title(&format!("Running {url} — bolt"));
+        self.finish_navigation(result);
+        true
+    }
+
+    fn finish_navigation(&mut self, result: Result<engine::Loaded, String>) {
+        match result {
             Ok(l) => {
                 let page = Page::new(l, self.w as f32, self.vh() as f32);
                 self.url_input = page.url.clone();
@@ -534,7 +664,7 @@ impl Browser {
         if let Some(p) = &mut self.page {
             p.t.paint = ms(t0);
         }
-        self.draw_chrome(false);
+        self.draw_chrome(self.pending.is_some());
     }
 
     fn draw_text(&mut self, s: &str, x: f32, y: f32, size: f32, color: u32) {
@@ -576,7 +706,15 @@ impl Browser {
             self.fill(51.0 + tw, 11.0, 1.0, 18.0, 0xFF1D_2433);
         }
         if loading {
-            self.fill(41.0, 30.0, (w - 50.0) * 0.6, 2.0, 0xFF1A_56DB);
+            // Indeterminate progress: a segment sweeping across the field.
+            let t = self.pending.as_ref().map_or(0.0, |p| p.started.elapsed().as_secs_f32());
+            let span = w - 50.0;
+            let seg = span * 0.25;
+            let x = ((t * 0.8).fract() * (span + seg)) - seg;
+            let (x0, x1) = (x.max(0.0), (x + seg).min(span));
+            if x1 > x0 {
+                self.fill(41.0 + x0, 30.0, x1 - x0, 2.0, 0xFF1A_56DB);
+            }
         }
         // status bubble for hovered links
         if let Some(hv) = self.hover.clone() {
@@ -652,6 +790,13 @@ impl Browser {
     fn event_loop(&mut self) {
         while self.window.is_open() {
             let mut dirty = false;
+            if self.poll_load() {
+                dirty = true;
+            }
+            // Animate the loading bar.
+            if self.pending.is_some() {
+                dirty = true;
+            }
             if self.poll_images() {
                 dirty = true;
             }

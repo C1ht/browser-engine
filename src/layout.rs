@@ -112,6 +112,12 @@ pub struct LBox {
     pub rel: (f32, f32),
     /// Decoded image for <img>.
     pub image: Option<Arc<Image>>,
+    /// Hit testing: ignores the pointer (pointer-events: none or
+    /// visibility: hidden), positioned, z-index, clips its content.
+    pub no_hit: bool,
+    pub positioned: bool,
+    pub z: Option<i32>,
+    pub clips: bool,
 }
 
 impl LayoutTree {
@@ -192,26 +198,82 @@ impl LayoutTree {
     }
 
     /// The element at page point (x, y): the last-painted box or text under it.
+    /// The topmost element or text node under a point: boxes are ranked
+    /// like paint order (z-index of the outermost stacking context, then
+    /// positioned over in-flow, then document order); `pointer-events:
+    /// none`, `visibility: hidden` and content clipped away don't hit.
     pub fn node_at(&self, x: f32, y: f32) -> Option<NodeId> {
-        let mut hit = None;
-        let inside = |r: [f32; 4]| x >= r[0] && x < r[0] + r[2] && y >= r[1] && y < r[1] + r[3];
-        let mut last_box = None;
-        let mut last_text = None;
-        self.walk(self.root, 0.0, 0.0, &mut |b, bx, by| {
-            if !b.anon && inside([bx, by, b.border_w(), b.border_h()]) {
-                last_box = Some(b.node);
-            }
-        }, &mut |n, r| {
-            if inside(r) {
-                last_text = Some(n);
-            }
-        });
-        // Text is painted over its container's background.
-        if let Some(t) = last_text {
-            hit = Some(t);
-        }
-        hit.or(last_box).map(|n| self.pseudo_owner.get(&n).copied().unwrap_or(n))
+        let mut st = HitState { x, y, best: None, order: 0 };
+        self.hit_walk(self.root, 0.0, 0.0, (0, false), &mut st);
+        st.best.map(|(_, n)| self.pseudo_owner.get(&n).copied().unwrap_or(n))
     }
+
+    fn hit_walk(&self, id: u32, ox: f32, oy: f32, rank: (i32, bool), st: &mut HitState) {
+        let b = &self.boxes[id as usize];
+        let (bx, by) = (ox + b.x + b.rel.0, oy + b.y + b.rel.1);
+        // The outermost z-index decides; positioned boxes paint above flow.
+        let rank = match b.z {
+            Some(z) if rank == (0, false) => (z, true),
+            _ => (rank.0, rank.1 || b.positioned),
+        };
+        let (bw, bh) = (b.border_w(), b.border_h());
+        let inside = st.x >= bx && st.x < bx + bw && st.y >= by && st.y < by + bh;
+        if b.clips && !inside {
+            return;
+        }
+        let hit = |st: &mut HitState, n: NodeId, text: bool| {
+            st.order += 1;
+            // Text paints over its own container's background.
+            let key = (rank.0, rank.1, st.order * 2 + text as u64);
+            if st.best.as_ref().is_none_or(|(k, _)| key >= *k) {
+                st.best = Some((key, n));
+            }
+        };
+        if !b.anon && !b.no_hit && inside {
+            hit(st, b.node, false);
+        }
+        let (mut px, mut py) = (bx + b.b[3], by + b.b[0]);
+        if !b.anon {
+            if let Some(&(sx, sy)) = self.scroll.get(&b.node) {
+                px -= sx;
+                py -= sy;
+            }
+        }
+        let (cx, cy) = (px + b.p[3], py + b.p[0] + b.cell_off);
+        for &c in &b.children {
+            if !self.boxes[c as usize].abs {
+                self.hit_walk(c, cx, cy, rank, st);
+            }
+        }
+        for &fl in &b.floats {
+            self.hit_walk(fl, cx, cy, rank, st);
+        }
+        for fr in &b.frags {
+            match fr.kind {
+                FragKind::Text { node, w, .. } | FragKind::InlineBox { node, w, .. } => {
+                    let r = [cx + fr.x, cy + fr.y - 14.0, w, 18.0];
+                    if !b.no_hit && st.x >= r[0] && st.x < r[0] + r[2] && st.y >= r[1] && st.y < r[1] + r[3] {
+                        hit(st, node, true);
+                    }
+                }
+                FragKind::Atomic(a) => self.hit_walk(a, cx, cy, rank, st),
+            }
+        }
+        for &a in &b.abs_kids {
+            let (ax, ay) = if self.boxes[a as usize].fixed { (0.0, 0.0) } else { (px, py) };
+            self.hit_walk(a, ax, ay, rank, st);
+        }
+    }
+}
+
+struct HitState {
+    x: f32,
+    y: f32,
+    best: Option<((i32, bool, u64), NodeId)>,
+    order: u64,
+}
+
+impl LayoutTree {
 }
 
 /// Text fragments of a box and its anonymous wrappers, in order.
@@ -596,7 +658,22 @@ impl<'a> Engine<'a> {
             static_pos: (0.0, 0.0),
             rel: (0.0, 0.0),
             image: None,
+            no_hit: false,
+            positioned: false,
+            z: None,
+            clips: false,
         });
+        if let Some(st) = self.styles.get(node as usize) {
+            let b = &mut self.boxes[id as usize];
+            b.no_hit = st.no_pointer || st.hidden;
+            if !anon {
+                b.positioned = st.position != Pos::Static;
+                b.z = if b.positioned { st.z } else { None };
+                // Overflow on the root and body applies to the viewport.
+                b.clips = (st.ovf_x != crate::style::Ovf::Visible || st.ovf_y != crate::style::Ovf::Visible)
+                    && !matches!(self.doc.tag(node), Some(k::html | k::body));
+            }
+        }
         id
     }
 

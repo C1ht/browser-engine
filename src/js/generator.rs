@@ -111,7 +111,7 @@ impl Interp {
         };
         let saved = std::mem::replace(&mut self.depth, depth);
         self.co_stack.push(holder.clone());
-        let out = co.resume(r);
+        let out = co.resume(self as *mut Interp as *mut std::ffi::c_void, r);
         self.co_stack.pop();
         let depth = std::mem::replace(&mut self.depth, saved);
         if let Kind::Generator(g) = &mut holder.borrow_mut().kind {
@@ -319,7 +319,7 @@ impl Interp {
 
     /// Suspend the running body; translate how it was resumed.
     fn suspend_with(&mut self, holder: &ObjRef, out: Out) -> R<Value> {
-        match coro::suspend(out) {
+        match coro::suspend(self as *mut Interp as *mut std::ffi::c_void, out) {
             Resume::Next(x) => Ok(x),
             Resume::Throw(e) => Err(e),
             Resume::Return(v) => {
@@ -419,7 +419,7 @@ impl Interp {
                 return self.get(&r, "value");
             }
             let item = self.get(&r, "value")?;
-            received = match coro::suspend(Out::Yield(item)) {
+            received = match coro::suspend(self as *mut Interp as *mut std::ffi::c_void, Out::Yield(item)) {
                 r @ (Resume::Next(_) | Resume::Throw(_) | Resume::Return(_)) => r,
             };
         }

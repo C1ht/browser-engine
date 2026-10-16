@@ -9,6 +9,7 @@ pub type Name = Rc<str>;
 #[derive(Debug)]
 pub enum Expr {
     Num(f64),
+    BigInt(i128),
     Str(Name),
     Template(Vec<Name>, Vec<Expr>),
     Regex(Name, Name),
@@ -88,6 +89,8 @@ pub struct FuncDef {
     pub arrow: bool,
     pub is_async: bool,
     pub is_gen: bool,
+    /// Strict mode code (`this` isn't coerced to the global object).
+    pub strict: bool,
 }
 
 #[derive(Debug)]
@@ -152,6 +155,8 @@ pub struct Parser {
     in_gen: bool,
     /// Parsing a module: import / export declarations are collected here.
     module: Option<ModuleInfo>,
+    /// Inside strict mode code.
+    strict: bool,
 }
 
 /// What a module imports and exports (its body has the `import` / `export`
@@ -210,7 +215,7 @@ fn bound_names(p: &Pattern, out: &mut Vec<Name>) {
 pub fn parse_module(src: &str) -> PResult<(Vec<Stmt>, ModuleInfo)> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {} at {}", e.0, e.1))?;
     // Top-level await is allowed in modules.
-    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false, module: Some(ModuleInfo::default()) };
+    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false, module: Some(ModuleInfo::default()), strict: true };
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.statement()?);
@@ -222,7 +227,8 @@ pub type PResult<T> = Result<T, String>;
 
 pub fn parse_program(src: &str) -> PResult<Vec<Stmt>> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {} at {}", e.0, e.1))?;
-    let mut p = Parser { toks, i: 0, in_func: false, in_gen: false, module: None };
+    let mut p = Parser { toks, i: 0, in_func: false, in_gen: false, module: None, strict: false };
+    p.strict = p.use_strict_directive();
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.statement()?);
@@ -243,7 +249,7 @@ pub fn parse_function(params: &[&str], body: &str) -> PResult<Rc<FuncDef>> {
 
 fn parse_expr_src(src: &str) -> PResult<Expr> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {}", e.0))?;
-    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false, module: None };
+    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false, module: None, strict: false };
     let e = p.expression(false)?;
     if !p.at_eof() {
         return Err("SyntaxError: junk in template expression".into());
@@ -819,14 +825,32 @@ impl Parser {
         Ok((ps, rest))
     }
 
-    fn func_body(&mut self, is_gen: bool) -> PResult<Vec<Stmt>> {
+    /// A `"use strict"` directive in the prologue starting at the cursor.
+    fn use_strict_directive(&self) -> bool {
+        let mut j = self.i;
+        while let Some(Tok::Str(s)) = self.toks.get(j).map(|t| &t.tok) {
+            if &**s == "use strict" {
+                return true;
+            }
+            j += 1;
+            if matches!(self.toks.get(j).map(|t| &t.tok), Some(Tok::Punct(";"))) {
+                j += 1;
+            }
+        }
+        false
+    }
+
+    /// Parse a function body; returns it and whether it is strict code.
+    fn func_body(&mut self, is_gen: bool) -> PResult<(Vec<Stmt>, bool)> {
         self.expect("{")?;
-        let saved = (self.in_func, self.in_gen);
+        let saved = (self.in_func, self.in_gen, self.strict);
         self.in_func = true;
         self.in_gen = is_gen;
+        self.strict = self.strict || self.use_strict_directive();
+        let strict = self.strict;
         let b = self.block_body();
-        (self.in_func, self.in_gen) = saved;
-        b
+        (self.in_func, self.in_gen, self.strict) = saved;
+        Ok((b?, strict))
     }
 
     fn function_rest(&mut self, is_async: bool, need_name: bool) -> PResult<Rc<FuncDef>> {
@@ -841,14 +865,14 @@ impl Parser {
             _ => None,
         };
         let (params, rest) = self.params()?;
-        let body = self.func_body(is_gen)?;
-        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen }))
+        let (body, strict) = self.func_body(is_gen)?;
+        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen, strict }))
     }
 
     fn method(&mut self, name: Option<Name>, is_async: bool, is_gen: bool) -> PResult<Rc<FuncDef>> {
         let (params, rest) = self.params()?;
-        let body = self.func_body(is_gen)?;
-        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen }))
+        let (body, strict) = self.func_body(is_gen)?;
+        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen, strict }))
     }
 
     fn class_rest(&mut self, need_name: bool) -> PResult<Rc<ClassDef>> {
@@ -863,6 +887,14 @@ impl Parser {
         };
         let extends = if self.eat_word("extends") { Some(self.unary_postfix()?) } else { None };
         self.expect("{")?;
+        // Class bodies are strict mode code.
+        let saved_strict = std::mem::replace(&mut self.strict, true);
+        let r = self.class_body(name, extends);
+        self.strict = saved_strict;
+        r
+    }
+
+    fn class_body(&mut self, name: Option<Name>, extends: Option<Expr>) -> PResult<Rc<ClassDef>> {
         let mut cd = ClassDef { name, extends, ctor: None, methods: Vec::new(), fields: Vec::new() };
         while !self.eat("}") {
             if self.eat(";") {
@@ -876,7 +908,7 @@ impl Parser {
                     // static initialization block: run as a static method-less field
                     self.next();
                     let body = self.block_body()?;
-                    let f = Rc::new(FuncDef { name: None, params: vec![], rest: None, body: Body::Block(body), arrow: false, is_async: false, is_gen: false });
+                    let f = Rc::new(FuncDef { name: None, params: vec![], rest: None, body: Body::Block(body), arrow: false, is_async: false, is_gen: false, strict: true });
                     cd.fields.push((true, PropKey::Name("".into()), Some(Expr::Call(Box::new(Expr::Func(f)), vec![], false))));
                     continue;
                 }
@@ -947,11 +979,11 @@ impl Parser {
     fn arrow_body(&mut self, params: Vec<Pattern>, rest: Option<Pattern>, is_async: bool) -> PResult<Expr> {
         self.expect("=>")?;
         let body = if self.is("{") {
-            Body::Block(self.func_body(false)?)
+            Body::Block(self.func_body(false)?.0)
         } else {
             Body::Expr(self.assign(false)?)
         };
-        Ok(Expr::Func(Rc::new(FuncDef { name: None, params, rest, body, arrow: true, is_async, is_gen: false })))
+        Ok(Expr::Func(Rc::new(FuncDef { name: None, params, rest, body, arrow: true, is_async, is_gen: false, strict: self.strict })))
     }
 
     fn assign(&mut self, no_in: bool) -> PResult<Expr> {
@@ -1181,6 +1213,7 @@ impl Parser {
         let t = self.next();
         Ok(match t {
             Tok::Num(n) => Expr::Num(n),
+            Tok::BigInt(n) => Expr::BigInt(n),
             Tok::Str(s) => Expr::Str(s),
             Tok::Template(q, x) => {
                 let exprs = x.iter().map(|s| parse_expr_src(s)).collect::<PResult<Vec<_>>>()?;

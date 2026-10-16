@@ -8,7 +8,10 @@
 //! eagerly.
 //!
 //! The interpreter is shared by raw pointer between fibers; only one fiber
-//! of a thread runs at a time, so accesses never overlap.
+//! of a thread runs at a time, so accesses never overlap. Every switch takes
+//! the interpreter pointer and escapes it first: callers hold `&mut Interp`
+//! across the switch, and without the escape the optimizer may keep its
+//! fields in registers, unaware that other fibers change them meanwhile.
 
 use super::{Value, R};
 use std::cell::RefCell;
@@ -36,12 +39,18 @@ mod sys {
     use std::ffi::c_void;
     #[link(name = "kernel32")]
     unsafe extern "system" {
-        pub fn ConvertThreadToFiber(p: *mut c_void) -> *mut c_void;
+        pub fn ConvertThreadToFiberEx(p: *mut c_void, flags: u32) -> *mut c_void;
         pub fn CreateFiberEx(commit: usize, reserve: usize, flags: u32, start: extern "system" fn(*mut c_void), p: *mut c_void) -> *mut c_void;
         pub fn SwitchToFiber(f: *mut c_void);
         pub fn DeleteFiber(f: *mut c_void);
     }
 }
+
+/// Switch the floating-point state too: on x64 that includes the callee-saved
+/// XMM6-15 registers, which optimized code may hold values (even pointers)
+/// in across the switch. Without it they are clobbered by other fibers.
+#[cfg(windows)]
+const FIBER_FLAG_FLOAT_SWITCH: u32 = 1;
 
 /// Virtual stack reserved per coroutine (committed on demand).
 const STACK_RESERVE: usize = 128 << 20;
@@ -70,15 +79,34 @@ pub fn supported() -> bool {
     cfg!(windows)
 }
 
+/// Whether code is executing inside a coroutine.
+pub fn running() -> bool {
+    RUNNING.with(|s| !s.borrow().is_empty())
+}
+
 #[cfg(windows)]
 fn main_fiber() -> *mut c_void {
     MAIN.with(|m| {
         let mut m = m.borrow_mut();
         if m.is_null() {
-            *m = unsafe { sys::ConvertThreadToFiber(std::ptr::null_mut()) };
+            *m = unsafe { sys::ConvertThreadToFiberEx(std::ptr::null_mut(), FIBER_FLAG_FLOAT_SWITCH) };
         }
         *m
     })
+}
+
+/// The fiber executing right now (`GetCurrentFiber()`: the TEB's FiberData).
+#[cfg(all(windows, target_arch = "x86_64"))]
+fn current_fiber() -> *mut c_void {
+    let f: *mut c_void;
+    // SAFETY: reads NT_TIB.FiberData of the current thread's TEB.
+    unsafe { std::arch::asm!("mov {}, gs:[0x20]", out(reg) f, options(nostack, readonly, preserves_flags)) };
+    f
+}
+
+#[cfg(all(windows, not(target_arch = "x86_64")))]
+fn current_fiber() -> *mut c_void {
+    RUNNING.with(|s| s.borrow().last().map(|&c| unsafe { (*c).fiber })).unwrap_or_else(main_fiber)
 }
 
 #[cfg(windows)]
@@ -112,7 +140,7 @@ impl Co {
         main_fiber();
         let ctx = POOL.with(|p| p.borrow_mut().pop()).or_else(|| {
             let ctx = Box::into_raw(Box::new(Ctx { fiber: std::ptr::null_mut(), caller: std::ptr::null_mut(), job: None, resume: None, out: None }));
-            let f = unsafe { sys::CreateFiberEx(64 << 10, STACK_RESERVE, 0, fiber_main, ctx as *mut c_void) };
+            let f = unsafe { sys::CreateFiberEx(64 << 10, STACK_RESERVE, FIBER_FLAG_FLOAT_SWITCH, fiber_main, ctx as *mut c_void) };
             if f.is_null() {
                 drop(unsafe { Box::from_raw(ctx) });
                 return None;
@@ -129,23 +157,27 @@ impl Co {
         None
     }
 
-    /// Run the coroutine until it yields, awaits or finishes.
+    /// Run the coroutine until it yields, awaits or finishes. `shared` is
+    /// the state other fibers may modify meanwhile (the interpreter).
     #[cfg(windows)]
-    pub fn resume(&self, r: Resume) -> Out {
+    pub fn resume(&self, shared: *mut c_void, r: Resume) -> Out {
         let ctx = self.ctx;
-        let me = RUNNING.with(|s| s.borrow().last().map(|&c| unsafe { (*c).fiber })).unwrap_or_else(main_fiber);
+        main_fiber();
+        let me = current_fiber();
         unsafe {
             (*ctx).resume = Some(r);
             (*ctx).caller = me;
         }
         RUNNING.with(|s| s.borrow_mut().push(ctx));
+        std::hint::black_box(shared);
         unsafe { sys::SwitchToFiber((*ctx).fiber) };
+        std::hint::black_box(shared);
         RUNNING.with(|s| s.borrow_mut().pop());
         unsafe { (*ctx).out.take() }.unwrap_or(Out::Done(Ok(Value::Undef)))
     }
 
     #[cfg(not(windows))]
-    pub fn resume(&self, _r: Resume) -> Out {
+    pub fn resume(&self, _shared: *mut c_void, _r: Resume) -> Out {
         Out::Done(Ok(Value::Undef))
     }
 
@@ -176,16 +208,18 @@ impl Drop for Co {
 /// Suspend the innermost running coroutine, handing `out` to whoever resumed
 /// it; returns how it was resumed.
 #[cfg(windows)]
-pub fn suspend(out: Out) -> Resume {
+pub fn suspend(shared: *mut c_void, out: Out) -> Resume {
     let ctx = RUNNING.with(|s| *s.borrow().last().expect("suspend outside a coroutine"));
     unsafe {
         (*ctx).out = Some(out);
+        std::hint::black_box(shared);
         sys::SwitchToFiber((*ctx).caller);
+        std::hint::black_box(shared);
         (*ctx).resume.take().unwrap_or(Resume::Next(Value::Undef))
     }
 }
 
 #[cfg(not(windows))]
-pub fn suspend(_out: Out) -> Resume {
+pub fn suspend(_shared: *mut c_void, _out: Out) -> Resume {
     Resume::Next(Value::Undef)
 }

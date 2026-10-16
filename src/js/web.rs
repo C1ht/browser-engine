@@ -22,6 +22,8 @@ pub enum PairKind {
 pub enum Target {
     Fetch(ObjRef, Value),
     Xhr(Value),
+    /// An external script inserted by a script: run it when it arrives.
+    Script(crate::dom::NodeId),
     Ignore,
 }
 
@@ -1093,6 +1095,22 @@ impl Interp {
                         log_err(self, &e);
                     }
                 }
+                Target::Script(node) => match r {
+                    Ok(h) if (200..300).contains(&h.status) => {
+                        let code = crate::net::decode(&h.body);
+                        let saved = std::mem::replace(&mut self.current_script, node);
+                        if let Err(e) = self.run_script(&code) {
+                            self.log(&e);
+                        }
+                        self.current_script = saved;
+                        self.run_microtasks();
+                        self.steps = 0;
+                        super::dombind::dispatch_nobubble(self, node, "load");
+                    }
+                    _ => {
+                        super::dombind::dispatch_nobubble(self, node, "error");
+                    }
+                },
                 Target::Ignore => {}
             }
             self.run_microtasks();

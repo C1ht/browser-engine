@@ -133,8 +133,10 @@ fn run_inserted_script(it: &mut Interp, s: NodeId) {
         return;
     }
     if let Some(src) = it.doc.attr(s, k::src) {
+        // Fetched in the background; runs (and fires load) when it arrives.
         let url = crate::net::resolve(&it.url, src);
-        it.pending_scripts.push((url, s));
+        it.start_request("GET", &url, Vec::new(), None, crate::js::web::Target::Script(s));
+        it.dirty = true;
         return;
     }
     let code = text_of(it, s);
@@ -1544,6 +1546,42 @@ fn w_get_computed_style(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     Ok(Value::Obj(o))
 }
 
+/// `CSS.supports(prop, value)` / `CSS.supports(condition)`.
+fn css_supports(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let first = it.to_str(&arg(a, 0))?;
+    let t = first.trim_start();
+    let cond = if a.len() >= 2 {
+        let v = it.to_str(&arg(a, 1))?;
+        format!("({first}: {v})")
+    } else if t.starts_with('(') || t.starts_with("selector(") || t.starts_with("not") {
+        first.to_string()
+    } else {
+        format!("({first})")
+    };
+    Ok(Value::Bool(crate::css::supports(&cond)))
+}
+
+/// `CSS.escape()`: serialize a CSS identifier.
+fn css_escape(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let s = it.to_str(&arg(a, 0))?;
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        match c {
+            '\0' => out.push('\u{FFFD}'),
+            '\u{1}'..='\u{1f}' | '\u{7f}' => out.push_str(&format!("\\{:x} ", c as u32)),
+            '0'..='9' if i == 0 || (i == 1 && chars[0] == '-') => out.push_str(&format!("\\{:x} ", c as u32)),
+            '-' if i == 0 && chars.len() == 1 => out.push_str("\\-"),
+            c if c as u32 >= 0x80 || c == '-' || c == '_' || c.is_ascii_alphanumeric() => out.push(c),
+            c => {
+                out.push('\\');
+                out.push(c);
+            }
+        }
+    }
+    Ok(Value::str(&out))
+}
+
 fn kebab_to_camel(s: &str) -> String {
     let mut out = String::new();
     let mut up = false;
@@ -1916,7 +1954,15 @@ pub fn install(it: &mut Interp) {
     ctor(it, "Event", event_ctor, Some(ev.clone()));
     ctor(it, "CustomEvent", event_ctor, Some(ev.clone()));
     ctor(it, "KeyboardEvent", event_ctor, Some(ev.clone()));
-    ctor(it, "MouseEvent", event_ctor, Some(ev));
+    ctor(it, "MouseEvent", event_ctor, Some(ev.clone()));
+    for n in [
+        "UIEvent", "PointerEvent", "FocusEvent", "InputEvent", "WheelEvent", "TouchEvent", "ErrorEvent",
+        "PromiseRejectionEvent", "MessageEvent", "ProgressEvent", "AnimationEvent", "TransitionEvent", "SubmitEvent",
+        "HashChangeEvent", "PopStateEvent", "StorageEvent", "ClipboardEvent", "DragEvent", "CompositionEvent",
+        "BeforeUnloadEvent", "PageTransitionEvent", "ToggleEvent", "SecurityPolicyViolationEvent", "MediaQueryListEvent",
+    ] {
+        ctor(it, n, event_ctor, Some(ev.clone()));
+    }
     for n in [
         "Node", "Element", "HTMLElement", "HTMLDivElement", "HTMLSpanElement", "HTMLInputElement", "HTMLAnchorElement",
         "HTMLImageElement", "HTMLDocument", "Document", "DocumentFragment", "Text", "Comment", "CharacterData",
@@ -1926,6 +1972,17 @@ pub fn install(it: &mut Interp) {
         "HTMLVideoElement", "HTMLAudioElement", "HTMLMediaElement", "HTMLBodyElement", "HTMLHeadElement",
         "HTMLHtmlElement", "HTMLParagraphElement", "HTMLHeadingElement", "HTMLUListElement", "HTMLLIElement",
         "HTMLTableElement", "HTMLSlotElement", "HTMLUnknownElement", "ShadowRoot",
+        "Attr", "XMLDocument", "MathMLElement", "SVGGraphicsElement", "SVGGeometryElement", "SVGPathElement",
+        "SVGGElement", "SVGUseElement", "SVGSymbolElement", "SVGRectElement", "SVGCircleElement", "SVGTextElement",
+        "SVGImageElement", "SVGDefsElement", "SVGStopElement", "SVGLinearGradientElement", "SVGForeignObjectElement",
+        "HTMLDialogElement", "HTMLTitleElement", "HTMLDetailsElement", "HTMLPictureElement", "HTMLSourceElement",
+        "HTMLObjectElement", "HTMLEmbedElement", "HTMLFieldSetElement", "HTMLOutputElement", "HTMLProgressElement",
+        "HTMLMeterElement", "HTMLDataListElement", "HTMLFrameElement", "HTMLMapElement", "HTMLAreaElement",
+        "HTMLBRElement", "HTMLHRElement", "HTMLPreElement", "HTMLQuoteElement", "HTMLModElement", "HTMLOListElement",
+        "HTMLDListElement", "HTMLTableRowElement", "HTMLTableCellElement", "HTMLTableSectionElement",
+        "HTMLTableCaptionElement", "HTMLTableColElement", "HTMLLegendElement", "HTMLOptGroupElement", "HTMLTimeElement",
+        "HTMLDataElement", "HTMLTrackElement", "HTMLBaseElement", "HTMLMenuElement", "HTMLSearchElement",
+        "HTMLFrameSetElement", "HTMLParamElement", "HTMLMarqueeElement", "HTMLDirectoryElement", "HTMLFontElement",
     ] {
         ctor(it, n, crate::js::custom::html_element_ctor, Some(np.clone()));
     }
@@ -2003,9 +2060,17 @@ pub fn install(it: &mut Interp) {
 
     let perf = it.plain();
     it.def_method(&perf, "now", perf_now);
-    for n in ["mark", "measure", "clearMarks"] {
+    for n in ["mark", "measure", "clearMarks", "clearMeasures", "clearResourceTimings", "setResourceTimingBufferSize"] {
         it.def_method(&perf, n, noop);
     }
+    it.def_method(&perf, "getEntries", |it, _, _| Ok(it.array(Vec::new())));
+    it.def_method(&perf, "toJSON", |it, _, _| Ok(Value::Obj(it.plain())));
+
+    // The CSS namespace.
+    let cssns = it.plain();
+    it.def_method(&cssns, "supports", css_supports);
+    it.def_method(&cssns, "escape", css_escape);
+    Interp::set_hidden(&g, "CSS", Value::Obj(cssns));
     it.def_method(&perf, "getEntriesByType", |it, _, _| Ok(it.array(Vec::new())));
     it.def_method(&perf, "getEntriesByName", |it, _, _| Ok(it.array(Vec::new())));
     Interp::set_hidden(&g, "performance", Value::Obj(perf));

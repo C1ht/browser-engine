@@ -1,6 +1,7 @@
 //! Standard library: Object, Function, Array, String, Number, Math, JSON,
 //! Error, RegExp, Date, Map, Set, Promise, Symbol, timers, URI functions.
 
+use super::ordmap::OrdMap;
 use super::regex::Regex;
 use super::*;
 
@@ -606,6 +607,7 @@ fn obj_to_string(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     Ok(Value::str(match &t {
         Value::Undef => "[object Undefined]",
         Value::Null => "[object Null]",
+        Value::BigInt(_) => "[object BigInt]",
         Value::Obj(o) => match o.borrow().kind {
             Kind::Array(_) => "[object Array]",
             Kind::Func(_) => "[object Function]",
@@ -1216,8 +1218,8 @@ fn str_raw(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     }
     Ok(Value::str(&out))
 }
-fn units(s: &str) -> Vec<u16> {
-    s.encode_utf16().collect()
+fn units(s: &Rc<str>) -> Rc<[u16]> {
+    crate::js::str_units(s)
 }
 fn from_units(u: &[u16]) -> Value {
     Value::str(&String::from_utf16_lossy(u))
@@ -1534,7 +1536,7 @@ fn str_search(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 fn pad(it: &mut Interp, t: Value, a: &[Value], start: bool) -> R<Value> {
     let s = this_str(it, &t)?;
     let target = num(it, a, 0)? as usize;
-    let fill: Vec<u16> = if a.len() > 1 && !matches!(a[1], Value::Undef) { units(&it.to_str(&a[1])?) } else { vec![b' ' as u16] };
+    let fill: Vec<u16> = if a.len() > 1 && !matches!(a[1], Value::Undef) { units(&it.to_str(&a[1])?).to_vec() } else { vec![b' ' as u16] };
     let u = units(&s);
     if u.len() >= target || fill.is_empty() {
         return Ok(Value::Str(s));
@@ -1544,9 +1546,9 @@ fn pad(it: &mut Interp, t: Value, a: &[Value], start: bool) -> R<Value> {
     let mut out = Vec::with_capacity(target);
     if start {
         out.extend(padding);
-        out.extend(u);
+        out.extend(u.iter().copied());
     } else {
-        out.extend(u);
+        out.extend(u.iter().copied());
         out.extend(padding);
     }
     Ok(from_units(&out))
@@ -1600,7 +1602,11 @@ fn this_num(it: &mut Interp, t: &Value) -> R<f64> {
     it.to_num(t)
 }
 fn number_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
-    let n = if a.is_empty() { 0.0 } else { it.to_num(&a[0])? };
+    let n = match a.first() {
+        None => 0.0,
+        Some(Value::BigInt(b)) => *b as f64,
+        Some(v) => it.to_num(v)?,
+    };
     if it.constructing {
         return Ok(Value::Obj(it.new_obj(it.p.number.clone(), Kind::Boxed(Value::Num(n)))));
     }
@@ -1894,6 +1900,7 @@ fn json_ser(it: &mut Interp, v: &Value, indent: &str, cur: &str, out: &mut Strin
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Num(n) => out.push_str(&if n.is_finite() { num_to_str(*n) } else { "null".into() }),
+        Value::BigInt(_) => return Err(type_error("Do not know how to serialize a BigInt")),
         Value::Str(s) => json_quote(s, out),
         Value::Obj(o) => {
             if matches!(o.borrow().kind, Kind::Func(_)) {
@@ -2353,21 +2360,15 @@ fn coll_items(it: &mut Interp, a: &[Value]) -> R<Vec<Value>> {
     }
 }
 fn map_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
-    let mut m: Vec<(Value, Value)> = Vec::new();
+    let mut m = OrdMap::default();
     for e in coll_items(it, a)? {
         let k = it.get(&e, "0")?;
         let v = it.get(&e, "1")?;
-        match m.iter_mut().find(|(x, _)| same_value_zero(x, &k)) {
-            Some(slot) => slot.1 = v,
-            None => m.push((k, v)),
-        }
+        m.set(k, v);
     }
     Ok(Value::Obj(it.new_obj(it.p.map.clone(), Kind::Map(m))))
 }
-fn same_value_zero(a: &Value, b: &Value) -> bool {
-    strict_eq(a, b) || matches!((a, b), (Value::Num(x), Value::Num(y)) if x.is_nan() && y.is_nan())
-}
-fn with_map<T>(t: &Value, f: impl FnOnce(&mut Vec<(Value, Value)>) -> T) -> R<T> {
+fn with_map<T>(t: &Value, f: impl FnOnce(&mut OrdMap) -> T) -> R<T> {
     match t {
         Value::Obj(o) => match &mut o.borrow_mut().kind {
             Kind::Map(m) => Ok(f(m)),
@@ -2376,7 +2377,7 @@ fn with_map<T>(t: &Value, f: impl FnOnce(&mut Vec<(Value, Value)>) -> T) -> R<T>
         _ => Err(type_error("not a Map")),
     }
 }
-fn with_set<T>(t: &Value, f: impl FnOnce(&mut Vec<Value>) -> T) -> R<T> {
+fn with_set<T>(t: &Value, f: impl FnOnce(&mut OrdMap) -> T) -> R<T> {
     match t {
         Value::Obj(o) => match &mut o.borrow_mut().kind {
             Kind::Set(m) => Ok(f(m)),
@@ -2387,33 +2388,25 @@ fn with_set<T>(t: &Value, f: impl FnOnce(&mut Vec<Value>) -> T) -> R<T> {
 }
 fn map_get(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let k = arg(a, 0);
-    with_map(&t, |m| m.iter().find(|(x, _)| same_value_zero(x, &k)).map(|(_, v)| v.clone()).unwrap_or_default())
+    with_map(&t, |m| m.get(&k).cloned().unwrap_or_default())
 }
 fn map_set(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let (k, v) = (arg(a, 0), arg(a, 1));
-    with_map(&t, |m| match m.iter_mut().find(|(x, _)| same_value_zero(x, &k)) {
-        Some(slot) => slot.1 = v,
-        None => m.push((k, v)),
-    })?;
+    with_map(&t, |m| m.set(k, v))?;
     Ok(t)
 }
 fn map_has(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let k = arg(a, 0);
-    Ok(Value::Bool(with_map(&t, |m| m.iter().any(|(x, _)| same_value_zero(x, &k)))?))
+    Ok(Value::Bool(with_map(&t, |m| m.has(&k))?))
 }
 fn map_delete(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let k = arg(a, 0);
-    Ok(Value::Bool(with_map(&t, |m| {
-        let n = m.len();
-        m.retain(|(x, _)| !same_value_zero(x, &k));
-        n != m.len()
-    })?))
+    Ok(Value::Bool(with_map(&t, |m| m.remove(&k))?))
 }
 fn coll_clear(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     if let Value::Obj(o) = &t {
         match &mut o.borrow_mut().kind {
-            Kind::Map(m) => m.clear(),
-            Kind::Set(s) => s.clear(),
+            Kind::Map(m) | Kind::Set(m) => m.clear(),
             _ => {}
         }
     }
@@ -2422,15 +2415,14 @@ fn coll_clear(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
 fn coll_size(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     Ok(match &t {
         Value::Obj(o) => match &o.borrow().kind {
-            Kind::Map(m) => Value::Num(m.len() as f64),
-            Kind::Set(s) => Value::Num(s.len() as f64),
+            Kind::Map(m) | Kind::Set(m) => Value::Num(m.len() as f64),
             _ => Value::Undef,
         },
         _ => Value::Undef,
     })
 }
 fn map_for_each(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let items = with_map(&t, |m| m.clone())?;
+    let items = with_map(&t, |m| m.to_vec())?;
     let f = arg(a, 0);
     for (k, v) in items {
         it.call(&f, arg(a, 1), &[v, k, t.clone()])?;
@@ -2442,7 +2434,7 @@ fn snapshot_iter(it: &mut Interp, items: Vec<Value>) -> Value {
     crate::js::iter::make(it, arr, crate::js::iter::IterKind::Values)
 }
 fn map_keys(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
-    let v = with_map(&t, |m| m.iter().map(|(k, _)| k.clone()).collect())?;
+    let v = with_map(&t, |m| m.keys())?;
     Ok(snapshot_iter(it, v))
 }
 fn map_values(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
@@ -2450,12 +2442,12 @@ fn map_values(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     Ok(snapshot_iter(it, v))
 }
 fn map_entries(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
-    let v = with_map(&t, |m| m.clone())?;
+    let v = with_map(&t, |m| m.to_vec())?;
     let out = v.into_iter().map(|(k, v)| it.array(vec![k, v])).collect();
     Ok(snapshot_iter(it, out))
 }
 fn set_entries(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
-    let v = with_set(&t, |s| s.clone())?;
+    let v = with_set(&t, |s| s.keys())?;
     let out = v.into_iter().map(|x| it.array(vec![x.clone(), x])).collect();
     Ok(snapshot_iter(it, out))
 }
@@ -2465,37 +2457,31 @@ fn string_iterator(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     Ok(snapshot_iter(it, chars))
 }
 fn set_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
-    let mut s: Vec<Value> = Vec::new();
+    let mut s = OrdMap::default();
     for v in coll_items(it, a)? {
-        if !s.iter().any(|x| same_value_zero(x, &v)) {
-            s.push(v);
-        }
+        s.set(v, Value::Undef);
     }
     Ok(Value::Obj(it.new_obj(it.p.set.clone(), Kind::Set(s))))
 }
 fn set_add(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let v = arg(a, 0);
     with_set(&t, |s| {
-        if !s.iter().any(|x| same_value_zero(x, &v)) {
-            s.push(v)
+        if !s.has(&v) {
+            s.set(v, Value::Undef)
         }
     })?;
     Ok(t)
 }
 fn set_has(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let v = arg(a, 0);
-    Ok(Value::Bool(with_set(&t, |s| s.iter().any(|x| same_value_zero(x, &v)))?))
+    Ok(Value::Bool(with_set(&t, |s| s.has(&v))?))
 }
 fn set_delete(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let v = arg(a, 0);
-    Ok(Value::Bool(with_set(&t, |s| {
-        let n = s.len();
-        s.retain(|x| !same_value_zero(x, &v));
-        n != s.len()
-    })?))
+    Ok(Value::Bool(with_set(&t, |s| s.remove(&v))?))
 }
 fn set_for_each(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let items = with_set(&t, |s| s.clone())?;
+    let items = with_set(&t, |s| s.keys())?;
     let f = arg(a, 0);
     for v in items {
         it.call(&f, arg(a, 1), &[v.clone(), v, t.clone()])?;
@@ -2503,7 +2489,7 @@ fn set_for_each(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     Ok(Value::Undef)
 }
 fn set_values(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
-    let v = with_set(&t, |s| s.clone())?;
+    let v = with_set(&t, |s| s.keys())?;
     Ok(snapshot_iter(it, v))
 }
 

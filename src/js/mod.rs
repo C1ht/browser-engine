@@ -2,6 +2,7 @@
 //! `parser`, with prototype objects, closures, classes, exceptions,
 //! promises/timers and a DOM binding (see `dom.rs`).
 
+pub mod bigint;
 pub mod binary;
 pub mod builtins;
 pub mod coro;
@@ -12,6 +13,7 @@ pub mod generator;
 pub mod iter;
 pub mod module;
 pub mod observe;
+pub mod ordmap;
 pub mod proxy;
 pub mod lexer;
 pub mod parser;
@@ -36,6 +38,8 @@ pub enum Value {
     Null,
     Bool(bool),
     Num(f64),
+    /// BigInt (64-bit-and-then-some: values beyond i128 throw RangeError).
+    BigInt(i128),
     Str(Rc<str>),
     Obj(ObjRef),
 }
@@ -47,6 +51,7 @@ impl std::fmt::Debug for Value {
             Value::Null => write!(f, "null"),
             Value::Bool(b) => write!(f, "{b}"),
             Value::Num(n) => write!(f, "{}", num_to_str(*n)),
+            Value::BigInt(n) => write!(f, "{n}n"),
             Value::Str(s) => write!(f, "{s:?}"),
             Value::Obj(_) => write!(f, "[object]"),
         }
@@ -68,6 +73,7 @@ impl Value {
             Value::Undef | Value::Null => false,
             Value::Bool(b) => *b,
             Value::Num(n) => *n != 0.0 && !n.is_nan(),
+            Value::BigInt(n) => *n != 0,
             Value::Str(s) => !s.is_empty(),
             Value::Obj(_) => true,
         }
@@ -184,8 +190,8 @@ pub enum Kind {
     Error,
     Date(f64),
     Regex(Rc<regex::Regex>),
-    Map(Vec<(Value, Value)>),
-    Set(Vec<Value>),
+    Map(ordmap::OrdMap),
+    Set(ordmap::OrdMap),
     Promise(PromiseState),
     /// A DOM node wrapper.
     Node(NodeId),
@@ -278,7 +284,11 @@ impl Interp {
             return;
         }
         let Some(src) = self.layout_src.clone() else { return };
+        let t = std::time::Instant::now();
         let (rects, metrics, styles) = crate::engine::script_layout(&self.doc, &src, self.vw, self.vh);
+        if std::env::var_os("BOLT_PROFILE").is_some() {
+            eprintln!("[profile] forced layout {:.1}ms", t.elapsed().as_secs_f64() * 1000.0);
+        }
         self.rects = rects;
         self.scroll_metrics = metrics;
         self.styles = Some((self.doc.version, Rc::new(styles)));
@@ -353,6 +363,7 @@ pub struct Protos {
     pub array: Option<ObjRef>,
     pub string: Option<ObjRef>,
     pub number: Option<ObjRef>,
+    pub bigint: Option<ObjRef>,
     pub boolean: Option<ObjRef>,
     pub error: Option<ObjRef>,
     pub regexp: Option<ObjRef>,
@@ -467,6 +478,8 @@ pub struct Interp {
     pub styles: Option<(u64, Rc<Vec<crate::style::Style>>)>,
     /// Generators / async calls whose coroutines are running, innermost last.
     pub co_stack: Vec<ObjRef>,
+    /// Top-level scripts / module bodies being evaluated (JS on the stack).
+    pub script_running: u32,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
     pub nav: Option<crate::forms::Nav>,
     /// A form a script submitted, to be serialized by the page.
@@ -479,6 +492,14 @@ pub const WINDOW: u32 = u32::MAX - 1;
 
 pub fn type_error(msg: impl Into<String>) -> Value {
     builtins::make_error_value("TypeError", &msg.into())
+}
+
+pub fn range_error(msg: &str) -> Value {
+    builtins::make_error_value("RangeError", msg)
+}
+
+pub fn syntax_error(msg: &str) -> Value {
+    builtins::make_error_value("SyntaxError", msg)
 }
 
 impl Interp {
@@ -546,11 +567,13 @@ impl Interp {
             geom_version: (u64::MAX, 0, 0),
             styles: None,
             co_stack: Vec::new(),
+            script_running: 0,
             nav: None,
             submit_form: None,
             requests: Vec::new(),
         });
         builtins::install(&mut it);
+        bigint::install(&mut it);
         iter::install(&mut it);
         proxy::install(&mut it);
         cssom::install(&mut it);
@@ -630,6 +653,7 @@ impl Interp {
             Value::Null => "null".into(),
             Value::Bool(b) => if *b { "true".into() } else { "false".into() },
             Value::Num(n) => num_to_str(*n).into(),
+            Value::BigInt(n) => n.to_string().into(),
             Value::Str(s) => s.clone(),
             Value::Obj(_) => {
                 let p = self.to_primitive(v, true)?;
@@ -644,6 +668,9 @@ impl Interp {
             Value::Null => 0.0,
             Value::Bool(b) => *b as u8 as f64,
             Value::Num(n) => *n,
+            // (A TypeError for implicit conversion per spec; Number(b) is
+            // handled by the Number constructor.)
+            Value::BigInt(n) => *n as f64,
             Value::Str(s) => str_to_num(s),
             Value::Obj(_) => {
                 let p = self.to_primitive(v, false)?;
@@ -687,6 +714,7 @@ impl Interp {
             Value::Null => "object",
             Value::Bool(_) => "boolean",
             Value::Num(_) => "number",
+            Value::BigInt(_) => "bigint",
             Value::Str(s) => if s.starts_with("@@sym:") { "symbol" } else { "string" },
             Value::Obj(_) => {
                 if Self::is_callable(v) { "function" } else { "object" }
@@ -700,6 +728,7 @@ impl Interp {
         match v {
             Value::Str(_) => self.p.string.clone(),
             Value::Num(_) => self.p.number.clone(),
+            Value::BigInt(_) => self.p.bigint.clone(),
             Value::Bool(_) => self.p.boolean.clone(),
             Value::Obj(o) => Some(o.clone()),
             _ => None,
@@ -1047,13 +1076,28 @@ impl Interp {
             return Err(builtins::make_error_value("RangeError", "Maximum call stack size exceeded"));
         }
         self.depth += 1;
-        let r = self.call_closure_inner(def, env, arrow_this, home, this, args, fobj);
+        let r = if prof::on() {
+            self.call_closure_profiled(def, env, arrow_this, home, this, args, fobj)
+        } else {
+            self.call_closure_inner(def, env, arrow_this, home, this, args, fobj)
+        };
         self.depth -= 1;
+        r
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn call_closure_profiled(&mut self, def: &Rc<FuncDef>, env: Env, arrow_this: Option<Value>, home: Option<ObjRef>, this: Value, args: &[Value], fobj: Option<ObjRef>) -> R<Value> {
+        prof::enter();
+        let r = self.call_closure_inner(def, env, arrow_this, home, this, args, fobj);
+        prof::exit(def);
         r
     }
 
     #[allow(clippy::too_many_arguments)]
     fn call_closure_inner(&mut self, def: &Rc<FuncDef>, env: Env, arrow_this: Option<Value>, home: Option<ObjRef>, this: Value, args: &[Value], fobj: Option<ObjRef>) -> R<Value> {
+        // Sloppy-mode functions see the global object for a missing `this`.
+        let this = if !def.strict && this.is_nullish() { Value::Obj(self.global.clone()) } else { this };
         let scope = if def.arrow {
             let _ = arrow_this;
             new_scope(Some(env), None, None, true)
@@ -1371,6 +1415,7 @@ impl Interp {
     pub fn run_script(&mut self, src: &str) -> Result<(), String> {
         let prog = parse_program(src)?;
         let env = self.genv.clone();
+        self.script_running += 1;
         let r = (|| -> R<()> {
             self.hoist(&prog, &env)?;
             for s in &prog {
@@ -1378,7 +1423,22 @@ impl Interp {
             }
             Ok(())
         })();
+        self.script_running -= 1;
         r.map_err(|e| self.describe_error(&e))
+    }
+
+    /// Run `src` as a function body (developer aid: `return` a value) and
+    /// stringify the result.
+    pub fn eval_str(&mut self, src: &str) -> String {
+        let wrapped = format!("globalThis.__bolt_eval = (function () {{
+{src}
+}})();");
+        if let Err(e) = self.run_script(&wrapped) {
+            return format!("error: {e}");
+        }
+        let g = Value::Obj(self.global.clone());
+        let v = self.get(&g, "__bolt_eval").unwrap_or_default();
+        self.to_str(&v).map(|s| s.to_string()).unwrap_or_else(|e| self.describe_error(&e))
     }
 
     pub fn describe_error(&mut self, e: &Value) -> String {
@@ -1693,7 +1753,7 @@ impl Interp {
                 }
                 let kind_items = match &o.borrow().kind {
                     Kind::Array(a) => Some(a.clone()),
-                    Kind::Set(s) => Some(s.clone()),
+                    Kind::Set(s) => Some(s.keys()),
                     Kind::Typed(t) => Some(t.values().into_iter().map(Value::Num).collect()),
                     Kind::Map(m) => Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).map(|(k, v)| self.array(vec![k, v])).collect()),
                     _ => None,
@@ -1846,6 +1906,7 @@ impl Interp {
     pub fn eval(&mut self, e: &Expr, env: &Env) -> R<Value> {
         Ok(match e {
             Expr::Num(n) => Value::Num(*n),
+            Expr::BigInt(n) => Value::BigInt(*n),
             Expr::Str(s) => Value::Str(s.clone()),
             Expr::Bool(b) => Value::Bool(*b),
             Expr::Null => Value::Null,
@@ -1969,6 +2030,15 @@ impl Interp {
                     }));
                 }
                 let v = self.eval(x, env)?;
+                if let Value::BigInt(b) = v {
+                    return match *op {
+                        "-" => Ok(Value::BigInt(b.checked_neg().ok_or_else(bigint::too_big)?)),
+                        "~" => Ok(Value::BigInt(!b)),
+                        "+" => Err(type_error("Cannot convert a BigInt value to a number")),
+                        "!" => Ok(Value::Bool(b == 0)),
+                        _ => Ok(Value::Undef),
+                    };
+                }
                 match *op {
                     "!" => Value::Bool(!v.truthy()),
                     "-" => Value::Num(-self.to_num(&v)?),
@@ -1980,6 +2050,12 @@ impl Interp {
             }
             Expr::Update { op, prefix, target } => {
                 let old = self.eval(target, env)?;
+                if let Value::BigInt(b) = old {
+                    let new = if *op == "++" { b.checked_add(1) } else { b.checked_sub(1) }.ok_or_else(bigint::too_big)?;
+                    let p = expr_target(target)?;
+                    self.bind_ref(&p, Value::BigInt(new), env)?;
+                    return Ok(Value::BigInt(if *prefix { new } else { b }));
+                }
                 let n = self.to_num(&old)?;
                 let new = if *op == "++" { n + 1.0 } else { n - 1.0 };
                 let p = expr_target(target)?;
@@ -2037,6 +2113,9 @@ impl Interp {
                 let Some(ov) = self.chain_obj(o, env)? else { return Ok(self.short_circuit()) };
                 if *opt && ov.is_nullish() {
                     return Ok(self.short_circuit());
+                }
+                if ov.is_nullish() && trace_on() {
+                    self.log(&format!("[trace] {}.{k} on {:?}", expr_name(o), ov));
                 }
                 let v = self.get(&ov, k)?;
                 self.short = false;
@@ -2120,6 +2199,9 @@ impl Interp {
                 };
                 if *mopt && ov.is_nullish() {
                     return Ok(self.short_circuit());
+                }
+                if ov.is_nullish() && trace_on() {
+                    self.log(&format!("[trace] call {}.{k}() on {:?}", expr_name(o), ov));
                 }
                 let f = if let Expr::Super = **o {
                     let sup = self.eval(o, env)?;
@@ -2207,6 +2289,11 @@ impl Interp {
     }
 
     pub fn binary(&mut self, op: &str, a: &Value, b: &Value) -> R<Value> {
+        if matches!(a, Value::BigInt(_)) || matches!(b, Value::BigInt(_)) {
+            if let Some(r) = bigint::binary(self, op, a, b)? {
+                return Ok(r);
+            }
+        }
         Ok(match op {
             "+" => {
                 let pa = self.to_primitive(a, false)?;
@@ -2292,6 +2379,8 @@ impl Interp {
                 return self.loose_eq(a, &p);
             }
             (Value::Str(x), Value::Str(y)) => x == y,
+            (Value::BigInt(x), Value::BigInt(y)) => x == y,
+            (Value::BigInt(x), Value::Str(s)) | (Value::Str(s), Value::BigInt(x)) => bigint::parse_str(s) == Some(*x),
             _ => self.to_num(a)? == self.to_num(b)?,
         })
     }
@@ -2381,6 +2470,13 @@ impl Interp {
 
     /// Run queued promise reactions.
     pub fn run_microtasks(&mut self) {
+        // A microtask checkpoint happens only with no JS on the stack: not
+        // from natives called by scripts (dispatchEvent, click(), inserted
+        // scripts...) and never inside a coroutine, which a microtask could
+        // otherwise try to resume while it is still running.
+        if self.depth > 0 || self.script_running > 0 || !self.co_stack.is_empty() || coro::running() {
+            return;
+        }
         let mut n = 0;
         loop {
             // Mutations made before a microtask was queued are delivered
@@ -2475,7 +2571,7 @@ fn expr_has_closure(e: &Expr) -> bool {
     let items = |v: &[ArrItem]| v.iter().any(|i| matches!(i, ArrItem::Item(e) | ArrItem::Spread(e) if expr_has_closure(e)));
     match e {
         Expr::Func(_) | Expr::Class(_) => true,
-        Expr::Num(_) | Expr::Str(_) | Expr::Regex(..) | Expr::Ident(_) | Expr::This | Expr::Super | Expr::Null | Expr::Bool(_) => false,
+        Expr::Num(_) | Expr::BigInt(_) | Expr::Str(_) | Expr::Regex(..) | Expr::Ident(_) | Expr::This | Expr::Super | Expr::Null | Expr::Bool(_) => false,
         Expr::Template(_, xs) | Expr::Seq(xs) => xs.iter().any(expr_has_closure),
         Expr::TaggedTemplate(t, _, xs) => expr_has_closure(t) || xs.iter().any(expr_has_closure),
         Expr::Array(v) => items(v),
@@ -2520,6 +2616,7 @@ fn clone_simple(e: &Expr) -> R<Expr> {
         Expr::Ident(n) => Expr::Ident(n.clone()),
         Expr::This => Expr::This,
         Expr::Num(n) => Expr::Num(*n),
+        Expr::BigInt(n) => Expr::BigInt(*n),
         Expr::Str(s) => Expr::Str(s.clone()),
         Expr::Member(o, k, opt) => Expr::Member(Box::new(clone_simple(o)?), k.clone(), *opt),
         Expr::Index(o, k, opt) => Expr::Index(Box::new(clone_simple(o)?), Box::new(clone_simple(k)?), *opt),
@@ -2528,11 +2625,78 @@ fn clone_simple(e: &Expr) -> R<Expr> {
     })
 }
 
+/// `BOLT_PROFILE=2`: self time per JS function (by definition), printed by
+/// `prof::report()`.
+pub mod prof {
+    use super::FuncDef;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::Instant;
+
+    struct Frame {
+        start: Instant,
+        child: f64,
+    }
+
+    thread_local! {
+        static STACK: RefCell<Vec<Frame>> = const { RefCell::new(Vec::new()) };
+        static TOTALS: RefCell<crate::fx::FxHashMap<usize, (Rc<FuncDef>, u64, f64)>> = RefCell::new(Default::default());
+    }
+
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("BOLT_PROFILE").is_ok_and(|v| v == "2"))
+    }
+
+    pub fn enter() {
+        STACK.with(|s| s.borrow_mut().push(Frame { start: Instant::now(), child: 0.0 }));
+    }
+
+    pub fn exit(def: &Rc<FuncDef>) {
+        let Some(f) = STACK.with(|s| s.borrow_mut().pop()) else { return };
+        let total = f.start.elapsed().as_secs_f64() * 1000.0;
+        STACK.with(|s| {
+            if let Some(p) = s.borrow_mut().last_mut() {
+                p.child += total;
+            }
+        });
+        TOTALS.with(|t| {
+            let mut t = t.borrow_mut();
+            let e = t.entry(Rc::as_ptr(def) as usize).or_insert_with(|| (def.clone(), 0, 0.0));
+            e.1 += 1;
+            e.2 += total - f.child;
+        });
+    }
+
+    /// Print the hottest functions and reset.
+    pub fn report() {
+        if !on() {
+            return;
+        }
+        let mut v: Vec<(Rc<FuncDef>, u64, f64)> = TOTALS.with(|t| t.borrow_mut().drain().map(|(_, e)| e).collect());
+        v.sort_by(|a, b| b.2.total_cmp(&a.2));
+        for (def, n, ms) in v.iter().take(25) {
+            let body = format!("{:?}", def.body);
+            let hint: String = body.chars().take(160).collect();
+            eprintln!("[prof] {ms:8.1}ms {n:8}x {}({} params) {hint}", def.name.as_deref().unwrap_or("<anon>"), def.params.len());
+        }
+    }
+}
+
+/// `BOLT_JS_TRACE=1`: log the expression behind property reads of
+/// undefined / null (minified code has no other clue).
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BOLT_JS_TRACE").is_some())
+}
+
 fn expr_name(e: &Expr) -> String {
     match e {
         Expr::Ident(n) => n.to_string(),
         Expr::Member(o, k, _) => format!("{}.{k}", expr_name(o)),
         Expr::This => "this".into(),
+        Expr::Index(o, _, _) => format!("{}[..]", expr_name(o)),
+        Expr::Call(f, ..) => format!("{}()", expr_name(f)),
         _ => "expression".into(),
     }
 }
@@ -2562,6 +2726,7 @@ pub fn strict_eq(a: &Value, b: &Value) -> bool {
         (Value::Undef, Value::Undef) | (Value::Null, Value::Null) => true,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Num(x), Value::Num(y)) => x == y,
+        (Value::BigInt(x), Value::BigInt(y)) => x == y,
         (Value::Str(x), Value::Str(y)) => x == y,
         (Value::Obj(x), Value::Obj(y)) => Rc::ptr_eq(x, y),
         _ => false,
@@ -2603,16 +2768,47 @@ pub fn array_index(k: &str) -> Option<usize> {
     k.parse().ok()
 }
 
-pub fn utf16_len(s: &str) -> usize {
-    if s.is_ascii() { s.len() } else { s.encode_utf16().count() }
+/// Strings shorter than this are re-encoded on demand; longer ones have
+/// their UTF-16 form cached (scripts index into big strings in loops).
+const UNITS_CACHE_MIN: usize = 64;
+
+thread_local! {
+    /// Recently used long strings and their UTF-16 code units (the cache
+    /// holds the string, so its address can't be reused while cached).
+    static UNITS: RefCell<Vec<(Rc<str>, Rc<[u16]>)>> = const { RefCell::new(Vec::new()) };
 }
 
-pub fn utf16_at(s: &str, i: usize) -> Option<String> {
-    if s.is_ascii() {
+/// The UTF-16 code units of a string.
+pub fn str_units(s: &Rc<str>) -> Rc<[u16]> {
+    if s.len() < UNITS_CACHE_MIN {
+        return s.encode_utf16().collect();
+    }
+    UNITS.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(i) = c.iter().position(|(k, _)| Rc::ptr_eq(k, s)) {
+            let e = c.remove(i);
+            let u = e.1.clone();
+            c.push(e);
+            return u;
+        }
+        let u: Rc<[u16]> = s.encode_utf16().collect();
+        if c.len() >= 8 {
+            c.remove(0);
+        }
+        c.push((s.clone(), u.clone()));
+        u
+    })
+}
+
+pub fn utf16_len(s: &Rc<str>) -> usize {
+    if s.len() < UNITS_CACHE_MIN && s.is_ascii() { s.len() } else { str_units(s).len() }
+}
+
+pub fn utf16_at(s: &Rc<str>, i: usize) -> Option<String> {
+    if s.len() < UNITS_CACHE_MIN && s.is_ascii() {
         return s.get(i..i + 1).map(str::to_owned);
     }
-    let u: Vec<u16> = s.encode_utf16().collect();
-    u.get(i).map(|c| String::from_utf16_lossy(&[*c]))
+    str_units(s).get(i).map(|c| String::from_utf16_lossy(&[*c]))
 }
 
 #[cfg(test)]

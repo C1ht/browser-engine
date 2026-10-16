@@ -157,6 +157,7 @@ pub enum Prop {
     TextTransform,
     ListStyleType,
     Visibility,
+    PointerEvents,
     VerticalAlign,
     BoxSizing,
     BorderCollapse,
@@ -1136,7 +1137,7 @@ fn logical_props(name: &str, value: &str) -> Option<Vec<(String, String)>> {
 fn inherited(p: Prop) -> bool {
     matches!(
         p,
-        Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | BorderCollapse | WordBreak | OverflowWrap
+        Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | PointerEvents | BorderCollapse | WordBreak | OverflowWrap
     )
 }
 
@@ -1414,6 +1415,10 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             }
             r
         }
+        "pointer-events" => match v {
+            "none" => kw(Kw::None),
+            _ => kw(Kw::Visible),
+        },
         "visibility" => match v {
             "hidden" | "collapse" => kw(Kw::Hidden),
             "visible" => kw(Kw::Visible),
@@ -1543,6 +1548,7 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "text-transform" => TextTransform,
         "list-style-type" | "list-style" => ListStyleType,
         "visibility" => Visibility,
+        "pointer-events" => PointerEvents,
         "vertical-align" => VerticalAlign,
         "box-sizing" => BoxSizing,
         "border-collapse" => BorderCollapse,

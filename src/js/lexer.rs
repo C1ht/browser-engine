@@ -7,6 +7,7 @@ use std::rc::Rc;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tok {
     Num(f64),
+    BigInt(i128),
     Str(Rc<str>),
     /// Template literal: cooked string parts and the source of each `${}`.
     Template(Vec<Rc<str>>, Vec<String>),
@@ -89,8 +90,15 @@ pub fn tokenize(src: &str) -> Result<Vec<Token>, LexError> {
         let start = i;
         let tok = if c.is_ascii_digit() || (c == '.' && i + 1 < n && chars[i + 1].is_ascii_digit()) {
             let (v, j) = number(&chars, i).ok_or(LexError("bad number".into(), i))?;
-            i = j;
-            Tok::Num(v)
+            if chars.get(j) == Some(&'n') {
+                // BigInt literal
+                let digits: String = chars[i..j].iter().filter(|&&c| c != '_').collect();
+                i = j + 1;
+                Tok::BigInt(crate::js::bigint::parse_literal(&digits).ok_or(LexError("bad BigInt".into(), i))?)
+            } else {
+                i = j;
+                Tok::Num(v)
+            }
         } else if c == '"' || c == '\'' {
             let (s, j) = string(&chars, i).ok_or(LexError("unterminated string".into(), i))?;
             i = j;
@@ -182,9 +190,6 @@ fn number(c: &[char], mut i: usize) -> Option<(f64, usize)> {
             }
             i += 1;
         }
-        if i < n && c[i] == 'n' {
-            i += 1;
-        }
         return Some((v, i));
     }
     let mut s = String::new();
@@ -219,9 +224,6 @@ fn number(c: &[char], mut i: usize) -> Option<(f64, usize)> {
             s.push_str(&e);
             i = j;
         }
-    }
-    if i < n && c[i] == 'n' {
-        i += 1;
     }
     // Legacy octal like 0755.
     if s.len() > 1 && s.starts_with('0') && s.chars().all(|d| d.is_digit(8)) {

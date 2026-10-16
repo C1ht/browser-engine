@@ -108,6 +108,20 @@ fn replace(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 
 fn rule_obj(it: &mut Interp, text: &str, sheet: &Value) -> Value {
     let r = it.plain();
+    let head0 = text.split('{').next().unwrap_or("").trim();
+    let iface = match head0.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("") {
+        "@media" => "CSSMediaRule",
+        "@keyframes" | "@-webkit-keyframes" => "CSSKeyframesRule",
+        "@font-face" => "CSSFontFaceRule",
+        "@import" => "CSSImportRule",
+        "@supports" => "CSSSupportsRule",
+        "@layer" => "CSSLayerBlockRule",
+        "@container" => "CSSContainerRule",
+        "@page" => "CSSPageRule",
+        "@namespace" => "CSSNamespaceRule",
+        _ => "CSSStyleRule",
+    };
+    r.borrow_mut().proto = it.p.web.get(iface).cloned().or_else(|| it.p.object.clone());
     let head = text.split('{').next().unwrap_or("").trim();
     let ty = if head.starts_with("@media") {
         4.0
@@ -240,4 +254,43 @@ pub fn install(it: &mut Interp) {
     }
     Interp::set_hidden(&it.global.clone(), "CSSStyleSheet", ctor);
     it.p.web.insert("CSSStyleSheet", proto);
+
+    // CSSRule interfaces (constructors throw; rule objects use these protos).
+    let iface = |it: &mut Interp, name: &'static str, parent: Option<&'static str>| {
+        let p = it.new_obj(parent.and_then(|n| it.p.web.get(n).cloned()).or_else(|| it.p.object.clone()), Kind::Plain);
+        let c = it.native(illegal_ctor, name);
+        if let Value::Obj(co) = &c {
+            Interp::set_hidden(co, "prototype", Value::Obj(p.clone()));
+        }
+        Interp::set_hidden(&p, "constructor", c.clone());
+        Interp::set_hidden(&it.global.clone(), name, c);
+        it.p.web.insert(name, p);
+    };
+    iface(it, "CSSRule", None);
+    for (n, parent) in [
+        ("CSSStyleRule", "CSSRule"),
+        ("CSSGroupingRule", "CSSRule"),
+        ("CSSConditionRule", "CSSGroupingRule"),
+        ("CSSMediaRule", "CSSConditionRule"),
+        ("CSSSupportsRule", "CSSConditionRule"),
+        ("CSSContainerRule", "CSSConditionRule"),
+        ("CSSLayerBlockRule", "CSSGroupingRule"),
+        ("CSSKeyframesRule", "CSSRule"),
+        ("CSSKeyframeRule", "CSSRule"),
+        ("CSSFontFaceRule", "CSSRule"),
+        ("CSSImportRule", "CSSRule"),
+        ("CSSPageRule", "CSSGroupingRule"),
+        ("CSSNamespaceRule", "CSSRule"),
+    ] {
+        iface(it, n, Some(parent));
+    }
+    if let Some(rp) = it.p.web.get("CSSRule").cloned() {
+        for (k, v) in [("STYLE_RULE", 1.0), ("IMPORT_RULE", 3.0), ("MEDIA_RULE", 4.0), ("FONT_FACE_RULE", 5.0), ("PAGE_RULE", 6.0), ("KEYFRAMES_RULE", 7.0), ("KEYFRAME_RULE", 8.0), ("SUPPORTS_RULE", 12.0)] {
+            Interp::set_hidden(&rp, k, Value::Num(v));
+        }
+    }
+}
+
+fn illegal_ctor(_: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
+    Err(crate::js::type_error("Illegal constructor"))
 }
