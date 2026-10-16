@@ -2370,7 +2370,7 @@ fn set_values(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
 
 // ---------------------------------------------------------------- Promise
 
-fn new_promise(it: &Interp) -> ObjRef {
+pub fn new_promise(it: &Interp) -> ObjRef {
     it.new_obj(it.p.promise.clone(), Kind::Promise(PromiseState::Pending(Vec::new())))
 }
 
@@ -2382,7 +2382,7 @@ fn is_promise(v: &Value) -> Option<ObjRef> {
 }
 
 /// Settle `p`; schedules its reactions as microtasks.
-fn settle(it: &mut Interp, p: &ObjRef, ok: bool, v: Value) {
+pub fn settle(it: &mut Interp, p: &ObjRef, ok: bool, v: Value) {
     let reactions = {
         let mut b = p.borrow_mut();
         let Kind::Promise(st) = &mut b.kind else { return };
@@ -2401,7 +2401,7 @@ fn settle(it: &mut Interp, p: &ObjRef, ok: bool, v: Value) {
 }
 
 /// Resolve `p` with `v`, adopting the state of promises.
-fn resolve_with(it: &mut Interp, p: &ObjRef, v: Value) {
+pub fn resolve_with(it: &mut Interp, p: &ObjRef, v: Value) {
     if let Some(inner) = is_promise(&v) {
         if Rc::ptr_eq(&inner, p) {
             settle(it, p, false, type_error("Chaining cycle detected"));

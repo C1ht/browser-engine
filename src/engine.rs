@@ -135,6 +135,8 @@ fn is_js(doc: &Document, s: NodeId) -> bool {
 
 /// Wall-clock budget for running a page's scripts at load.
 const SCRIPT_BUDGET: f64 = 3000.0;
+/// How long the first paint may wait for scripts' network requests.
+const NET_WAIT: f64 = 1500.0;
 
 /// Run a page's scripts (in document order), load events and zero-delay timers.
 fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, base: &str, vw: f32, vh: f32) -> (Document, Option<js::Interp>, f64) {
@@ -173,6 +175,20 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, url: &str, ba
             break;
         }
         run_pending(&mut it, &t0);
+    }
+    // Let data requested at startup (fetch / XHR) arrive before the first
+    // paint, within a bounded wait; later responses arrive via `tick`.
+    let net_start = Instant::now();
+    while it.has_pending_requests() && ms(t0) < SCRIPT_BUDGET && ms(net_start) < NET_WAIT {
+        let left = (SCRIPT_BUDGET - ms(t0)).min(NET_WAIT - ms(net_start)).max(1.0);
+        if it.poll_requests(Some(std::time::Duration::from_millis(left.min(50.0) as u64))) {
+            run_pending(&mut it, &t0);
+            for _ in 0..3 {
+                if it.run_timers(1.0) == 0 {
+                    break;
+                }
+            }
+        }
     }
     let elapsed = ms(t0);
     it.dirty = false;
@@ -232,7 +248,7 @@ pub fn fetch_fonts(faces: &[css::FontFace]) {
 /// Fetch images (one parallel batch) and decode them on all cores; `done`
 /// is called as each finishes decoding.
 pub fn fetch_images(urls: &[String], done: &(dyn Fn(String, Option<Arc<Image>>) + Sync)) {
-    let bodies = net::fetch_many(urls);
+    let bodies = net::fetch_many_accept(urls, net::ACCEPT_IMG);
     let next = AtomicUsize::new(0);
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(urls.len().max(1));
     std::thread::scope(|s| {
@@ -348,11 +364,12 @@ fn inline_svgs(doc: &Document, styles: &[Style], res: &mut Resources) {
         let mut markup = String::new();
         doc.outer_html(id, &mut markup);
         let color = styles[i].color;
+        let fluid = e.attr(k::width).is_none() && e.attr(k::height).is_none();
         let mut h = crate::fx::FxHasher::default();
         markup.hash(&mut h);
-        let key = format!("svg-inline:{:x}:{color:x}", h.finish());
+        let key = format!("svg-inline:{:x}:{color:x}:{fluid}", h.finish());
         if !res.images.contains_key(&key) {
-            let img = crate::svg::render(&markup, color, None).map(|r| Arc::new(Image { vector: true, ..image::from_pixels(r.w, r.h, r.px, r.iw, r.ih) }));
+            let img = crate::svg::render(&markup, color, None).map(|r| Arc::new(Image { vector: true, fluid, ..image::from_pixels(r.w, r.h, r.px, r.iw, r.ih) }));
             res.images.insert(key.clone(), img);
         }
         res.img_src.insert(id, key);
@@ -791,12 +808,18 @@ impl Page {
 
     /// Run due timers (`now` = ms since load). Returns true if the page changed.
     pub fn tick(&mut self, now: f64) -> bool {
-        let due = self.js.as_ref().and_then(|it| it.next_timer_at()).is_some_and(|t| t <= now);
-        if !due {
+        let Some(it) = &self.js else { return false };
+        let due = it.next_timer_at().is_some_and(|t| t <= now);
+        if !due && it.requests.is_empty() {
             return false;
         }
         let before = self.layouts;
-        self.with_js(|it| it.run_timers(now));
+        self.with_js(|it| {
+            it.poll_requests(None);
+            if due {
+                it.run_timers(now);
+            }
+        });
         self.layouts != before
     }
 

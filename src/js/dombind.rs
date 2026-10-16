@@ -19,7 +19,7 @@ pub fn node_obj(it: &mut Interp, id: NodeId) -> Value {
     Value::Obj(o)
 }
 
-fn node_id(v: &Value) -> Option<NodeId> {
+pub(crate) fn node_id(v: &Value) -> Option<NodeId> {
     match v {
         Value::Obj(o) => match o.borrow().kind {
             Kind::Node(id) => Some(id),
@@ -295,6 +295,7 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
             let c = it.doc.children(id).filter(|&c| is_elem(it, c)).last().unwrap_or(NONE);
             node_obj(it, c)
         }
+        "content" if it.doc.tag(id) == Some(k::template) => node_obj(it, id),
         "nextElementSibling" => node_obj(it, it.doc.next_element(id)),
         "previousElementSibling" => node_obj(it, it.doc.prev_element(id)),
         "textContent" | "innerText" | "nodeValue" | "data" | "outerText" => {
@@ -889,7 +890,7 @@ fn dispatch_event_m(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     Ok(Value::Bool(!prevented))
 }
 
-fn new_event(it: &mut Interp, ty: &str) -> Value {
+pub(crate) fn new_event(it: &mut Interp, ty: &str) -> Value {
     let e = it.new_obj(it.p.event.clone(), Kind::Plain);
     Interp::set_prop(&e, "type", Value::str(ty));
     Interp::set_prop(&e, "bubbles", Value::Bool(true));
@@ -1254,6 +1255,8 @@ pub fn install(it: &mut Interp) {
         ("removeEventListener", remove_listener),
         ("dispatchEvent", dispatch_event_m),
         ("click", n_click),
+        ("getContext", |_, _, _| Ok(Value::Null)),
+        ("toDataURL", |_, _, _| Ok(Value::str("data:,"))),
         ("focus", n_focus),
         ("blur", n_blur),
         ("submit", n_submit),
@@ -1316,7 +1319,16 @@ pub fn install(it: &mut Interp) {
     ctor(it, "CustomEvent", event_ctor, Some(ev.clone()));
     ctor(it, "KeyboardEvent", event_ctor, Some(ev.clone()));
     ctor(it, "MouseEvent", event_ctor, Some(ev));
-    for n in ["Node", "Element", "HTMLElement", "HTMLDivElement", "HTMLInputElement", "HTMLAnchorElement", "HTMLImageElement", "HTMLDocument", "Document", "Text", "EventTarget", "SVGElement"] {
+    for n in [
+        "Node", "Element", "HTMLElement", "HTMLDivElement", "HTMLSpanElement", "HTMLInputElement", "HTMLAnchorElement",
+        "HTMLImageElement", "HTMLDocument", "Document", "DocumentFragment", "Text", "Comment", "CharacterData",
+        "EventTarget", "SVGElement", "SVGSVGElement", "HTMLTemplateElement", "HTMLScriptElement", "HTMLStyleElement",
+        "HTMLLinkElement", "HTMLMetaElement", "HTMLButtonElement", "HTMLFormElement", "HTMLSelectElement",
+        "HTMLOptionElement", "HTMLTextAreaElement", "HTMLLabelElement", "HTMLIFrameElement", "HTMLCanvasElement",
+        "HTMLVideoElement", "HTMLAudioElement", "HTMLMediaElement", "HTMLBodyElement", "HTMLHeadElement",
+        "HTMLHtmlElement", "HTMLParagraphElement", "HTMLHeadingElement", "HTMLUListElement", "HTMLLIElement",
+        "HTMLTableElement", "HTMLSlotElement", "HTMLUnknownElement", "ShadowRoot",
+    ] {
         ctor(it, n, w_unsupported_ctor, Some(np.clone()));
     }
     for n in ["MutationObserver", "IntersectionObserver", "ResizeObserver", "PerformanceObserver"] {
@@ -1370,7 +1382,7 @@ pub fn install(it: &mut Interp) {
     Interp::set_hidden(&g, "location", Value::Obj(loc));
 
     let nav = it.plain();
-    Interp::set_prop(&nav, "userAgent", Value::str("Mozilla/5.0 (Windows NT 10.0; Win64; x64) bolt/0.1 (like Gecko)"));
+    Interp::set_prop(&nav, "userAgent", Value::str(crate::net::UA));
     Interp::set_prop(&nav, "language", Value::str("en-US"));
     Interp::set_prop(&nav, "languages", it.array(vec![Value::str("en-US"), Value::str("en")]));
     Interp::set_prop(&nav, "platform", Value::str("Win32"));

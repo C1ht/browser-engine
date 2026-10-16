@@ -6,7 +6,12 @@
 
 use std::process::Command;
 
-const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) bolt/0.1 (like Gecko)";
+/// A Chrome user agent: many sites refuse or degrade unknown browsers.
+pub const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const ACCEPT_DOC: &str = "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+/// Advertise WebP/AVIF so image CDNs serve them.
+pub const ACCEPT_IMG: &str = "Accept: image/avif,image/webp,image/svg+xml,image/*,*/*;q=0.8";
+const ACCEPT_LANG: &str = "Accept-Language: en-US,en;q=0.9";
 
 /// Where cookies persist between requests and runs.
 fn cookie_jar() -> String {
@@ -15,6 +20,98 @@ fn cookie_jar() -> String {
 
 pub fn fetch(url: &str) -> Result<(String, Vec<u8>), String> {
     request(url, None)
+}
+
+/// An HTTP response.
+#[derive(Debug, Clone)]
+pub struct Http {
+    pub status: u16,
+    pub url: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Http {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().rev().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
+    }
+}
+
+/// A general request (for scripts' fetch / XMLHttpRequest): any method,
+/// request headers and body; returns status, final URL, headers and body.
+pub fn http(method: &str, url: &str, headers: &[(String, String)], body: Option<&[u8]>) -> Result<Http, String> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    if url.starts_with("data:") {
+        let body = crate::image::data_url(url).ok_or("bad data: URL")?;
+        let mime = url[5..].split([',', ';']).next().unwrap_or("text/plain").to_owned();
+        return Ok(Http { status: 200, url: url.to_owned(), headers: vec![("content-type".into(), mime)], body });
+    }
+    if url.starts_with("file:") {
+        let (u, b) = request(url, None)?;
+        return Ok(Http { status: 200, url: u, headers: Vec::new(), body: b });
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!("unsupported URL scheme: {url}"));
+    }
+    let hdr_path = std::env::temp_dir().join(format!("bolt-h-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+    let jar = cookie_jar();
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sS", "-L", "--compressed", "--max-time", "30", "-A", UA, "-b", &jar, "-c", &jar, "-D"]);
+    cmd.arg(&hdr_path);
+    cmd.args(["-w", "%{stderr}\n@@BOLT %{http_code} %{url_effective}\n"]);
+    let m = method.to_ascii_uppercase();
+    if m == "HEAD" {
+        cmd.arg("--head");
+    } else if m != "GET" {
+        cmd.args(["-X", &m]);
+    }
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
+        cmd.args(["-H", "Accept: */*"]);
+    }
+    cmd.args(["-H", ACCEPT_LANG]);
+    for (k, v) in headers {
+        if k.contains(['\r', '\n']) || v.contains(['\r', '\n']) {
+            continue;
+        }
+        cmd.arg("-H").arg(format!("{k}: {v}"));
+    }
+    if body.is_some() {
+        cmd.args(["--data-binary", "@-"]);
+    }
+    cmd.arg(url).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("could not run curl: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Some(b) = body {
+            let _ = stdin.write_all(b);
+        }
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    let raw_headers = std::fs::read(&hdr_path).unwrap_or_default();
+    let _ = std::fs::remove_file(&hdr_path);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let marker = err.lines().rev().find_map(|l| l.strip_prefix("@@BOLT "));
+    let (status, final_url) = match marker {
+        Some(m) => {
+            let (code, u) = m.split_once(' ').unwrap_or((m, url));
+            (code.trim().parse::<u16>().unwrap_or(0), u.trim().to_owned())
+        }
+        None => (0, url.to_owned()),
+    };
+    if status == 0 {
+        let msg = err.lines().find(|l| !l.starts_with("@@BOLT")).unwrap_or("network error").trim().to_owned();
+        return Err(msg);
+    }
+    // The last header block belongs to the final response after redirects.
+    let text = String::from_utf8_lossy(&raw_headers).replace("\r\n", "\n");
+    let block = text.split("\n\n").filter(|b| b.trim_start().starts_with("HTTP/")).last().unwrap_or("");
+    let headers = block
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned())))
+        .collect();
+    Ok(Http { status, url: if final_url.is_empty() { url.to_owned() } else { final_url }, headers, body: out.stdout })
 }
 
 /// Fetch a URL, POSTing `post` (form-urlencoded) if given. Returns the final
@@ -27,7 +124,7 @@ pub fn request(url: &str, post: Option<&str>) -> Result<(String, Vec<u8>), Strin
     if url.starts_with("http://") || url.starts_with("https://") {
         let jar = cookie_jar();
         let mut cmd = Command::new("curl");
-        cmd.args(["-sSL", "--compressed", "--max-time", "20", "-A", UA, "-b", &jar, "-c", &jar, "-w", "\n%{url_effective}"]);
+        cmd.args(["-sSL", "--compressed", "--max-time", "20", "-A", UA, "-H", ACCEPT_DOC, "-H", ACCEPT_LANG, "-b", &jar, "-c", &jar, "-w","\n%{url_effective}"]);
         if let Some(body) = post {
             // curl sends the form Content-Type itself (setting it by hand
             // reorders headers, which some sites treat as a bot signal).
@@ -54,6 +151,11 @@ pub fn request(url: &str, post: Option<&str>) -> Result<(String, Vec<u8>), Strin
 /// with `--parallel`, so connections (and HTTP/2 multiplexing) are reused
 /// instead of paying a TLS handshake per resource.
 pub fn fetch_many(urls: &[String]) -> Vec<Option<Vec<u8>>> {
+    fetch_many_accept(urls, "Accept: */*")
+}
+
+/// `fetch_many` with a specific Accept header.
+pub fn fetch_many_accept(urls: &[String], accept: &str) -> Vec<Option<Vec<u8>>> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static BATCH: AtomicUsize = AtomicUsize::new(0);
     let mut out: Vec<Option<Vec<u8>>> = vec![None; urls.len()];
@@ -83,7 +185,7 @@ pub fn fetch_many(urls: &[String]) -> Vec<Option<Vec<u8>>> {
     let cfg_path = dir.join("batch.cfg");
     if std::fs::write(&cfg_path, cfg).is_ok() {
         let _ = Command::new("curl")
-            .args(["-sSL", "--fail", "--compressed", "--max-time", "30", "--parallel", "--parallel-max", "16", "-A", UA, "-b", &cookie_jar(), "-K"])
+            .args(["-sSL", "--fail", "--compressed", "--max-time", "30", "--parallel", "--parallel-max", "16", "-A", UA, "-H", accept, "-H", ACCEPT_LANG, "-b", &cookie_jar(), "-K"])
             .arg(&cfg_path)
             .output();
         for &i in &remote {
@@ -115,7 +217,7 @@ pub fn decode(bytes: &[u8]) -> String {
     }
 }
 
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;

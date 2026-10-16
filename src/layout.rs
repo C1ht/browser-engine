@@ -76,6 +76,8 @@ pub struct LBox {
     pub b: [f32; 4],
     pub p: [f32; 4],
     pub intrinsic: Option<(f32, f32)>,
+    /// Replaced content without an intrinsic width (fills the container).
+    pub fluid: bool,
     pub marker: Option<String>,
     /// First baseline, relative to the content box top.
     pub baseline: Option<f32>,
@@ -492,6 +494,7 @@ impl<'a> Engine<'a> {
             b: [0.0; 4],
             p: [0.0; 4],
             intrinsic: None,
+            fluid: false,
             marker: None,
             baseline: None,
             colspan: 1,
@@ -571,6 +574,7 @@ impl<'a> Engine<'a> {
                 let img = if tag == k::img || tag == k::svg { self.res.img(c).cloned() } else { None };
                 let b = &mut self.boxes[bx as usize];
                 b.repl = img.as_ref().map_or(size, |i| (i.iw, i.ih));
+                b.fluid = img.as_ref().is_some_and(|i| i.fluid);
                 b.img = tag == k::img;
                 b.image = img;
             }
@@ -1025,7 +1029,12 @@ impl<'a> Engine<'a> {
         let v = match kind {
             Kind::Replaced => {
                 let st = self.st(id);
-                let (nw, nh) = self.boxes[id as usize].repl;
+                let (mut nw, mut nh) = self.boxes[id as usize].repl;
+                if self.boxes[id as usize].fluid && nw > 0.0 {
+                    // CSS default object width for content with only an aspect ratio.
+                    nh *= 300.0 / nw;
+                    nw = 300.0;
+                }
                 let w = st.width.fixed().unwrap_or_else(|| match st.height.fixed() {
                     Some(h) if nh > 0.0 => h * nw / nh,
                     _ => nw,
@@ -1214,6 +1223,10 @@ impl<'a> Engine<'a> {
                 (Some(w), Some(h)) => (w, h),
                 (Some(w), None) => (w, ratio.map_or(nh, |r| w * r)),
                 (None, Some(h)) => (ratio.map_or(nw, |r| h / r), h),
+                (None, None) if self.boxes[id as usize].fluid => {
+                    let w = (cb_w - pb_h - m[1] - m[3]).max(0.0);
+                    (w, ratio.map_or(nh, |r| w * r))
+                }
                 (None, None) => (nw, nh),
             };
             // min/max constraints keep the aspect ratio of auto dimensions.

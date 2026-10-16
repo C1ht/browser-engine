@@ -86,16 +86,19 @@ On real sites, total load time is dominated by the network, not the engine.
 - **Fonts:** `@font-face` with TTF, OTF, WOFF and WOFF2 (Brotli plus the `glyf` / `loca` / `hmtx` transforms), matched by weight, style and `unicode-range`; symbol and CJK fallback fonts.
 - **JavaScript:**
   - ES2015+ syntax: classes with private names, destructuring, spread, arrow functions, template literals, optional chaining, `async` / `await`, generators and async generators.
-  - Built-ins: Promises, Map / Set, JSON, RegExp, Date.
-  - DOM: `querySelector`, `innerHTML`, `classList`, `style`, events with bubbling, timers.
+  - Built-ins: Promises, Map / Set, JSON, RegExp, Date, `ArrayBuffer`, typed arrays, `DataView`, `TextEncoder` / `TextDecoder`, `crypto.getRandomValues`.
+  - DOM: `querySelector`, `innerHTML`, `classList`, `style`, events with bubbling, timers, `TreeWalker` / `NodeIterator`, `<template>.content`.
+  - Network: `fetch` (Request, Response, Headers, `AbortController`) and `XMLHttpRequest`, both asynchronous on background threads; `URL`, `URLSearchParams`, `FormData`, `Blob`.
+- **Identity:** bolt sends a Chrome user agent and Chrome's `Accept` headers, so sites serve their modern markup.
 - **Forms:** typing into inputs and textareas with a caret, checkboxes, radio buttons, labels, `<select>` (a click cycles through the options), and GET / POST submission, including Enter in a field. Scripts see `keydown`, `input`, `change`, `focus`, `blur` and `submit` events, and can call `focus()`, `form.submit()` and `requestSubmit()`.
 - **Browser:** links, back / forward history, `#fragment` scrolling, address bar (plain words search DuckDuckGo), resizing, clicks dispatched to scripts, script navigation via `location`, and cookies kept between runs.
 
 ## Not supported (yet)
 
 - Animated images beyond the first frame, AVIF superres, and SVG filters, masks, patterns and markers. A text run uses one font face, so `unicode-range` subsets other than Latin are skipped.
-- ES modules and `fetch` / XHR; text selection and drop-down menus for `<select>`. Generators run their body eagerly on the first `next()`, so an infinite generator stops after 100,000 values.
+- ES modules, custom elements, shadow DOM, WebSocket and `<canvas>`; text selection and drop-down menus for `<select>`. Generators run their body eagerly on the first `next()`, so an infinite generator stops after 100,000 values.
 - Transforms, filters, animations / transitions and right-to-left text.
+- YouTube: its content is built from custom elements, so only the loading skeleton renders.
 - Google search results: Google only serves them after a JavaScript anti-bot challenge that bolt can't pass yet. Forms on Google (search box, cookie consent) work.
 
 ## Tests

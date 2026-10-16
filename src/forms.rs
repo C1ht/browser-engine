@@ -327,6 +327,18 @@ pub fn submission(doc: &Document, form: NodeId, submitter: NodeId, base: &str) -
     if url.starts_with("javascript:") {
         return None;
     }
+    let pairs = form_pairs(doc, form, submitter);
+    let body = pairs.iter().map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v))).collect::<Vec<_>>().join("&");
+    if method == "post" {
+        Some(Nav { url, post: Some(body) })
+    } else {
+        let stem = url.split(['?', '#']).next().unwrap_or(&url);
+        Some(Nav { url: format!("{stem}?{body}"), post: None })
+    }
+}
+
+/// The (name, value) pairs a form submits, in tree order.
+pub fn form_pairs(doc: &Document, form: NodeId, submitter: NodeId) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     for n in doc.preorder() {
         let Some(el) = doc.elem(n) else { continue };
@@ -355,13 +367,7 @@ pub fn submission(doc: &Document, form: NodeId, submitter: NodeId, base: &str) -
         }
         pairs.push((name.to_owned(), value(doc, n)));
     }
-    let body = pairs.iter().map(|(k, v)| format!("{}={}", urlencode(k), urlencode(v))).collect::<Vec<_>>().join("&");
-    if method == "post" {
-        Some(Nav { url, post: Some(body) })
-    } else {
-        let stem = url.split(['?', '#']).next().unwrap_or(&url);
-        Some(Nav { url: format!("{stem}?{body}"), post: None })
-    }
+    pairs
 }
 
 /// application/x-www-form-urlencoded byte serializer.

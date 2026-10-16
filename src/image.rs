@@ -15,6 +15,9 @@ pub struct Image {
     pub ih: f32,
     /// Rendered from vector data (SVG): scales preserving aspect ratio.
     pub vector: bool,
+    /// No intrinsic width (an inline `<svg>` without width/height): fills
+    /// the containing block's width.
+    pub fluid: bool,
 }
 
 const MAX_DIM: u32 = 4096;
@@ -57,7 +60,7 @@ pub fn from_pixels(w: u32, h: u32, px: Vec<u32>, iw: f32, ih: f32) -> Image {
         mips.push((nw, nh, next.clone()));
         (mw, mh, cur) = (nw, nh, Some(next));
     }
-    Image { w, h, px, mips, iw, ih, vector: false }
+    Image { w, h, px, mips, iw, ih, vector: false, fluid: false }
 }
 
 /// 2x2 box filter.

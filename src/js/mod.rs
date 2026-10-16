@@ -2,11 +2,13 @@
 //! `parser`, with prototype objects, closures, classes, exceptions,
 //! promises/timers and a DOM binding (see `dom.rs`).
 
+pub mod binary;
 pub mod builtins;
 pub mod dombind;
 pub mod lexer;
 pub mod parser;
 pub mod regex;
+pub mod web;
 
 use crate::dom::{Document, NodeId};
 use crate::fx::FxHashMap;
@@ -186,6 +188,13 @@ pub enum Kind {
     /// Boxed primitive (new String(...), etc).
     Boxed(Value),
     Generator(Box<Gen>),
+    /// ArrayBuffer contents.
+    Buffer(Vec<u8>),
+    /// A typed array view onto an ArrayBuffer.
+    Typed(binary::View),
+    DataView(binary::View),
+    /// Headers / URLSearchParams / FormData entries.
+    Pairs(web::PairKind, Vec<(Rc<str>, Rc<str>)>),
 }
 
 /// A generator. Its body runs to completion on the first `next()` (with a
@@ -268,6 +277,12 @@ pub struct Protos {
     pub generator: Option<ObjRef>,
     pub style: Option<ObjRef>,
     pub classlist: Option<ObjRef>,
+    pub array_buffer: Option<ObjRef>,
+    pub data_view: Option<ObjRef>,
+    /// Per element type, in `binary::TA_ALL` order.
+    pub typed: Vec<ObjRef>,
+    /// Web API prototypes by interface name.
+    pub web: FxHashMap<&'static str, ObjRef>,
     pub errors: FxHashMap<&'static str, ObjRef>,
 }
 
@@ -312,6 +327,8 @@ pub struct Interp {
     pub nav: Option<crate::forms::Nav>,
     /// A form a script submitted, to be serialized by the page.
     pub submit_form: Option<NodeId>,
+    /// fetch / XMLHttpRequest requests in flight.
+    pub requests: Vec<web::Pending>,
 }
 
 pub const WINDOW: u32 = u32::MAX - 1;
@@ -356,9 +373,15 @@ impl Interp {
             gen_sinks: Vec::new(),
             nav: None,
             submit_form: None,
+            requests: Vec::new(),
         };
         builtins::install(&mut it);
+        binary::install(&mut it);
         dombind::install(&mut it);
+        web::install(&mut it);
+        if let Err(e) = it.run_script(include_str!("prelude.js")) {
+            eprintln!("js prelude: {e}");
+        }
         it
     }
 
@@ -522,6 +545,14 @@ impl Interp {
                                 return Ok(a.get(i).cloned().unwrap_or_default());
                             }
                         }
+                        Kind::Typed(t) => {
+                            if key == "length" {
+                                return Ok(Value::Num(t.len as f64));
+                            }
+                            if let Some(i) = array_index(key) {
+                                return Ok(t.get(i).map_or(Value::Undef, Value::Num));
+                            }
+                        }
                         Kind::Node(_) | Kind::Style(_) | Kind::ClassList(_) | Kind::Dataset(_) => {}
                         _ => {}
                     }
@@ -575,10 +606,14 @@ impl Interp {
 
     pub fn get_v(&mut self, target: &Value, key: &Value) -> R<Value> {
         if let (Value::Obj(o), Value::Num(n)) = (target, key) {
-            if let Kind::Array(a) = &o.borrow().kind {
-                if *n >= 0.0 && n.fract() == 0.0 {
+            match &o.borrow().kind {
+                Kind::Array(a) if *n >= 0.0 && n.fract() == 0.0 => {
                     return Ok(a.get(*n as usize).cloned().unwrap_or_default());
                 }
+                Kind::Typed(t) if *n >= 0.0 && n.fract() == 0.0 => {
+                    return Ok(t.get(*n as usize).map_or(Value::Undef, Value::Num));
+                }
+                _ => {}
             }
         }
         let k = self.key(key)?;
@@ -592,6 +627,20 @@ impl Interp {
             }
             return Ok(());
         };
+        let typed = match &o.borrow().kind {
+            Kind::Typed(t) => Some(t.clone()),
+            _ => None,
+        };
+        if let Some(t) = typed {
+            if let Some(i) = array_index(key) {
+                let x = self.to_num(&v)?;
+                t.set(i, x);
+                return Ok(());
+            }
+            if key == "length" {
+                return Ok(());
+            }
+        }
         {
             let mut ob = o.borrow_mut();
             if let Kind::Array(a) = &mut ob.kind {
@@ -649,6 +698,15 @@ impl Interp {
 
     pub fn put_v(&mut self, target: &Value, key: &Value, v: Value) -> R<()> {
         if let (Value::Obj(o), Value::Num(n)) = (target, key) {
+            let typed = match &o.borrow().kind {
+                Kind::Typed(t) if *n >= 0.0 && n.fract() == 0.0 => Some(t.clone()),
+                _ => None,
+            };
+            if let Some(t) = typed {
+                let x = self.to_num(&v)?;
+                t.set(*n as usize, x);
+                return Ok(());
+            }
             let mut ob = o.borrow_mut();
             if let Kind::Array(a) = &mut ob.kind {
                 if *n >= 0.0 && n.fract() == 0.0 && (*n as usize) < a.len() + 1000 {
@@ -675,6 +733,11 @@ impl Interp {
                     return true;
                 }
             }
+            if let Kind::Typed(t) = &o.borrow().kind {
+                if let Some(i) = array_index(key) {
+                    return i < t.len;
+                }
+            }
             if matches!(o.borrow().kind, Kind::Node(_)) && dombind::has(self, o, key) {
                 return true;
             }
@@ -696,8 +759,10 @@ impl Interp {
             Value::Obj(o) => {
                 let ob = o.borrow();
                 let mut out: Vec<Rc<str>> = Vec::new();
-                if let Kind::Array(a) = &ob.kind {
-                    out.extend((0..a.len()).map(|i| Rc::from(i.to_string())));
+                match &ob.kind {
+                    Kind::Array(a) => out.extend((0..a.len()).map(|i| Rc::from(i.to_string()))),
+                    Kind::Typed(t) => out.extend((0..t.len).map(|i| Rc::from(i.to_string()))),
+                    _ => {}
                 }
                 out.extend(ob.props.list.iter().filter(|(k, p)| p.enumerable && !k.starts_with("@@")).map(|(k, _)| k.clone()));
                 out
@@ -1314,6 +1379,7 @@ impl Interp {
                 let kind_items = match &o.borrow().kind {
                     Kind::Array(a) => Some(a.clone()),
                     Kind::Set(s) => Some(s.clone()),
+                    Kind::Typed(t) => Some(t.values().into_iter().map(Value::Num).collect()),
                     Kind::Map(m) => Some(m.iter().map(|(k, v)| (k.clone(), v.clone())).map(|(k, v)| self.array(vec![k, v])).collect()),
                     _ => None,
                 };
