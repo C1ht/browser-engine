@@ -398,6 +398,13 @@ pub fn install(it: &mut Interp) {
         it.def_method(&pp, n, f);
     }
 
+    // Generators
+    let gp = it.new_obj(Some(object.clone()), Kind::Plain);
+    for (n, f) in [("next", gen_next as NativeFn), ("return", gen_return), ("throw", gen_throw), ("@@iterator", identity_this), ("@@asyncIterator", identity_this)] {
+        it.def_method(&gp, n, f);
+    }
+    it.p.generator = Some(gp);
+
     // Symbol
     let sym = it.native(symbol_fn, "Symbol");
     if let Value::Obj(s) = &sym {
@@ -2664,6 +2671,67 @@ fn promise_race(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
         add_reaction(it, &p, ok, err, None);
     }
     Ok(Value::Obj(agg))
+}
+
+// -------------------------------------------------------------- Generator
+
+fn gen_obj(t: &Value) -> R<ObjRef> {
+    match t {
+        Value::Obj(o) if matches!(o.borrow().kind, Kind::Generator(_)) => Ok(o.clone()),
+        _ => Err(type_error("not a generator")),
+    }
+}
+fn iter_result(it: &mut Interp, value: Value, done: bool) -> Value {
+    let r = it.plain();
+    Interp::set_prop(&r, "value", value);
+    Interp::set_prop(&r, "done", Value::Bool(done));
+    Value::Obj(r)
+}
+fn gen_finish(it: &mut Interp, o: &ObjRef, r: R<Value>) -> R<Value> {
+    let is_async = matches!(&o.borrow().kind, Kind::Generator(g) if g.is_async);
+    if !is_async {
+        return r;
+    }
+    Ok(match r {
+        Ok(v) => promise_resolved(it, v),
+        Err(e) => promise_rejected(it, e),
+    })
+}
+fn gen_next(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let o = gen_obj(&t)?;
+    it.gen_run(&o);
+    let step = match &mut o.borrow_mut().kind {
+        Kind::Generator(g) => match g.buf.pop_front() {
+            Some(v) => Ok((v, false)),
+            None => match g.err.take() {
+                Some(e) => Err(e),
+                None => Ok((g.ret.take().unwrap_or_default(), true)),
+            },
+        },
+        _ => unreachable!(),
+    };
+    let r = step.map(|(v, done)| iter_result(it, v, done));
+    gen_finish(it, &o, r)
+}
+fn gen_return(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let o = gen_obj(&t)?;
+    if let Kind::Generator(g) = &mut o.borrow_mut().kind {
+        g.start = None;
+        g.buf.clear();
+        g.ret = None;
+        g.err = None;
+    }
+    let r = Ok(iter_result(it, arg(a, 0), true));
+    gen_finish(it, &o, r)
+}
+fn gen_throw(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let o = gen_obj(&t)?;
+    if let Kind::Generator(g) = &mut o.borrow_mut().kind {
+        g.start = None;
+        g.buf.clear();
+        g.ret = None;
+    }
+    gen_finish(it, &o, Err(arg(a, 0)))
 }
 
 // ----------------------------------------------------------------- Symbol

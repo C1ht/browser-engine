@@ -34,6 +34,8 @@ pub enum Expr {
     Seq(Vec<Expr>),
     Spread(Box<Expr>),
     Await(Box<Expr>),
+    /// `yield` / `yield*`
+    Yield(Option<Box<Expr>>, bool),
     TaggedTemplate(Box<Expr>, Vec<Name>, Vec<Expr>),
 }
 
@@ -82,6 +84,7 @@ pub struct FuncDef {
     pub body: Body,
     pub arrow: bool,
     pub is_async: bool,
+    pub is_gen: bool,
 }
 
 #[derive(Debug)]
@@ -142,13 +145,15 @@ pub struct Parser {
     toks: Vec<Token>,
     i: usize,
     in_func: bool,
+    /// Inside a generator body (`yield` is an operator).
+    in_gen: bool,
 }
 
 pub type PResult<T> = Result<T, String>;
 
 pub fn parse_program(src: &str) -> PResult<Vec<Stmt>> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {} at {}", e.0, e.1))?;
-    let mut p = Parser { toks, i: 0, in_func: false };
+    let mut p = Parser { toks, i: 0, in_func: false, in_gen: false };
     let mut out = Vec::new();
     while !p.at_eof() {
         out.push(p.statement()?);
@@ -169,7 +174,7 @@ pub fn parse_function(params: &[&str], body: &str) -> PResult<Rc<FuncDef>> {
 
 fn parse_expr_src(src: &str) -> PResult<Expr> {
     let toks = tokenize(src).map_err(|e| format!("SyntaxError: {}", e.0))?;
-    let mut p = Parser { toks, i: 0, in_func: true };
+    let mut p = Parser { toks, i: 0, in_func: true, in_gen: false };
     let e = p.expression(false)?;
     if !p.at_eof() {
         return Err("SyntaxError: junk in template expression".into());
@@ -565,19 +570,18 @@ impl Parser {
         Ok((ps, rest))
     }
 
-    fn func_body(&mut self) -> PResult<Vec<Stmt>> {
+    fn func_body(&mut self, is_gen: bool) -> PResult<Vec<Stmt>> {
         self.expect("{")?;
-        let saved = self.in_func;
+        let saved = (self.in_func, self.in_gen);
         self.in_func = true;
+        self.in_gen = is_gen;
         let b = self.block_body();
-        self.in_func = saved;
+        (self.in_func, self.in_gen) = saved;
         b
     }
 
     fn function_rest(&mut self, is_async: bool, need_name: bool) -> PResult<Rc<FuncDef>> {
-        if self.eat("*") {
-            return self.err("generators are not supported");
-        }
+        let is_gen = self.eat("*");
         let name = match self.peek() {
             Tok::Ident(n) if !self.is("(") => {
                 let n = n.clone();
@@ -588,14 +592,14 @@ impl Parser {
             _ => None,
         };
         let (params, rest) = self.params()?;
-        let body = self.func_body()?;
-        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async }))
+        let body = self.func_body(is_gen)?;
+        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen }))
     }
 
-    fn method(&mut self, name: Option<Name>, is_async: bool) -> PResult<Rc<FuncDef>> {
+    fn method(&mut self, name: Option<Name>, is_async: bool, is_gen: bool) -> PResult<Rc<FuncDef>> {
         let (params, rest) = self.params()?;
-        let body = self.func_body()?;
-        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async }))
+        let body = self.func_body(is_gen)?;
+        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen }))
     }
 
     fn class_rest(&mut self, need_name: bool) -> PResult<Rc<ClassDef>> {
@@ -623,7 +627,7 @@ impl Parser {
                     // static initialization block: run as a static method-less field
                     self.next();
                     let body = self.block_body()?;
-                    let f = Rc::new(FuncDef { name: None, params: vec![], rest: None, body: Body::Block(body), arrow: false, is_async: false });
+                    let f = Rc::new(FuncDef { name: None, params: vec![], rest: None, body: Body::Block(body), arrow: false, is_async: false, is_gen: false });
                     cd.fields.push((true, PropKey::Name("".into()), Some(Expr::Call(Box::new(Expr::Func(f)), vec![], false))));
                     continue;
                 }
@@ -637,11 +641,11 @@ impl Parser {
                 self.next();
                 is_async = true;
             }
-            self.eat("*");
+            let is_gen = self.eat("*");
             let key = self.prop_name()?;
             if self.is("(") {
                 let fname = if let PropKey::Name(n) = &key { Some(n.clone()) } else { None };
-                let f = self.method(fname.clone(), is_async)?;
+                let f = self.method(fname.clone(), is_async, is_gen)?;
                 if !is_static && kind == MethodKind::Method && fname.as_deref() == Some("constructor") {
                     cd.ctor = Some(f);
                 } else {
@@ -694,11 +698,11 @@ impl Parser {
     fn arrow_body(&mut self, params: Vec<Pattern>, rest: Option<Pattern>, is_async: bool) -> PResult<Expr> {
         self.expect("=>")?;
         let body = if self.is("{") {
-            Body::Block(self.func_body()?)
+            Body::Block(self.func_body(false)?)
         } else {
             Body::Expr(self.assign(false)?)
         };
-        Ok(Expr::Func(Rc::new(FuncDef { name: None, params, rest, body, arrow: true, is_async })))
+        Ok(Expr::Func(Rc::new(FuncDef { name: None, params, rest, body, arrow: true, is_async, is_gen: false })))
     }
 
     fn assign(&mut self, no_in: bool) -> PResult<Expr> {
@@ -721,8 +725,12 @@ impl Parser {
             }
             self.i = save;
         }
-        if self.is_word("yield") && self.in_func {
-            return self.err("generators are not supported");
+        if self.is_word("yield") && self.in_gen {
+            self.next();
+            let delegate = self.eat("*");
+            let ends = self.nl_before() || matches!(self.peek(), Tok::Punct(")" | "]" | "}" | "," | ";" | ":") | Tok::Eof);
+            let arg = if ends && !delegate { None } else { Some(Box::new(self.assign(no_in)?)) };
+            return Ok(Expr::Yield(arg, delegate));
         }
         let lhs = self.conditional(no_in)?;
         if let Tok::Punct(op) = self.peek().clone() {
@@ -996,15 +1004,15 @@ impl Parser {
                     self.next();
                     is_async = true;
                 }
-                self.eat("*");
+                let is_gen = self.eat("*");
                 let shorthand_name = if let Tok::Ident(n) = self.peek() { Some(n.clone()) } else { None };
                 let key = self.prop_name()?;
                 let name = if let PropKey::Name(n) = &key { Some(n.clone()) } else { None };
                 if let Some(get) = accessor {
-                    let f = self.method(name, false)?;
+                    let f = self.method(name, false, false)?;
                     props.push(if get { PropDef::Getter(key, f) } else { PropDef::Setter(key, f) });
                 } else if self.is("(") {
-                    props.push(PropDef::Value(key, Expr::Func(self.method(name, is_async)?)));
+                    props.push(PropDef::Value(key, Expr::Func(self.method(name, is_async, is_gen)?)));
                 } else if self.eat(":") {
                     props.push(PropDef::Value(key, self.assign(false)?));
                 } else if let Some(n) = shorthand_name {

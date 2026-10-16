@@ -185,7 +185,33 @@ pub enum Kind {
     Dataset(NodeId),
     /// Boxed primitive (new String(...), etc).
     Boxed(Value),
+    Generator(Box<Gen>),
 }
+
+/// A generator. Its body runs to completion on the first `next()` (with a
+/// cap on yields, so infinite generators can still be partially consumed);
+/// the yielded values are then handed out one by one. `x = yield v`
+/// therefore always receives `undefined`.
+pub struct Gen {
+    pub start: Option<GenStart>,
+    pub buf: VecDeque<Value>,
+    pub ret: Option<Value>,
+    pub err: Option<Value>,
+    pub is_async: bool,
+}
+
+pub struct GenStart {
+    pub def: Rc<FuncDef>,
+    pub env: Env,
+    pub home: Option<ObjRef>,
+    pub this: Value,
+    pub args: Vec<Value>,
+    pub fobj: ObjRef,
+}
+
+/// Thrown internally to stop a generator that yielded too many values.
+const GEN_CAP_MARKER: &str = "@@generator-cap";
+const GEN_CAP: usize = 100_000;
 
 pub struct Obj {
     pub props: Props,
@@ -239,6 +265,7 @@ pub struct Protos {
     pub set: Option<ObjRef>,
     pub node: Option<ObjRef>,
     pub event: Option<ObjRef>,
+    pub generator: Option<ObjRef>,
     pub style: Option<ObjRef>,
     pub classlist: Option<ObjRef>,
     pub errors: FxHashMap<&'static str, ObjRef>,
@@ -279,6 +306,8 @@ pub struct Interp {
     label: Option<Name>,
     /// Scripts are interrupted after this instant.
     pub deadline: Option<std::time::Instant>,
+    /// Values yielded by the generators currently running.
+    gen_sinks: Vec<Vec<Value>>,
 }
 
 pub const WINDOW: u32 = u32::MAX - 1;
@@ -320,6 +349,7 @@ impl Interp {
             start: std::time::Instant::now(),
             label: None,
             deadline: None,
+            gen_sinks: Vec::new(),
         };
         builtins::install(&mut it);
         dombind::install(&mut it);
@@ -703,6 +733,17 @@ impl Interp {
             }
             C::Class => Err(type_error("Class constructor cannot be invoked without 'new'")),
             C::Closure(def, env, arrow_this, home) => {
+                if def.is_gen {
+                    let g = Gen {
+                        start: Some(GenStart { def: def.clone(), env, home, this, args: args.to_vec(), fobj: fo.clone() }),
+                        buf: VecDeque::new(),
+                        ret: None,
+                        err: None,
+                        is_async: def.is_async,
+                    };
+                    let _ = arrow_this;
+                    return Ok(Value::Obj(self.new_obj(self.p.generator.clone(), Kind::Generator(Box::new(g)))));
+                }
                 if def.is_async {
                     // Run synchronously; wrap the outcome in a promise.
                     let r = self.call_closure(&def, env, arrow_this, home, this, args, Some(fo.clone()));
@@ -1279,7 +1320,11 @@ impl Interp {
                     let next = self.get(&iter, "next")?;
                     let mut out = Vec::new();
                     for _ in 0..10_000_000 {
-                        let r = self.call(&next, iter.clone(), &[])?;
+                        let mut r = self.call(&next, iter.clone(), &[])?;
+                        if matches!(&r, Value::Obj(o) if matches!(o.borrow().kind, Kind::Promise(_))) {
+                            // Async iterators (for await).
+                            r = builtins::await_value(self, r)?;
+                        }
                         if self.get(&r, "done")?.truthy() {
                             break;
                         }
@@ -1626,6 +1671,19 @@ impl Interp {
                 let v = self.eval(x, env)?;
                 builtins::await_value(self, v)?
             }
+            Expr::Yield(arg, delegate) => {
+                let v = match arg {
+                    Some(a) => self.eval(a, env)?,
+                    None => Value::Undef,
+                };
+                let items = if *delegate { self.iterate(&v)? } else { vec![v] };
+                let Some(sink) = self.gen_sinks.last_mut() else { return Ok(Value::Undef) };
+                sink.extend(items);
+                if sink.len() > GEN_CAP {
+                    return Err(Value::str(GEN_CAP_MARKER));
+                }
+                Value::Undef
+            }
         })
     }
 
@@ -1869,6 +1927,26 @@ impl Interp {
         Ok(cv)
     }
 
+    /// Run a generator's body (once), buffering what it yields.
+    pub fn gen_run(&mut self, o: &ObjRef) {
+        let start = match &mut o.borrow_mut().kind {
+            Kind::Generator(g) => g.start.take(),
+            _ => None,
+        };
+        let Some(st) = start else { return };
+        self.gen_sinks.push(Vec::new());
+        let r = self.call_closure(&st.def, st.env, None, st.home, st.this, &st.args, Some(st.fobj));
+        let sink = self.gen_sinks.pop().unwrap_or_default();
+        if let Kind::Generator(g) = &mut o.borrow_mut().kind {
+            g.buf = sink.into();
+            match r {
+                Ok(v) => g.ret = Some(v),
+                Err(Value::Str(s)) if &*s == GEN_CAP_MARKER => g.ret = Some(Value::Undef),
+                Err(e) => g.err = Some(e),
+            }
+        }
+    }
+
     // ------------------------------------------------------------ the loop
 
     /// Run queued promise reactions.
@@ -1967,6 +2045,7 @@ fn expr_has_closure(e: &Expr) -> bool {
             PropDef::Spread(e) => expr_has_closure(e),
         }),
         Expr::Unary(_, x) | Expr::Spread(x) | Expr::Await(x) => expr_has_closure(x),
+        Expr::Yield(x, _) => x.as_deref().is_some_and(expr_has_closure),
         Expr::Update { target, .. } => expr_has_closure(target),
         Expr::Binary(_, a, b) | Expr::Logical(_, a, b) | Expr::Index(a, b, _) => expr_has_closure(a) || expr_has_closure(b),
         Expr::Assign(_, p, v) => pat_has_closure(p) || expr_has_closure(v),
@@ -2248,6 +2327,29 @@ mod tests {
         assert_eq!(out[0], "caught nope");
         assert_eq!(out[1], "all 1,2");
         assert_eq!(out[2], "sync then1 micro async43 then2 timeout");
+    }
+
+    #[test]
+    fn generators() {
+        let out = run(r#"
+            function* range(n) { for (let i = 0; i < n; i++) yield i; return 'end'; }
+            console.log([...range(4)].join());
+            const g = range(2);
+            console.log(JSON.stringify([g.next(), g.next(), g.next(), g.next()]));
+            function* nat() { let i = 0; while (true) yield i++; }
+            const firstFive = []; for (const x of nat()) { if (x >= 5) break; firstFive.push(x); }
+            console.log(firstFive.join());
+            function* both() { yield* [1, 2]; yield* range(2); }
+            console.log(Array.from(both()).join());
+            const obj = { *[Symbol.iterator]() { yield 'a'; yield 'b'; } };
+            console.log([...obj].join(''));
+            class Tree { constructor(v, kids = []) { this.v = v; this.kids = kids; }
+              *walk() { yield this.v; for (const k of this.kids) yield* k.walk(); } }
+            console.log([...new Tree(1, [new Tree(2, [new Tree(3)]), new Tree(4)]).walk()].join());
+            async function* agen() { yield 1; yield await Promise.resolve(2); }
+            (async () => { const out = []; for await (const v of agen()) out.push(v); console.log('async', out.join()); })();
+        "#);
+        assert_eq!(out, ["0,1,2,3", r#"[{"value":0,"done":false},{"value":1,"done":false},{"value":"end","done":true},{"done":true}]"#, "0,1,2,3,4", "1,2,0,1", "ab", "1,2,3,4", "async 1,2"]);
     }
 
     #[test]
