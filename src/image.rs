@@ -1,5 +1,5 @@
 //! Image decoders written from scratch: PNG (with our own inflate), JPEG
-//! (baseline + progressive) and GIF (first frame). Decoded images carry a
+//! (baseline + progressive), GIF (first frame) and WebP (in `webp.rs`). Decoded images carry a
 //! mipmap chain so heavily downscaled images still look smooth.
 
 /// A decoded image: 0xAARRGGBB pixels (not premultiplied) plus mip levels.
@@ -20,6 +20,8 @@ pub fn decode(data: &[u8]) -> Option<Image> {
         jpeg(data)?
     } else if data.starts_with(b"GIF8") {
         gif(data)?
+    } else if data.len() > 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        crate::webp::decode(data)?
     } else {
         return None;
     };

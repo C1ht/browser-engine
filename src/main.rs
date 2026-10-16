@@ -21,10 +21,12 @@ mod image;
 mod js;
 mod layout;
 mod net;
+mod webp;
 mod woff2;
 mod paint;
 mod png;
 mod style;
+mod vp8_tables;
 
 use engine::{ms, Click, Edit, Nav, Page};
 use fonts::{fonts, GlyphCache};
