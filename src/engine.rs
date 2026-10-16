@@ -1389,6 +1389,37 @@ mod tests {
     }
 
     #[test]
+    fn stacking_order() {
+        let p = page_from(
+            r#"<!doctype html><style>body { margin: 0 } div { box-sizing: border-box }
+               #hdr { position: relative; height: 50px }
+               #menu { position: absolute; top: 40px; left: 0; width: 100px; height: 100px; background: rgb(255, 0, 0); z-index: 10 }
+               #later { position: relative; height: 200px; background: rgb(0, 0, 255) }
+               #behind { position: absolute; left: 300px; top: 0; width: 50px; height: 50px; background: rgb(0, 255, 0); z-index: -1 }
+               #flow { margin-left: 300px; width: 50px; height: 20px; background: rgb(9, 9, 9) }
+               #clip { position: absolute; left: 500px; top: 0; width: 40px; height: 40px; overflow: hidden }
+               #inner { position: relative; width: 100px; height: 100px; background: rgb(255, 0, 255) }
+               #grp { position: absolute; left: 600px; top: 0; opacity: 0.5 }
+               #a, #b { width: 40px; height: 40px; background: rgb(0, 0, 0) } #b { margin-top: -20px }</style>
+               <div id=hdr><div id=menu></div></div><div id=later></div>
+               <div id=behind></div>
+               <div id=clip><div id=inner></div></div>
+               <div id=grp><div id=a></div><div id=b></div></div>"#,
+        );
+        let (w, h) = (800, 400);
+        let mut buf = vec![0u32; w * h];
+        let mut glyphs = crate::fonts::GlyphCache::default();
+        paint::paint(&p.dl, &p.tree.text, &mut glyphs, &mut buf, w, h, 0.0);
+        let px = |x: usize, y: usize| buf[y * w + x] & 0xFFFFFF;
+        assert_eq!(px(50, 100), 0xFF0000, "z-index dropdown above later positioned content");
+        assert_eq!(px(320, 60), 0x0000FF, "later content beyond the dropdown");
+        assert_eq!(px(560, 45), 0xFFFFFF, "overflow:hidden clips positioned children");
+        assert_eq!(px(520, 20), 0xFF00FF);
+        // Group opacity: the overlap of #a and #b is the same grey as the rest.
+        assert_eq!(px(620, 10), px(620, 30));
+    }
+
+    #[test]
     fn transforms() {
         let p = page_from(
             r#"<!doctype html><style>body { margin: 0 }

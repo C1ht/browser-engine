@@ -87,6 +87,8 @@ pub struct LayerData {
     pub m: [f32; 6],
     /// Bounds after transformation.
     pub tbounds: [f32; 4],
+    /// Group opacity.
+    pub alpha: f32,
 }
 
 /// a · b (apply b first).
@@ -171,6 +173,18 @@ struct Builder<'a> {
     dl: DisplayList,
     opacity: f32,
     in_fixed: bool,
+    /// Positioned descendants collected per open stacking context.
+    ctx: Vec<Vec<Deferred>>,
+    /// Active overflow clip rects, and the depth at the current context root.
+    clip_stack: Vec<[f32; 4]>,
+    ctx_clip_base: usize,
+    /// Paint the next box as a stacking context.
+    force_ctx: bool,
+    /// Record the display-list position after this box's decorations.
+    mark_after_decor: Option<u32>,
+    decor_mark: Option<usize>,
+    /// This box's opacity is applied by its layer.
+    group_opacity: Option<u32>,
 }
 
 pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style], res: &Resources) -> DisplayList {
@@ -198,6 +212,13 @@ pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style], res: &Resource
         },
         opacity: 1.0,
         in_fixed: false,
+        ctx: Vec::new(),
+        clip_stack: Vec::new(),
+        ctx_clip_base: 0,
+        force_ctx: false,
+        mark_after_decor: None,
+        decor_mark: None,
+        group_opacity: None,
     };
     b.paint_box(tree.root, 0.0, 0.0);
     b.dl
@@ -242,26 +263,6 @@ impl Builder<'_> {
             self.dl.fixed_links.push(a);
         } else {
             self.dl.links.push(a);
-        }
-    }
-
-    fn positioned(&self, id: u32) -> bool {
-        let b = &self.tree.boxes[id as usize];
-        !b.anon && matches!(self.styles[b.node as usize].position, Pos::Relative | Pos::Sticky)
-    }
-
-    fn z(&self, id: u32) -> i32 {
-        self.styles[self.tree.boxes[id as usize].node as usize].z.unwrap_or(0)
-    }
-
-    fn paint_abs(&mut self, a: u32, px: f32, py: f32) {
-        if self.tree.boxes[a as usize].fixed {
-            let saved = self.in_fixed;
-            self.in_fixed = true;
-            self.paint_box(a, 0.0, 0.0);
-            self.in_fixed = saved;
-        } else {
-            self.paint_box(a, px, py);
         }
     }
 
@@ -411,20 +412,25 @@ impl Builder<'_> {
     fn paint_box(&mut self, id: u32, ox: f32, oy: f32) {
         let b = &self.tree.boxes[id as usize];
         let st = &self.styles[b.node as usize];
-        if b.anon || !st.has_transform() || st.pure_translate(b.border_w(), b.border_h()).is_some() {
-            // (Translations are applied by layout.)
+        if b.anon {
             return self.paint_box_inner(id, ox, oy);
         }
         let (bx, by) = (ox + b.x + b.rel.0, oy + b.y + b.rel.1);
-        let Some(m) = box_matrix(st, bx, by, b.border_w(), b.border_h()) else {
-            return self.paint_box_inner(id, ox, oy);
-        };
-        if m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3] == 1.0 {
-            // A translation: just move the content (links included).
-            return self.paint_box_inner(id, ox + m[4], oy + m[5]);
+        // (Translations are applied by layout.)
+        let m = if st.has_transform() && st.pure_translate(b.border_w(), b.border_h()).is_none() { box_matrix(st, bx, by, b.border_w(), b.border_h()) } else { None };
+        // Group opacity: the element and its content are composited as one.
+        let group_alpha = st.opacity < 1.0 && st.opacity >= 0.004 && !st.hidden;
+        if m.is_none() && !group_alpha {
+            return self.paint_context_or_box(id, ox, oy);
         }
         let saved = std::mem::take(self.target());
-        self.paint_box_inner(id, ox, oy);
+        let saved_opacity = self.opacity;
+        if group_alpha {
+            self.opacity = 1.0;
+            self.group_opacity = Some(id);
+        }
+        self.paint_context_or_box(id, ox, oy);
+        self.opacity = saved_opacity;
         let items = std::mem::replace(self.target(), saved);
         let mut bb: Option<[f32; 4]> = None;
         for it in &items {
@@ -440,8 +446,141 @@ impl Builder<'_> {
             }
         }
         let Some(bounds) = bb else { return };
+        let m = m.unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
         let tbounds = transform_rect(m, bounds);
-        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds })));
+        let alpha = if group_alpha { st.opacity * self.opacity } else { 1.0 };
+        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds, alpha })));
+    }
+
+    /// Does this box start a stacking context (its positioned descendants
+    /// are painted with it)?
+    fn creates_context(&self, id: u32) -> bool {
+        let b = &self.tree.boxes[id as usize];
+        if id == self.tree.root {
+            return true;
+        }
+        if b.anon {
+            return false;
+        }
+        let st = &self.styles[b.node as usize];
+        (st.position != Pos::Static && st.z.is_some()) || st.position == Pos::Fixed || st.opacity < 1.0 || st.has_transform()
+    }
+
+    fn is_positioned(&self, id: u32) -> bool {
+        let b = &self.tree.boxes[id as usize];
+        !b.anon && (b.abs || b.fixed || self.styles[b.node as usize].position != Pos::Static)
+    }
+
+    fn z(&self, id: u32) -> i32 {
+        self.styles[self.tree.boxes[id as usize].node as usize].z.unwrap_or(0)
+    }
+
+    /// Collect a positioned descendant for the current stacking context.
+    fn defer(&mut self, id: u32, ox: f32, oy: f32) {
+        let fixed = self.tree.boxes[id as usize].fixed;
+        let clips = if fixed { Vec::new() } else { self.clip_stack[self.ctx_clip_base..].to_vec() };
+        let z = self.z(id);
+        let order = self.ctx.last().map_or(0, |l| l.len());
+        let d = Deferred { z, id, ox, oy, fixed, clips, order };
+        match self.ctx.last_mut() {
+            Some(l) => l.push(d),
+            None => self.paint_queue(vec![d]),
+        }
+    }
+
+    /// Paint a collected positioned box. A stacking context paints with all
+    /// its positioned descendants; a `z-index: auto` box returns the ones it
+    /// collected, which belong to the enclosing context.
+    fn paint_deferred(&mut self, d: &Deferred) -> Vec<Deferred> {
+        let saved_fixed = self.in_fixed;
+        if d.fixed {
+            self.in_fixed = true;
+        }
+        let saved_base = self.ctx_clip_base;
+        let own_ctx = self.creates_context(d.id);
+        if !own_ctx {
+            // Descendants record the clips from here (including d's own).
+            self.ctx_clip_base = self.clip_stack.len();
+            self.ctx.push(Vec::new());
+        }
+        for c in &d.clips {
+            self.push(DItem::Clip { x: c[0], y: c[1], w: c[2], h: c[3] });
+            self.clip_stack.push(*c);
+        }
+        self.force_ctx = own_ctx;
+        self.paint_box(d.id, d.ox, d.oy);
+        self.force_ctx = false;
+        for _ in &d.clips {
+            self.push(DItem::Unclip);
+            self.clip_stack.pop();
+        }
+        self.in_fixed = saved_fixed;
+        if own_ctx {
+            return Vec::new();
+        }
+        self.ctx_clip_base = saved_base;
+        let mut extra = self.ctx.pop().unwrap_or_default();
+        // Carry the fixed flag to descendants of fixed boxes.
+        if d.fixed {
+            for e in &mut extra {
+                e.fixed = true;
+            }
+        }
+        extra
+    }
+
+    /// Paint a sorted queue of positioned boxes, merging in the positioned
+    /// descendants of `z-index: auto` boxes as they are found.
+    fn paint_queue(&mut self, mut queue: Vec<Deferred>) {
+        let mut i = 0;
+        while i < queue.len() {
+            let d = std::mem::replace(&mut queue[i], Deferred { z: 0, id: 0, ox: 0.0, oy: 0.0, fixed: false, clips: Vec::new(), order: 0 });
+            let mut extra = self.paint_deferred(&d);
+            i += 1;
+            if extra.is_empty() {
+                continue;
+            }
+            extra.sort_by_key(|e| (e.z, e.order));
+            // Descendants come before later boxes of the same z (tree order).
+            let tail = queue.split_off(i);
+            let mut merged = Vec::with_capacity(extra.len() + tail.len());
+            let (mut a, mut b) = (extra.into_iter().peekable(), tail.into_iter().peekable());
+            loop {
+                let take_a = match (a.peek(), b.peek()) {
+                    (Some(x), Some(y)) => x.z <= y.z,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => false,
+                    (None, None) => break,
+                };
+                merged.push(if take_a { a.next().unwrap() } else { b.next().unwrap() });
+            }
+            queue.extend(merged);
+        }
+    }
+
+    fn paint_context_or_box(&mut self, id: u32, ox: f32, oy: f32) {
+        if !std::mem::take(&mut self.force_ctx) && !self.creates_context(id) {
+            return self.paint_box_inner(id, ox, oy);
+        }
+        // Stacking context: own background, negative z, in-flow content,
+        // z auto / 0 in tree order, positive z.
+        self.ctx.push(Vec::new());
+        let saved_base = std::mem::replace(&mut self.ctx_clip_base, self.clip_stack.len());
+        self.mark_after_decor = Some(id);
+        self.paint_box_inner(id, ox, oy);
+        let mark = std::mem::take(&mut self.decor_mark);
+        let mut list = self.ctx.pop().unwrap_or_default();
+        self.ctx_clip_base = saved_base;
+        list.sort_by_key(|d| (d.z, d.order));
+        let (neg, rest): (Vec<Deferred>, Vec<Deferred>) = list.into_iter().partition(|d| d.z < 0);
+        if !neg.is_empty() {
+            // Below the in-flow content, above the root's own background.
+            let at = mark.unwrap_or(0).min(self.target().len());
+            let tail = self.target().split_off(at);
+            self.paint_queue(neg);
+            self.target().extend(tail);
+        }
+        self.paint_queue(rest);
     }
 
     fn paint_box_inner(&mut self, id: u32, ox: f32, oy: f32) {
@@ -451,19 +590,35 @@ impl Builder<'_> {
         let bx = ox + b.x + b.rel.0;
         let by = oy + b.y + b.rel.1;
         if !b.anon && st.hidden {
+            if self.mark_after_decor == Some(id) {
+                self.mark_after_decor = None;
+                self.decor_mark = Some(self.target().len());
+            }
             return;
         }
         let saved_opacity = self.opacity;
         if !b.anon {
-            self.opacity *= st.opacity;
+            if self.group_opacity == Some(id) {
+                self.group_opacity = None;
+            } else {
+                self.opacity *= st.opacity;
+            }
             if self.opacity < 0.004 {
                 self.opacity = saved_opacity;
+                if self.mark_after_decor == Some(id) {
+                    self.mark_after_decor = None;
+                    self.decor_mark = Some(self.target().len());
+                }
                 return;
             }
             self.decorations(b, st, bx, by);
             if b.link != NO_LINK {
                 self.link(bx, by, b.border_w(), b.border_h(), b.link);
             }
+        }
+        if self.mark_after_decor == Some(id) {
+            self.mark_after_decor = None;
+            self.decor_mark = Some(self.target().len());
         }
         let (px, py) = (bx + b.b[3], by + b.b[0]);
         let cx = px + b.p[3];
@@ -472,6 +627,7 @@ impl Builder<'_> {
         if clipped {
             let (w, h) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
             self.push(DItem::Clip { x: px, y: py, w, h });
+            self.clip_stack.push([px, py, w, h]);
         }
 
         if let Some(m) = &b.marker {
@@ -487,26 +643,31 @@ impl Builder<'_> {
             self.push(DItem::Text { x: cx - w - fs * 0.5, y: base, start, end, src: 1, face, size: fs, color });
         }
 
-        // Stacking (simplified): negative z, in-flow blocks, floats, inline
-        // content, then positioned descendants in z order.
-        let mut abs: Vec<(i32, u32)> = b.abs_kids.iter().map(|&a| (self.z(a), a)).collect();
-        abs.sort_by_key(|&(z, _)| z);
-        for &(_, a) in abs.iter().filter(|(z, _)| *z < 0) {
-            self.paint_abs(a, px, py);
+        // In-flow blocks, floats, inline content; positioned descendants go
+        // to the enclosing stacking context.
+        for &a in &b.abs_kids {
+            if tree.boxes[a as usize].fixed {
+                self.defer(a, 0.0, 0.0);
+            } else {
+                self.defer(a, px, py);
+            }
         }
-        let mut deferred = Vec::new();
         for &c in &b.children {
             if tree.boxes[c as usize].abs {
                 continue;
             }
-            if self.positioned(c) {
-                deferred.push(c);
+            if self.is_positioned(c) {
+                self.defer(c, cx, cy);
             } else {
                 self.paint_box(c, cx, cy);
             }
         }
         for &f in &b.floats {
-            self.paint_box(f, cx, cy);
+            if self.is_positioned(f) {
+                self.defer(f, cx, cy);
+            } else {
+                self.paint_box(f, cx, cy);
+            }
         }
 
         for f in &b.frags {
@@ -539,26 +700,32 @@ impl Builder<'_> {
                     }
                 }
                 FragKind::Atomic(a) => {
-                    if self.positioned(a) {
-                        deferred.push(a);
+                    if self.is_positioned(a) {
+                        self.defer(a, cx, cy);
                     } else {
                         self.paint_box(a, cx, cy);
                     }
                 }
             }
         }
-        deferred.sort_by_key(|&c| self.z(c));
-        for c in deferred {
-            self.paint_box(c, cx, cy);
-        }
-        for &(_, a) in abs.iter().filter(|(z, _)| *z >= 0) {
-            self.paint_abs(a, px, py);
-        }
         if clipped {
             self.push(DItem::Unclip);
+            self.clip_stack.pop();
         }
         self.opacity = saved_opacity;
     }
+}
+
+/// A positioned box waiting to be painted by its stacking context.
+struct Deferred {
+    z: i32,
+    id: u32,
+    ox: f32,
+    oy: f32,
+    fixed: bool,
+    /// Clip rects (page coordinates) between the context and the box.
+    clips: Vec<[f32; 4]>,
+    order: usize,
 }
 
 /// Sample a gradient's colour stops into a 256-entry table.
@@ -1116,6 +1283,11 @@ fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache
             let mut c = [0.0f32; 4];
             for k in 0..4 {
                 c[k] = (p00[k] * (1.0 - fu) + p10[k] * fu) * (1.0 - fv) + (p01[k] * (1.0 - fu) + p11[k] * fu) * fv;
+            }
+            if l.alpha < 1.0 {
+                for v in c.iter_mut() {
+                    *v *= l.alpha;
+                }
             }
             if c[3] < 0.5 {
                 continue;
