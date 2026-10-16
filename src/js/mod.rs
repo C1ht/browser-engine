@@ -8,6 +8,7 @@ pub mod coro;
 pub mod dombind;
 pub mod generator;
 pub mod iter;
+pub mod proxy;
 pub mod lexer;
 pub mod parser;
 pub mod regex;
@@ -193,6 +194,7 @@ pub enum Kind {
     Generator(Box<Gen>),
     /// A built-in iterator (array / map / set / string iteration).
     Iter(Box<iter::IterState>),
+    Proxy(Box<proxy::ProxyData>),
     /// ArrayBuffer contents.
     Buffer(Vec<u8>),
     /// A typed array view onto an ArrayBuffer.
@@ -419,6 +421,7 @@ impl Interp {
         });
         builtins::install(&mut it);
         iter::install(&mut it);
+        proxy::install(&mut it);
         binary::install(&mut it);
         dombind::install(&mut it);
         web::install(&mut it);
@@ -464,7 +467,14 @@ impl Interp {
     }
 
     pub fn is_callable(v: &Value) -> bool {
-        matches!(v, Value::Obj(o) if matches!(o.borrow().kind, Kind::Func(_)))
+        match v {
+            Value::Obj(o) => match &o.borrow().kind {
+                Kind::Func(_) => true,
+                Kind::Proxy(p) => Self::is_callable(&p.target),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     #[inline]
@@ -544,8 +554,8 @@ impl Interp {
             Value::Bool(_) => "boolean",
             Value::Num(_) => "number",
             Value::Str(s) => if s.starts_with("@@sym:") { "symbol" } else { "string" },
-            Value::Obj(o) => {
-                if matches!(o.borrow().kind, Kind::Func(_)) { "function" } else { "object" }
+            Value::Obj(_) => {
+                if Self::is_callable(v) { "function" } else { "object" }
             }
         }
     }
@@ -577,6 +587,9 @@ impl Interp {
                 }
             }
             Value::Obj(o) => {
+                if matches!(o.borrow().kind, Kind::Proxy(_)) {
+                    return proxy::get(self, o, key, target);
+                }
                 {
                     let ob = o.borrow();
                     match &ob.kind {
@@ -670,6 +683,9 @@ impl Interp {
             }
             return Ok(());
         };
+        if matches!(o.borrow().kind, Kind::Proxy(_)) {
+            return proxy::set(self, o, key, v, target);
+        }
         let typed = match &o.borrow().kind {
             Kind::Typed(t) => Some(t.clone()),
             _ => None,
@@ -768,6 +784,9 @@ impl Interp {
 
     pub fn has_prop(&mut self, target: &Value, key: &str) -> bool {
         if let Value::Obj(o) = target {
+            if matches!(o.borrow().kind, Kind::Proxy(_)) {
+                return proxy::has(self, o, key);
+            }
             if let Kind::Array(a) = &o.borrow().kind {
                 if let Some(i) = array_index(key) {
                     return i < a.len();
@@ -799,6 +818,7 @@ impl Interp {
     pub fn own_keys(&mut self, v: &Value) -> Vec<Rc<str>> {
         match v {
             Value::Str(s) => (0..utf16_len(s)).map(|i| Rc::from(i.to_string())).collect(),
+            Value::Obj(o) if matches!(o.borrow().kind, Kind::Proxy(_)) => proxy::own_keys(self, o),
             Value::Obj(o) => {
                 let ob = o.borrow();
                 let mut out: Vec<Rc<str>> = Vec::new();
@@ -826,8 +846,10 @@ impl Interp {
             Class,
             Native(NativeFn),
             Bound(Value, Value, Vec<Value>),
+            Proxy,
         }
         let c = match &fo.borrow().kind {
+            Kind::Proxy(_) => C::Proxy,
             Kind::Func(Func::Closure { def, env, this: t, home }) => C::Closure(def.clone(), env.clone(), t.clone(), home.clone()),
             Kind::Func(Func::Class(_)) => C::Class,
             Kind::Func(Func::Native(n, _)) => C::Native(*n),
@@ -846,6 +868,7 @@ impl Interp {
                 self.call(&t, th, &a)
             }
             C::Class => Err(type_error("Class constructor cannot be invoked without 'new'")),
+            C::Proxy => proxy::apply(self, fo, this, args),
             C::Closure(def, env, arrow_this, home) => {
                 if (def.is_gen || def.is_async) && coro::supported() {
                     let st = GenStart { def: def.clone(), env: env.clone(), home: home.clone(), this: this.clone(), args: args.to_vec(), fobj: fo.clone() };
@@ -931,6 +954,9 @@ impl Interp {
 
     pub fn construct(&mut self, f: &Value, args: &[Value]) -> R<Value> {
         let Value::Obj(fo) = f else { return Err(type_error("not a constructor")) };
+        if matches!(fo.borrow().kind, Kind::Proxy(_)) {
+            return proxy::construct(self, fo, args);
+        }
         let is_class = matches!(fo.borrow().kind, Kind::Func(Func::Class(_)));
         let native = matches!(fo.borrow().kind, Kind::Func(Func::Native(..)));
         if native {
@@ -1995,8 +2021,11 @@ impl Interp {
         self.bind(p, v, env, None)
     }
 
-    fn delete(&mut self, o: &Value, k: &str) -> bool {
+    pub(crate) fn delete(&mut self, o: &Value, k: &str) -> bool {
         if let Value::Obj(ob) = o {
+            if matches!(ob.borrow().kind, Kind::Proxy(_)) {
+                return proxy::delete(self, ob, k).unwrap_or(false);
+            }
             let mut b = ob.borrow_mut();
             if let Kind::Array(a) = &mut b.kind {
                 if let Some(i) = array_index(k) {
@@ -2462,6 +2491,44 @@ mod tests {
                 "2 0 false",
                 "1,9,3 3,4,3,4 1,3",
                 "10,20,30 1,2 function",
+            ]
+        );
+    }
+
+    #[test]
+    fn proxy_and_reflect() {
+        let out = run(r#"
+            const log = [];
+            function reactive(o) {
+                return new Proxy(o, {
+                    get(t, k, r) { if (typeof k === 'string') log.push('get ' + k); return Reflect.get(t, k, r); },
+                    set(t, k, v) { log.push('set ' + k + '=' + v); t[k] = v; return true; },
+                    has(t, k) { return k === 'secret' ? false : k in t; },
+                    deleteProperty(t, k) { log.push('del ' + k); delete t[k]; return true; },
+                    ownKeys(t) { return Reflect.ownKeys(t).filter(k => k !== 'secret'); },
+                });
+            }
+            const s = reactive({count: 1, secret: 2});
+            s.count++;
+            console.log(s.count, 'secret' in s, 'count' in s, Object.keys(s).join());
+            delete s.count;
+            console.log(log.join('|'));
+            const f = new Proxy(function (a, b) { return a + b; }, { apply(t, th, args) { return t(...args) * 10; } });
+            console.log(f(1, 2), typeof f);
+            class P { constructor(x) { this.x = x; } }
+            const C = new Proxy(P, { construct(t, args) { return new t(args[0] + 1); } });
+            console.log(new C(1).x, Reflect.has({a: 1}, 'a'), Reflect.ownKeys({a: 1, b: 2}).join(), Reflect.apply(Math.max, null, [1, 5, 3]));
+            const { proxy, revoke } = Proxy.revocable({}, {}); revoke();
+            try { proxy.x; } catch (e) { console.log(e.name); }
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "2 false true count",
+                "get count|set count=2|get count|del count",
+                "30 function",
+                "2 true a,b 5",
+                "TypeError",
             ]
         );
     }
