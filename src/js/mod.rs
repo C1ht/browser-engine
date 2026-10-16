@@ -7,6 +7,7 @@ pub mod builtins;
 pub mod coro;
 pub mod dombind;
 pub mod generator;
+pub mod iter;
 pub mod lexer;
 pub mod parser;
 pub mod regex;
@@ -190,6 +191,8 @@ pub enum Kind {
     /// Boxed primitive (new String(...), etc).
     Boxed(Value),
     Generator(Box<Gen>),
+    /// A built-in iterator (array / map / set / string iteration).
+    Iter(Box<iter::IterState>),
     /// ArrayBuffer contents.
     Buffer(Vec<u8>),
     /// A typed array view onto an ArrayBuffer.
@@ -301,6 +304,8 @@ pub struct Protos {
     pub node: Option<ObjRef>,
     pub event: Option<ObjRef>,
     pub generator: Option<ObjRef>,
+    pub iterator: Option<ObjRef>,
+    pub array_iterator: Option<ObjRef>,
     pub style: Option<ObjRef>,
     pub classlist: Option<ObjRef>,
     pub array_buffer: Option<ObjRef>,
@@ -351,6 +356,8 @@ pub struct Interp {
     gen_sinks: Vec<Vec<Value>>,
     /// Nesting depth of JS function calls (per coroutine).
     pub depth: u32,
+    /// The last member access / call short-circuited an optional chain.
+    short: bool,
     /// Generators / async calls whose coroutines are running, innermost last.
     pub co_stack: Vec<ObjRef>,
     /// Navigation requested by a script (`location.assign`, `form.submit()`).
@@ -404,12 +411,14 @@ impl Interp {
             deadline: None,
             gen_sinks: Vec::new(),
             depth: 0,
+            short: false,
             co_stack: Vec::new(),
             nav: None,
             submit_form: None,
             requests: Vec::new(),
         });
         builtins::install(&mut it);
+        iter::install(&mut it);
         binary::install(&mut it);
         dombind::install(&mut it);
         web::install(&mut it);
@@ -1133,7 +1142,14 @@ impl Interp {
             vars(s, &mut names);
         }
         let fs = Self::func_scope(env).clone();
-        {
+        if Rc::ptr_eq(&fs, &self.genv) {
+            let g = Value::Obj(self.global.clone());
+            for n in names {
+                if !fs.vars.borrow().contains_key(&n) && !self.has_prop(&g, &n) {
+                    self.put(&g, &n, Value::Undef)?;
+                }
+            }
+        } else {
             let mut v = fs.vars.borrow_mut();
             for n in names {
                 v.entry(n).or_insert(Value::Undef);
@@ -1146,7 +1162,12 @@ impl Interp {
         for s in stmts {
             if let Stmt::Func(def) = s {
                 let f = self.make_closure(def, env);
-                env.vars.borrow_mut().insert(def.name.clone().unwrap(), f);
+                let name = def.name.clone().unwrap();
+                if Rc::ptr_eq(env, &self.genv) && !env.vars.borrow().contains_key(&name) {
+                    self.put(&Value::Obj(self.global.clone()), &name, f)?;
+                } else {
+                    env.vars.borrow_mut().insert(name, f);
+                }
             }
         }
         Ok(())
@@ -1463,7 +1484,7 @@ impl Interp {
     /// the iterator and its `next` method. None for built-in collections.
     fn lazy_iterator(&mut self, v: &Value) -> R<Option<(Value, Value)>> {
         let Value::Obj(o) = v else { return Ok(None) };
-        if matches!(o.borrow().kind, Kind::Array(_) | Kind::Set(_) | Kind::Map(_) | Kind::Typed(_)) {
+        if matches!(o.borrow().kind, Kind::Array(_) | Kind::Set(_) | Kind::Map(_) | Kind::Typed(_) | Kind::Iter(_)) {
             return Ok(None);
         }
         let f = self.get(v, "@@iterator")?;
@@ -1480,6 +1501,9 @@ impl Interp {
         match v {
             Value::Str(s) => return Ok(s.chars().map(|c| Value::Str(c.to_string().into())).collect()),
             Value::Obj(o) => {
+                if matches!(o.borrow().kind, Kind::Iter(_)) {
+                    return Ok(iter::drain(self, o));
+                }
                 let kind_items = match &o.borrow().kind {
                     Kind::Array(a) => Some(a.clone()),
                     Kind::Set(s) => Some(s.clone()),
@@ -1531,6 +1555,10 @@ impl Interp {
             Pattern::Ident(n) => match decl {
                 Some(VarKind::Var) => {
                     let fs = Self::func_scope(env).clone();
+                    if Rc::ptr_eq(&fs, &self.genv) && !fs.vars.borrow().contains_key(n) {
+                        // Global `var`s are properties of the global object.
+                        return self.put(&Value::Obj(self.global.clone()), n, v);
+                    }
                     fs.vars.borrow_mut().insert(n.clone(), v);
                     Ok(())
                 }
@@ -1819,19 +1847,23 @@ impl Interp {
                     let sup = self.eval(o, env)?;
                     return self.get(&sup, k);
                 }
-                let ov = self.eval(o, env)?;
+                let Some(ov) = self.chain_obj(o, env)? else { return Ok(self.short_circuit()) };
                 if *opt && ov.is_nullish() {
-                    return Ok(Value::Undef);
+                    return Ok(self.short_circuit());
                 }
-                self.get(&ov, k)?
+                let v = self.get(&ov, k)?;
+                self.short = false;
+                v
             }
             Expr::Index(o, k, opt) => {
-                let ov = self.eval(o, env)?;
+                let Some(ov) = self.chain_obj(o, env)? else { return Ok(self.short_circuit()) };
                 if *opt && ov.is_nullish() {
-                    return Ok(Value::Undef);
+                    return Ok(self.short_circuit());
                 }
                 let kv = self.eval(k, env)?;
-                self.get_v(&ov, &kv)?
+                let v = self.get_v(&ov, &kv)?;
+                self.short = false;
+                v
             }
             Expr::Call(callee, args, opt) => return self.eval_call(callee, args, *opt, env),
             Expr::New(callee, args) => {
@@ -1888,9 +1920,14 @@ impl Interp {
         }
         let (f, this) = match callee {
             Expr::Member(o, k, mopt) => {
-                let ov = if let Expr::Super = **o { Self::this_val(env) } else { self.eval(o, env)? };
+                let ov = if let Expr::Super = **o {
+                    Self::this_val(env)
+                } else {
+                    let Some(ov) = self.chain_obj(o, env)? else { return Ok(self.short_circuit()) };
+                    ov
+                };
                 if *mopt && ov.is_nullish() {
-                    return Ok(Value::Undef);
+                    return Ok(self.short_circuit());
                 }
                 let f = if let Expr::Super = **o {
                     let sup = self.eval(o, env)?;
@@ -1900,30 +1937,50 @@ impl Interp {
                 };
                 if !Self::is_callable(&f) {
                     if opt && f.is_nullish() {
-                        return Ok(Value::Undef);
+                        return Ok(self.short_circuit());
                     }
                     return Err(type_error(format!("{}.{k} is not a function", expr_name(o))));
                 }
                 (f, ov)
             }
             Expr::Index(o, k, mopt) => {
-                let ov = self.eval(o, env)?;
+                let Some(ov) = self.chain_obj(o, env)? else { return Ok(self.short_circuit()) };
                 if *mopt && ov.is_nullish() {
-                    return Ok(Value::Undef);
+                    return Ok(self.short_circuit());
                 }
                 let kv = self.eval(k, env)?;
                 (self.get_v(&ov, &kv)?, ov)
             }
-            _ => (self.eval(callee, env)?, Value::Undef),
+            _ => {
+                let Some(f) = self.chain_obj(callee, env)? else { return Ok(self.short_circuit()) };
+                (f, Value::Undef)
+            }
         };
         if opt && f.is_nullish() {
-            return Ok(Value::Undef);
+            return Ok(self.short_circuit());
         }
         if !Self::is_callable(&f) {
             return Err(type_error(format!("{} is not a function", expr_name(callee))));
         }
         let a = self.spread_args(args, env)?;
-        self.call(&f, this, &a)
+        let r = self.call(&f, this, &a)?;
+        self.short = false;
+        Ok(r)
+    }
+
+    /// Evaluate the object of a member access or call. None if it is part of
+    /// an optional chain that already short-circuited (`a?.b.c` with `a`
+    /// nullish skips `.c`).
+    fn chain_obj(&mut self, o: &Expr, env: &Env) -> R<Option<Value>> {
+        self.short = false;
+        let v = self.eval(o, env)?;
+        let chained = matches!(o, Expr::Member(..) | Expr::Index(..) | Expr::Call(..));
+        Ok(if std::mem::take(&mut self.short) && chained { None } else { Some(v) })
+    }
+
+    fn short_circuit(&mut self) -> Value {
+        self.short = true;
+        Value::Undef
     }
 
     fn eval_pattern_value(&mut self, p: &Pattern, env: &Env) -> R<Value> {
@@ -2368,6 +2425,45 @@ mod tests {
 
     fn eval1(src: &str) -> String {
         run(&format!("console.log({src})")).join("\n")
+    }
+
+    #[test]
+    fn language_compat() {
+        let out = run(r#"
+            var gv = 1; function gf() { return 2; } let lv = 3;
+            console.log(window.gv, typeof window.gf, window.lv, gv + gf());
+            var a = null;
+            console.log(a?.b.c, a?.[0].x, a?.b(), a?.b.c(), ({x: {y: 5}}).x?.y);
+            var jq = {length: 0}; Array.prototype.push.call(jq, 'p', 'q');
+            console.log(jq.length, jq[1], [].slice.call({length: 2, 0: 'x', 1: 'y'}).join());
+            function args() { return Array.prototype.map.call(arguments, x => x * 2).join(); }
+            console.log(args(1, 2, 3));
+            var m = new Map([[1, 'a'], [2, 'b']]);
+            var mi = m.values(); console.log(mi.next().value, [...m.keys()].join(), typeof m[Symbol.iterator]);
+            console.log(Object.prototype.toString.call(m), Object.prototype.toString.call(new Set()));
+            var ai = [7, 8][Symbol.iterator](); ai.next(); console.log(JSON.stringify(ai.next()), JSON.stringify(ai.next()));
+            console.log([...'héllo'].length, Array.from(new Set([1, 1, 2]).entries()).join('|'));
+            console.log([1, 2, 1, 2].indexOf(1, 1), [1, 2, 1].lastIndexOf(1, 1), [1, 2, 3].includes(1, 1));
+            console.log([1, 2, 3].with(1, 9).join(), [1, 2, 3, 4].copyWithin(0, 2).join(), [1, 2, 3].toSpliced(1, 1).join());
+            function* g() { yield 1; yield 2; yield 3; }
+            console.log(g().map(x => x * 10).toArray().join(), g().take(2).toArray().join(), typeof Iterator.prototype.map);
+        "#);
+        assert_eq!(
+            out,
+            vec![
+                "1 function undefined 3",
+                "undefined undefined undefined undefined 5",
+                "2 q x,y",
+                "2,4,6",
+                "a 1,2 function",
+                "[object Map] [object Set]",
+                r#"{"value":8,"done":false} {"done":true}"#,
+                "5 1,1|2,2",
+                "2 0 false",
+                "1,9,3 3,4,3,4 1,3",
+                "10,20,30 1,2 function",
+            ]
+        );
     }
 
     #[test]

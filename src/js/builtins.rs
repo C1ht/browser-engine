@@ -156,48 +156,14 @@ pub fn install(it: &mut Interp) {
     it.def_method(&ac, "isArray", array_is_array);
     it.def_method(&ac, "from", array_from);
     it.def_method(&ac, "of", array_of);
-    for (n, f) in [
-        ("push", arr_push as NativeFn),
-        ("pop", arr_pop),
-        ("shift", arr_shift),
-        ("unshift", arr_unshift),
-        ("slice", arr_slice),
-        ("splice", arr_splice),
-        ("concat", arr_concat),
-        ("join", arr_join),
-        ("toString", arr_join),
-        ("reverse", arr_reverse),
-        ("indexOf", arr_index_of),
-        ("lastIndexOf", arr_last_index_of),
-        ("includes", arr_includes),
-        ("find", arr_find),
-        ("findIndex", arr_find_index),
-        ("findLast", arr_find_last),
-        ("findLastIndex", arr_find_last_index),
-        ("filter", arr_filter),
-        ("map", arr_map),
-        ("forEach", arr_for_each),
-        ("reduce", arr_reduce),
-        ("reduceRight", arr_reduce_right),
-        ("some", arr_some),
-        ("every", arr_every),
-        ("sort", arr_sort),
-        ("flat", arr_flat),
-        ("flatMap", arr_flat_map),
-        ("fill", arr_fill),
-        ("keys", arr_keys),
-        ("values", identity_this),
-        ("entries", arr_entries),
-        ("at", arr_at),
-        ("toSorted", arr_to_sorted),
-        ("toReversed", arr_to_reversed),
-    ] {
-        it.def_method(&ap, n, f);
+    for (n, f) in ARRAY_METHODS {
+        it.def_method(&ap, n, *f);
     }
 
     // String
     let sp = it.p.string.clone().unwrap();
     let sc = ctor(it, "String", string_ctor, &sp);
+    it.def_method(&sp, "@@iterator", string_iterator);
     it.def_method(&sc, "fromCharCode", str_from_char_code);
     it.def_method(&sc, "fromCodePoint", str_from_char_code);
     it.def_method(&sc, "raw", str_raw);
@@ -376,14 +342,14 @@ pub fn install(it: &mut Interp) {
     let mp = it.p.map.clone().unwrap();
     ctor(it, "Map", map_ctor, &mp);
     ctor(it, "WeakMap", map_ctor, &mp);
-    for (n, f) in [("get", map_get as NativeFn), ("set", map_set), ("has", map_has), ("delete", map_delete), ("clear", coll_clear), ("forEach", map_for_each), ("keys", map_keys), ("values", map_values), ("entries", map_entries)] {
+    for (n, f) in [("get", map_get as NativeFn), ("set", map_set), ("has", map_has), ("delete", map_delete), ("clear", coll_clear), ("forEach", map_for_each), ("keys", map_keys), ("values", map_values), ("entries", map_entries), ("@@iterator", map_entries)] {
         it.def_method(&mp, n, f);
     }
     it.def_getter(&mp, "size", coll_size);
     let stp = it.p.set.clone().unwrap();
     ctor(it, "Set", set_ctor, &stp);
     ctor(it, "WeakSet", set_ctor, &stp);
-    for (n, f) in [("add", set_add as NativeFn), ("has", set_has), ("delete", set_delete), ("clear", coll_clear), ("forEach", set_for_each), ("values", set_values), ("keys", set_values), ("entries", set_values)] {
+    for (n, f) in [("add", set_add as NativeFn), ("has", set_has), ("delete", set_delete), ("clear", coll_clear), ("forEach", set_for_each), ("values", set_values), ("keys", set_values), ("entries", set_entries), ("@@iterator", set_values)] {
         it.def_method(&stp, n, f);
     }
     it.def_getter(&stp, "size", coll_size);
@@ -629,7 +595,12 @@ fn obj_has_own(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
         _ => false,
     }))
 }
-fn obj_to_string(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+fn obj_to_string(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    if let Value::Obj(_) = &t {
+        if let Value::Str(tag) = it.get(&t, "@@toStringTag")? {
+            return Ok(Value::str(&format!("[object {tag}]")));
+        }
+    }
     Ok(Value::str(match &t {
         Value::Undef => "[object Undefined]",
         Value::Null => "[object Null]",
@@ -639,6 +610,15 @@ fn obj_to_string(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
             Kind::Error => "[object Error]",
             Kind::Date(_) => "[object Date]",
             Kind::Regex(_) => "[object RegExp]",
+            Kind::Map(_) => "[object Map]",
+            Kind::Set(_) => "[object Set]",
+            Kind::Promise(_) => "[object Promise]",
+            Kind::Generator(_) => "[object Generator]",
+            Kind::Boxed(Value::Str(_)) => "[object String]",
+            Kind::Boxed(Value::Num(_)) => "[object Number]",
+            Kind::Boxed(Value::Bool(_)) => "[object Boolean]",
+            Kind::Buffer(_) => "[object ArrayBuffer]",
+            Kind::DataView(_) => "[object DataView]",
             _ => "[object Object]",
         },
         Value::Str(_) => "[object String]",
@@ -796,17 +776,163 @@ fn arr_reverse(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     with_arr(&t, |v| v.reverse())?;
     Ok(t)
 }
-fn arr_index_of(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    let x = arg(a, 0);
-    ok_num(arr_vec(&t)?.iter().position(|v| strict_eq(v, &x)).map_or(-1.0, |i| i as f64))
+/// A relative index argument (`fromIndex`, `start`, ...) clamped to 0..=len.
+fn rel_arg(it: &mut Interp, v: &Value, len: usize, default: usize) -> R<usize> {
+    if matches!(v, Value::Undef) {
+        return Ok(default);
+    }
+    let n = it.to_num(v)?;
+    let n = if n.is_nan() { 0.0 } else { n.trunc() };
+    Ok(if n < 0.0 { (len as f64 + n).max(0.0) as usize } else { (n as usize).min(len) })
 }
-fn arr_last_index_of(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+fn arr_index_of(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let x = arg(a, 0);
-    ok_num(arr_vec(&t)?.iter().rposition(|v| strict_eq(v, &x)).map_or(-1.0, |i| i as f64))
+    let v = arr_vec(&t)?;
+    let from = rel_arg(it, &arg(a, 1), v.len(), 0)?;
+    ok_num(v[from..].iter().position(|v| strict_eq(v, &x)).map_or(-1.0, |i| (i + from) as f64))
 }
-fn arr_includes(_: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+fn arr_last_index_of(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let x = arg(a, 0);
-    Ok(Value::Bool(arr_vec(&t)?.iter().any(|v| strict_eq(v, &x) || matches!((v, &x), (Value::Num(p), Value::Num(q)) if p.is_nan() && q.is_nan()))))
+    let v = arr_vec(&t)?;
+    if v.is_empty() {
+        return ok_num(-1.0);
+    }
+    let end = if a.len() > 1 {
+        let n = it.to_num(&a[1])?;
+        let n = if n.is_nan() { 0.0 } else { n.trunc() };
+        if n < 0.0 { v.len() as f64 + n } else { n.min(v.len() as f64 - 1.0) }
+    } else {
+        v.len() as f64 - 1.0
+    };
+    if end < 0.0 {
+        return ok_num(-1.0);
+    }
+    ok_num(v[..=end as usize].iter().rposition(|v| strict_eq(v, &x)).map_or(-1.0, |i| i as f64))
+}
+fn arr_includes(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let x = arg(a, 0);
+    let v = arr_vec(&t)?;
+    let from = rel_arg(it, &arg(a, 1), v.len(), 0)?;
+    Ok(Value::Bool(v[from..].iter().any(|v| strict_eq(v, &x) || matches!((v, &x), (Value::Num(p), Value::Num(q)) if p.is_nan() && q.is_nan()))))
+}
+fn arr_copy_within(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let len = arr_vec(&t)?.len();
+    let target = rel_arg(it, &arg(a, 0), len, 0)?;
+    let start = rel_arg(it, &arg(a, 1), len, 0)?;
+    let end = rel_arg(it, &arg(a, 2), len, len)?;
+    with_arr(&t, |v| {
+        let chunk: Vec<Value> = v[start..end.max(start)].to_vec();
+        for (i, x) in chunk.into_iter().enumerate() {
+            if target + i < v.len() {
+                v[target + i] = x;
+            }
+        }
+    })?;
+    Ok(t)
+}
+fn arr_with(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let mut v = arr_vec(&t)?;
+    let n = it.to_num(&arg(a, 0))?.trunc();
+    let i = if n < 0.0 { v.len() as f64 + n } else { n };
+    if i < 0.0 || i >= v.len() as f64 {
+        return Err(make_error_value("RangeError", "Invalid index"));
+    }
+    v[i as usize] = arg(a, 1);
+    Ok(it.array(v))
+}
+fn arr_to_spliced(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let copy = it.array(arr_vec(&t)?);
+    arr_splice(it, copy.clone(), a)?;
+    Ok(copy)
+}
+fn arr_values(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    Ok(crate::js::iter::make(it, t, crate::js::iter::IterKind::Values))
+}
+
+/// Run an Array.prototype method on an array-like `this` (`arguments`, a
+/// NodeList, a jQuery object...): copy it into a real array, call `f`, then
+/// write mutations back.
+fn generic(it: &mut Interp, f: NativeFn, mutates: bool, t: Value, a: &[Value]) -> R<Value> {
+    if matches!(&t, Value::Obj(o) if matches!(o.borrow().kind, Kind::Array(_))) {
+        return f(it, t, a);
+    }
+    if t.is_nullish() {
+        return Err(type_error("Array.prototype method called on null or undefined"));
+    }
+    let len = it.get(&t, "length")?;
+    let n = it.to_num(&len)?;
+    let n = if n.is_finite() && n > 0.0 { (n as usize).min(1 << 28) } else { 0 };
+    let mut items = Vec::with_capacity(n);
+    for i in 0..n {
+        items.push(it.get(&t, &i.to_string())?);
+    }
+    let tmp = it.array(items);
+    let r = f(it, tmp.clone(), a)?;
+    if mutates {
+        let items = arr_vec(&tmp)?;
+        for (i, v) in items.iter().enumerate() {
+            it.put(&t, &i.to_string(), v.clone())?;
+        }
+        if let Value::Obj(o) = &t {
+            let mut b = o.borrow_mut();
+            for i in items.len()..n {
+                b.props.remove(&i.to_string());
+            }
+        }
+        it.put(&t, "length", Value::Num(items.len() as f64))?;
+    }
+    Ok(match (&r, &tmp) {
+        (Value::Obj(a), Value::Obj(b)) if Rc::ptr_eq(a, b) => t,
+        _ => r,
+    })
+}
+
+macro_rules! array_methods {
+    ($($name:literal => $w:ident($f:ident, $mutates:expr)),* $(,)?) => {
+        $(fn $w(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> { generic(it, $f, $mutates, t, a) })*
+        const ARRAY_METHODS: &[(&str, NativeFn)] = &[$(($name, $w as NativeFn)),*];
+    };
+}
+array_methods! {
+    "push" => g_push(arr_push, true),
+    "pop" => g_pop(arr_pop, true),
+    "shift" => g_shift(arr_shift, true),
+    "unshift" => g_unshift(arr_unshift, true),
+    "slice" => g_slice(arr_slice, false),
+    "splice" => g_splice(arr_splice, true),
+    "concat" => g_concat(arr_concat, false),
+    "join" => g_join(arr_join, false),
+    "toString" => g_to_string(arr_join, false),
+    "toLocaleString" => g_to_locale_string(arr_join, false),
+    "reverse" => g_reverse(arr_reverse, true),
+    "indexOf" => g_index_of(arr_index_of, false),
+    "lastIndexOf" => g_last_index_of(arr_last_index_of, false),
+    "includes" => g_includes(arr_includes, false),
+    "find" => g_find(arr_find, false),
+    "findIndex" => g_find_index(arr_find_index, false),
+    "findLast" => g_find_last(arr_find_last, false),
+    "findLastIndex" => g_find_last_index(arr_find_last_index, false),
+    "filter" => g_filter(arr_filter, false),
+    "map" => g_map(arr_map, false),
+    "forEach" => g_for_each(arr_for_each, false),
+    "reduce" => g_reduce(arr_reduce, false),
+    "reduceRight" => g_reduce_right(arr_reduce_right, false),
+    "some" => g_some(arr_some, false),
+    "every" => g_every(arr_every, false),
+    "sort" => g_sort(arr_sort, true),
+    "flat" => g_flat(arr_flat, false),
+    "flatMap" => g_flat_map(arr_flat_map, false),
+    "fill" => g_fill(arr_fill, true),
+    "copyWithin" => g_copy_within(arr_copy_within, true),
+    "keys" => g_keys(arr_keys, false),
+    "values" => g_values(arr_values, false),
+    "@@iterator" => g_iterator(arr_values, false),
+    "entries" => g_entries(arr_entries, false),
+    "at" => g_at(arr_at, false),
+    "with" => g_with(arr_with, false),
+    "toSorted" => g_to_sorted(arr_to_sorted, false),
+    "toReversed" => g_to_reversed(arr_to_reversed, false),
+    "toSpliced" => g_to_spliced(arr_to_spliced, false),
 }
 fn each(it: &mut Interp, t: &Value, a: &[Value], mut f: impl FnMut(&mut Interp, usize, &Value, Value) -> R<bool>) -> R<()> {
     let v = arr_vec(t)?;
@@ -1038,13 +1164,10 @@ fn arr_fill(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     Ok(t)
 }
 fn arr_keys(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
-    let n = arr_vec(&t)?.len();
-    Ok(it.array((0..n).map(|i| Value::Num(i as f64)).collect()))
+    Ok(crate::js::iter::make(it, t, crate::js::iter::IterKind::Keys))
 }
 fn arr_entries(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
-    let v = arr_vec(&t)?;
-    let out = v.into_iter().enumerate().map(|(i, x)| it.array(vec![Value::Num(i as f64), x])).collect();
-    Ok(it.array(out))
+    Ok(crate::js::iter::make(it, t, crate::js::iter::IterKind::Entries))
 }
 fn arr_at(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let v = arr_vec(&t)?;
@@ -2312,18 +2435,32 @@ fn map_for_each(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     }
     Ok(Value::Undef)
 }
+fn snapshot_iter(it: &mut Interp, items: Vec<Value>) -> Value {
+    let arr = it.array(items);
+    crate::js::iter::make(it, arr, crate::js::iter::IterKind::Values)
+}
 fn map_keys(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let v = with_map(&t, |m| m.iter().map(|(k, _)| k.clone()).collect())?;
-    Ok(it.array(v))
+    Ok(snapshot_iter(it, v))
 }
 fn map_values(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let v = with_map(&t, |m| m.iter().map(|(_, v)| v.clone()).collect())?;
-    Ok(it.array(v))
+    Ok(snapshot_iter(it, v))
 }
 fn map_entries(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let v = with_map(&t, |m| m.clone())?;
     let out = v.into_iter().map(|(k, v)| it.array(vec![k, v])).collect();
-    Ok(it.array(out))
+    Ok(snapshot_iter(it, out))
+}
+fn set_entries(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let v = with_set(&t, |s| s.clone())?;
+    let out = v.into_iter().map(|x| it.array(vec![x.clone(), x])).collect();
+    Ok(snapshot_iter(it, out))
+}
+fn string_iterator(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let s = it.to_str(&t)?;
+    let chars = s.chars().map(|c| Value::Str(c.to_string().into())).collect();
+    Ok(snapshot_iter(it, chars))
 }
 fn set_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let mut s: Vec<Value> = Vec::new();
@@ -2365,7 +2502,7 @@ fn set_for_each(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 }
 fn set_values(it: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let v = with_set(&t, |s| s.clone())?;
-    Ok(it.array(v))
+    Ok(snapshot_iter(it, v))
 }
 
 // ---------------------------------------------------------------- Promise
