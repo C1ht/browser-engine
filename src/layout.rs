@@ -42,12 +42,18 @@ pub enum Item {
     Float(u32),
     /// Where an absolutely positioned box would have been (its static position).
     Anchor(u32),
+    /// Start / end of an inline element with padding, borders or a background.
+    Open(NodeId),
+    Close(NodeId),
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum FragKind {
     Text { start: u32, end: u32, node: NodeId, link: u32, bg: u32, w: f32 },
     Atomic(u32),
+    /// One line's piece of a decorated inline element (`first` / `last`
+    /// pieces carry the left / right edges). `y` is the baseline.
+    InlineBox { node: NodeId, w: f32, first: bool, last: bool },
 }
 
 /// A positioned piece of a line. For text, `y` is the baseline.
@@ -123,7 +129,7 @@ impl LayoutTree {
         }
         for fr in &b.frags {
             match fr.kind {
-                FragKind::Text { node, w, .. } => t(node, [cx + fr.x, cy + fr.y - 14.0, w, 18.0]),
+                FragKind::Text { node, w, .. } | FragKind::InlineBox { node, w, .. } => t(node, [cx + fr.x, cy + fr.y - 14.0, w, 18.0]),
                 FragKind::Atomic(a) => self.walk(a, cx, cy, f, t),
             }
         }
@@ -939,13 +945,26 @@ impl<'a> Engine<'a> {
                     return;
                 }
                 let link = self.link_for(c, link);
-                let bg = if st.bg >> 24 != 0 { st.bg } else { bg };
+                let decorated = st.bg >> 24 != 0
+                    || st.bg_image.is_some()
+                    || st.bw.iter().any(|&v| v > 0.0)
+                    || st.padding.iter().any(|p| *p != Len::Px(0.0))
+                    || st.margin[1] != Len::Px(0.0)
+                    || st.margin[3] != Len::Px(0.0);
+                // A decorated inline paints its own background.
+                let bg = if decorated { bg } else if st.bg >> 24 != 0 { st.bg } else { bg };
+                if decorated {
+                    self.boxes[bx as usize].items.push(Item::Open(c));
+                }
                 if let Some(t) = crate::forms::display_text(doc, c) {
                     self.push_text(&t, c, bx, link, bg);
-                    return;
+                } else {
+                    for cc in self.kids(c) {
+                        self.collect_inline(cc, bx, link, bg);
+                    }
                 }
-                for cc in self.kids(c) {
-                    self.collect_inline(cc, bx, link, bg);
+                if decorated {
+                    self.boxes[bx as usize].items.push(Item::Close(c));
                 }
             }
             _ => {}
@@ -1268,6 +1287,13 @@ impl<'a> Engine<'a> {
                     nowrap_run = 0.0;
                 }
                 Item::Anchor(_) => {}
+                Item::Open(n) | Item::Close(n) => {
+                    let st = &self.styles[n as usize];
+                    let side = if matches!(*it, Item::Open(_)) { 3 } else { 1 };
+                    let edge = st.margin[side].fixed().unwrap_or(0.0) + st.bw[side] + st.padding[side].fixed().unwrap_or(0.0);
+                    line += edge;
+                    nowrap_run += edge;
+                }
                 Item::Text { start, end, node, .. } => {
                     let st = &self.styles[node as usize];
                     let face = self.face_of(st);
@@ -1283,7 +1309,18 @@ impl<'a> Engine<'a> {
                         if wraps {
                             for word in seg.split(' ') {
                                 let w = self.f.measure(face, fs, word);
-                                mn = mn.max(w);
+                                // Min-content: the widest unbreakable piece.
+                                if st.wrap_anywhere {
+                                    for (i, ch) in word.char_indices() {
+                                        mn = mn.max(self.f.measure(face, fs, &word[i..i + ch.len_utf8()]));
+                                    }
+                                } else {
+                                    let mut s0 = 0;
+                                    for cut in word_breaks(word, st.word_break).into_iter().chain([word.len()]) {
+                                        mn = mn.max(self.f.measure(face, fs, &word[s0..cut]));
+                                        s0 = cut;
+                                    }
+                                }
                                 line += w + space;
                             }
                             nowrap_run = 0.0;
@@ -1725,6 +1762,7 @@ impl<'a> Engine<'a> {
             align: cst.align,
             baseline: None,
             line_bottoms: Vec::new(),
+            open: Vec::new(),
         };
         for it in &items {
             match *it {
@@ -1741,6 +1779,33 @@ impl<'a> Engine<'a> {
                     }
                 }
                 Item::Anchor(a) => self.boxes[a as usize].static_pos = (lb.left + lb.x, lb.y),
+                Item::Open(n) => {
+                    let st = &self.styles[n as usize];
+                    self.begin_line(&mut lb, w, cx, cy, 0.0);
+                    lb.x += st.margin[3].px(w);
+                    let idx = lb.frags.len();
+                    lb.frags.push(Frag { x: lb.x, y: 0.0, kind: FragKind::InlineBox { node: n, w: 0.0, first: true, last: false } });
+                    lb.x += st.bw[3] + st.padding[3].px(w);
+                    lb.open.push((n, idx));
+                    lb.has_content = true;
+                    lb.trailing_w = 0.0;
+                    lb.trailing_bytes = 0;
+                }
+                Item::Close(n) => {
+                    let st = &self.styles[n as usize];
+                    lb.x += st.padding[1].px(w) + st.bw[1];
+                    if let Some(pos) = lb.open.iter().rposition(|&(m, _)| m == n) {
+                        let (_, idx) = lb.open.remove(pos);
+                        let x0 = lb.frags[idx].x;
+                        if let FragKind::InlineBox { w: bw, last, .. } = &mut lb.frags[idx].kind {
+                            *bw = lb.x - x0;
+                            *last = true;
+                        }
+                    }
+                    lb.x += st.margin[1].px(w);
+                    lb.trailing_w = 0.0;
+                    lb.trailing_bytes = 0;
+                }
                 Item::Atomic(a) => {
                     self.layout_block(a, w, Mode::Fit, 0.0, 0.0);
                     let ab = &self.boxes[a as usize];
@@ -2717,6 +2782,8 @@ struct LineBuilder {
     baseline: Option<f32>,
     /// Bottom of each finished line.
     line_bottoms: Vec<f32>,
+    /// Decorated inline elements open at this point: (node, frag index).
+    open: Vec<(NodeId, usize)>,
 }
 
 fn is_cjk(c: char) -> bool {
@@ -2800,6 +2867,13 @@ impl LineBuilder {
             *w -= self.trailing_w;
         }
         let line_w = self.x - self.trailing_w;
+        // Inline elements that continue on the next line end here.
+        for &(_, idx) in &self.open {
+            let x0 = self.frags[idx].x;
+            if let FragKind::InlineBox { w, .. } = &mut self.frags[idx].kind {
+                *w = (line_w - x0).max(0.0);
+            }
+        }
         let off = self.left
             + match self.align {
                 Align::Left => 0.0,
@@ -2810,7 +2884,7 @@ impl LineBuilder {
         for f in &mut self.frags[self.line_start..] {
             f.x += off;
             match f.kind {
-                FragKind::Text { .. } => f.y = self.y + baseline,
+                FragKind::Text { .. } | FragKind::InlineBox { .. } => f.y = self.y + baseline,
                 FragKind::Atomic(a) => {
                     // f.y holds the distance from the border-box top to the baseline.
                     let top = self.y + baseline - f.y;
@@ -2826,6 +2900,11 @@ impl LineBuilder {
         self.line_bottoms.push(self.y);
         self.x = 0.0;
         self.line_start = self.frags.len();
+        for o in &mut self.open {
+            let n = o.0;
+            o.1 = self.frags.len();
+            self.frags.push(Frag { x: 0.0, y: 0.0, kind: FragKind::InlineBox { node: n, w: 0.0, first: false, last: false } });
+        }
         self.asc = self.strut.0;
         self.desc = self.strut.1;
         self.has_content = false;

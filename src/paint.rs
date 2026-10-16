@@ -724,6 +724,42 @@ impl Builder<'_> {
                         self.link(x, y - a * fs, w, (a + d) * fs, link);
                     }
                 }
+                FragKind::InlineBox { node, w, first, last } => {
+                    let ist = &self.styles[node as usize];
+                    if ist.hidden {
+                        continue;
+                    }
+                    let face = self.f.pick_style(ist);
+                    let fs = ist.font_size;
+                    let (a, d, _) = self.f.metrics(face);
+                    let (pt, pb) = (ist.padding[0].px(b.w), ist.padding[2].px(b.w));
+                    let (bt, bb) = (ist.bw[0], ist.bw[2]);
+                    let bl = if first { ist.bw[3] } else { 0.0 };
+                    let br = if last { ist.bw[1] } else { 0.0 };
+                    let x = cx + f.x;
+                    let top = cy + f.y - a * fs - pt - bt;
+                    let h = (a + d) * fs + pt + pb + bt + bb;
+                    let r = radii(ist, w, h);
+                    let r = [if first { r[0] } else { 0.0 }, if last { r[1] } else { 0.0 }, if last { r[2] } else { 0.0 }, if first { r[3] } else { 0.0 }];
+                    let bgc = self.fade(ist.bg);
+                    if r.iter().any(|&v| v > 0.0) {
+                        if bgc >> 24 != 0 {
+                            self.push(DItem::RRect(Box::new(([x, top, w, h], r, bgc))));
+                        }
+                        let c = self.fade(ist.bc[0]);
+                        if (bt > 0.0 || bb > 0.0 || bl > 0.0 || br > 0.0) && c >> 24 != 0 {
+                            let i = [x + bl, top + bt, w - bl - br, h - bt - bb];
+                            let ir = r.map(|v| (v - bt.max(bl)).max(0.0));
+                            self.push(DItem::Ring(Box::new(RingData { o: [x, top, w, h], or: r, i, ir, c })));
+                        }
+                    } else {
+                        self.rect(x, top, w, h, ist.bg);
+                        self.rect(x, top, w, bt, ist.bc[0]);
+                        self.rect(x, top + h - bb, w, bb, ist.bc[2]);
+                        self.rect(x, top, bl, h, ist.bc[3]);
+                        self.rect(x + w - br, top, br, h, ist.bc[1]);
+                    }
+                }
                 FragKind::Atomic(a) => {
                     if self.is_positioned(a) {
                         self.defer(a, cx, cy);

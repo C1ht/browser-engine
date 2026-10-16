@@ -1389,6 +1389,30 @@ mod tests {
     }
 
     #[test]
+    fn inline_boxes() {
+        let p = page_from(
+            r#"<!doctype html><style>body { margin: 0; font-size: 16px; line-height: 20px }
+               #b { padding: 2px 30px; background: rgb(255, 0, 0); border-radius: 3px }
+               #l { border-left: 4px solid rgb(0, 0, 255) }</style>
+               <p id=p>a<span id=b>X</span>c</p><p><span id=l>z</span></p>"#,
+        );
+        let (w, h) = (400, 200);
+        let mut buf = vec![0u32; w * h];
+        let mut glyphs = crate::fonts::GlyphCache::default();
+        paint::paint(&p.dl, &p.tree.text, &mut glyphs, &mut buf, w, h, 0.0);
+        let rp = p.tree.node_rects()[&node_by_id(&p, "p")];
+        let px = |x: f32, y: f32| buf[y as usize * w + x as usize] & 0xFFFFFF;
+        // The span's left padding (30px) is painted red right after "a".
+        let mid = rp[1] + rp[3] / 2.0;
+        let a_w = 10.0;
+        assert_eq!(px(a_w + 15.0, mid), 0xFF0000);
+        // "c" is pushed right by both paddings: the paragraph is wider than a+X+c alone.
+        assert!(rp[2] > 60.0, "{:?}", rp);
+        let rl = p.tree.node_rects()[&node_by_id(&p, "l")];
+        assert_eq!(px(rl[0] + 1.0, rl[1] + rl[3] / 2.0), 0x0000FF);
+    }
+
+    #[test]
     fn line_breaking() {
         let p = page_from(
             "<!doctype html><style>body { margin: 0; font-size: 16px } div { width: 100px }
