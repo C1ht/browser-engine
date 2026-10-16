@@ -2,7 +2,7 @@
 
 A browser engine written from scratch in Rust, built for speed.
 
-bolt parses HTML and CSS, runs the cascade, lays out pages (block, inline, floats, positioning, flexbox, grid and tables), decodes images, loads web fonts, runs JavaScript, and rasterizes everything in software. It has two dependencies: `minifb` opens a window and blits pixels, and `fontdue` turns glyph outlines into bitmaps. Everything else is in this repo, including the HTML parser, CSS engine, layout, the PNG/JPEG/GIF decoders, the inflate (zlib) decompressor, the JavaScript interpreter and its regex engine, and the rasterizer.
+bolt parses HTML and CSS, runs the cascade, lays out pages (block, inline, floats, positioning, flexbox, grid and tables), decodes images, loads web fonts, runs JavaScript, and rasterizes everything in software. It has two dependencies: `minifb` opens a window and blits pixels, and `fontdue` turns glyph outlines into bitmaps. Everything else is in this repo, including the HTML parser, CSS engine, layout, the PNG/JPEG/GIF decoders, the inflate (zlib) and Brotli decompressors, the JavaScript interpreter and its regex engine, and the rasterizer.
 
 ## Usage
 
@@ -76,17 +76,17 @@ On real sites, total load time is dominated by the network, not the engine.
   - Tables (automatic layout), lists, `overflow: hidden`.
 - **Paint:** backgrounds, borders, rounded corners, box shadows, opacity, linear / radial / repeating gradients, background images (size / position / repeat) and `object-fit`.
 - **Images:** PNG (all color types and depths, interlaced), baseline and progressive JPEG, GIF (first frame) and `data:` URLs.
-- **Fonts:** `@font-face` with TTF, OTF and WOFF, matched by weight and style; symbol and CJK fallback fonts.
+- **Fonts:** `@font-face` with TTF, OTF, WOFF and WOFF2 (Brotli plus the `glyf` / `loca` / `hmtx` transforms), matched by weight, style and `unicode-range`; symbol and CJK fallback fonts.
 - **JavaScript:**
-  - ES2015+ syntax: classes with private names, destructuring, spread, arrow functions, template literals, optional chaining, `async` / `await`.
+  - ES2015+ syntax: classes with private names, destructuring, spread, arrow functions, template literals, optional chaining, `async` / `await`, generators and async generators.
   - Built-ins: Promises, Map / Set, JSON, RegExp, Date.
   - DOM: `querySelector`, `innerHTML`, `classList`, `style`, events with bubbling, timers.
 - **Browser:** links, back / forward history, `#fragment` scrolling, address bar, resizing, clicks dispatched to scripts.
 
 ## Not supported (yet)
 
-- WOFF2 fonts (they need a Brotli decoder) and SVG / WebP images.
-- Generators, ES modules, `fetch` / XHR and form text editing.
+- SVG / WebP images. A text run uses one font face, so `unicode-range` subsets other than Latin are skipped.
+- ES modules, `fetch` / XHR and form text editing. Generators run their body eagerly on the first `next()`, so an infinite generator stops after 100,000 values.
 - Transforms, filters, animations / transitions and right-to-left text.
 
 ## Tests
@@ -95,4 +95,4 @@ On real sites, total load time is dominated by the network, not the engine.
 cargo test --release
 ```
 
-The image decoders are checked against Pillow-decoded fixtures in `testdata/`. JavaScript semantics, the DOM bindings and end-to-end clicks have unit tests in `src/js` and `src/engine.rs`.
+The image decoders are checked against Pillow-decoded fixtures in `testdata/`, and the Brotli decoder against real CDN responses. The WOFF2 test optionally compares every ASCII glyph with the same font as plain TTF (`BOLT_REF_TTF=<folder with lobster.ttf, roboto-bold.ttf>`). JavaScript semantics, the DOM bindings and end-to-end clicks have unit tests in `src/js` and `src/engine.rs`.

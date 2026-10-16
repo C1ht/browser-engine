@@ -754,6 +754,7 @@ fn parse_font_face(body: &str) {
     let mut family = None;
     let mut url = None;
     let (mut weight, mut italic) = ((400u16, 400u16), false);
+    let mut latin = true;
     let b = body.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -765,7 +766,7 @@ fn parse_font_face(body: &str) {
         match name.trim().to_ascii_lowercase().as_str() {
             "font-family" => family = Some(value.trim_matches(|c| c == '"' || c == '\'').to_ascii_lowercase()),
             "src" => {
-                // Prefer formats we can load: woff, then truetype/opentype.
+                // Prefer formats we can load: woff2, woff, then truetype/opentype.
                 let mut best: Option<(u8, String)> = None;
                 for part in split_top(value, b',') {
                     let part = part.trim();
@@ -776,7 +777,7 @@ fn parse_font_face(body: &str) {
                     let fmt = lower[ue..].to_string();
                     let path = raw.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
                     let rank = if fmt.contains("woff2") || path.ends_with(".woff2") {
-                        0
+                        4
                     } else if fmt.contains("woff") || path.ends_with(".woff") {
                         3
                     } else if fmt.contains("truetype") || fmt.contains("opentype") || path.ends_with(".ttf") || path.ends_with(".otf") {
@@ -804,11 +805,13 @@ fn parse_font_face(body: &str) {
                     weight = (a, toks.get(1).and_then(|t| w(t)).unwrap_or(a));
                 }
             }
+            // Text runs use a single face, so only subsets covering Latin are kept.
+            "unicode-range" => latin = covers(value, 'a' as u32),
             "font-style" => italic = value.to_ascii_lowercase().starts_with("italic") || value.to_ascii_lowercase().starts_with("oblique"),
             _ => {}
         }
     }
-    if let (Some(family), Some(url)) = (family, url) {
+    if let (Some(family), Some(url), true) = (family, url, latin) {
         FONT_FACES.with(|f| {
             let mut f = f.borrow_mut();
             if !f.iter().any(|x| x.url == url && *x.family == *family) {
@@ -816,6 +819,21 @@ fn parse_font_face(body: &str) {
             }
         });
     }
+}
+
+/// Does a `unicode-range` value (`U+0000-00FF, U+0131, U+4??`) include `cp`?
+fn covers(range: &str, cp: u32) -> bool {
+    range.split(',').any(|r| {
+        let r = r.trim();
+        let Some(r) = r.strip_prefix("U+").or_else(|| r.strip_prefix("u+")) else { return false };
+        let hex = |t: &str| u32::from_str_radix(t, 16).ok();
+        let (lo, hi) = match r.split_once('-') {
+            Some((a, b)) => (hex(a), hex(b)),
+            None if r.contains('?') => (hex(&r.replace('?', "0")), hex(&r.replace('?', "F"))),
+            None => (hex(r), hex(r)),
+        };
+        matches!((lo, hi), (Some(lo), Some(hi)) if (lo..=hi).contains(&cp))
+    })
 }
 
 fn push4(out: &mut Vec<Decl>, props: [Prop; 4], vals: &[Value], important: bool) {

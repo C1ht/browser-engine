@@ -8,6 +8,8 @@
 #![allow(non_upper_case_globals)]
 
 mod atom;
+mod brotli;
+mod brotli_tables;
 mod css;
 mod dom;
 mod engine;
@@ -18,6 +20,7 @@ mod image;
 mod js;
 mod layout;
 mod net;
+mod woff2;
 mod paint;
 mod png;
 mod style;
