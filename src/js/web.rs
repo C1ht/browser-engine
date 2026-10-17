@@ -1097,6 +1097,9 @@ impl Interp {
                 }
                 Target::Script(node) => match r {
                     Ok(h) if (200..300).contains(&h.status) => {
+                        if crate::js::trace_scripts() {
+                            eprintln!("[script] inserted {}", h.url);
+                        }
                         let code = crate::net::decode(&h.body);
                         let saved = std::mem::replace(&mut self.current_script, node);
                         if let Err(e) = self.run_script(&code) {

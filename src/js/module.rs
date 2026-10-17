@@ -114,7 +114,12 @@ impl Interp {
         }
         let src = match src {
             Some(s) => s,
-            None => self.fetch_module_source(url)?,
+            None => {
+                if crate::js::trace_scripts() {
+                    eprintln!("[script] load module {url}");
+                }
+                self.fetch_module_source(url)?
+            }
         };
         let (body, info) = parser::parse_module(&src).map_err(|e| err("SyntaxError", format!("{} ({url})", e.trim_start_matches("SyntaxError: "))))?;
         let env = new_scope(Some(self.genv.clone()), Some(Value::Undef), None, true);
@@ -215,6 +220,9 @@ impl Interp {
 
     /// Run a module script: load its graph and evaluate it.
     pub fn run_module(&mut self, url: &str, src: Option<String>) {
+        if crate::js::trace_scripts() {
+            eprintln!("[script] module {}", if src.is_some() { "(inline)" } else { url });
+        }
         match self.load_module(url, src) {
             Ok(id) => {
                 self.evaluate_module(id);
@@ -340,20 +348,20 @@ impl Interp {
             Ok(Value::Str(s)) => s.to_string(),
             _ => self.url.clone(),
         };
-        let loaded = (|| -> R<usize> {
+        let url = (|| -> R<String> {
             let s = self.to_str(&spec)?;
-            let url = self.resolve_specifier(&base, &s)?;
-            self.load_module(&url, None)
+            self.resolve_specifier(&base, &s)
         })();
-        match loaded {
-            Ok(id) => {
-                let p = self.evaluate_module(id);
-                let ns = Value::Obj(self.module_namespace(id));
-                self.start_job(Box::new(move |it: &mut Interp| {
-                    builtins::await_value(it, p)?;
-                    Ok(ns)
-                }))
-            }
+        match url {
+            // The module loads and runs later, never inside the caller (a
+            // framework mid-render must not see a module's top-level code run).
+            Ok(url) => self.start_job(Box::new(move |it: &mut Interp| {
+                builtins::await_value(it, Value::Undef)?;
+                let id = it.load_module(&url, None)?;
+                let p = it.evaluate_module(id);
+                builtins::await_value(it, p)?;
+                Ok(Value::Obj(it.module_namespace(id)))
+            })),
             Err(e) => builtins::promise_rejected(self, e),
         }
     }

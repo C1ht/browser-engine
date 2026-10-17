@@ -438,7 +438,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
     it.ready_state = "loading";
-    it.deadline = Some(t0 + std::time::Duration::from_millis(script_budget() as u64));
+    it.set_deadline(t0 + std::time::Duration::from_millis(script_budget() as u64));
     it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: css.clone(), base: base.to_owned() }));
     // Parser-blocking classic scripts run in order; `defer` and module
     // scripts after them (in order), then `async` ones. Scripts that don't
@@ -462,7 +462,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     }
     for s in classic.into_iter().chain(deferred).chain(later) {
         if it.script_queue.is_empty() && ms(t0) <= script_budget() {
-            it.deadline = Some(Instant::now() + std::time::Duration::from_millis(SCRIPT_TASK_MS));
+            it.set_deadline(Instant::now() + std::time::Duration::from_millis(script_task_ms()));
             let kind = script_kind(&it.doc, s);
             run_script_node(&mut it, s, kind, sources, base);
             run_pending(&mut it, &t0);
@@ -470,6 +470,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
             it.script_queue.push_back(s);
         }
     }
+    it.set_deadline(Instant::now() + std::time::Duration::from_millis(script_task_ms()));
     if it.script_queue.is_empty() {
         fire_load_events(&mut it);
     } else {
@@ -515,8 +516,12 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     (doc, Some(it), elapsed)
 }
 
-/// How long one script (or event handler / timer task) may run.
-const SCRIPT_TASK_MS: u64 = 5000;
+/// How long one script (or event handler / timer task) may run
+/// (`BOLT_TASK_MS` overrides).
+fn script_task_ms() -> u64 {
+    static T: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *T.get_or_init(|| std::env::var("BOLT_TASK_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(15_000))
+}
 
 /// The document finished loading: readystatechange, DOMContentLoaded, load.
 fn fire_load_events(it: &mut js::Interp) {
@@ -962,7 +967,7 @@ impl Page {
         it.doc = std::mem::take(&mut self.doc);
         // Event handlers and timers get a leash; generous, since a killed
         // task (half-rendered component) is worse than a slow one.
-        it.deadline = Some(Instant::now() + std::time::Duration::from_millis(SCRIPT_TASK_MS));
+        it.set_deadline(Instant::now() + std::time::Duration::from_millis(script_task_ms()));
         let focus_before = it.doc.focus;
         let r = f(it);
         it.run_microtasks();

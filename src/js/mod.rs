@@ -488,6 +488,9 @@ pub struct Interp {
     pub co_stack: Vec<ObjRef>,
     /// Top-level scripts / module bodies being evaluated (JS on the stack).
     pub script_running: u32,
+    /// The current task overran its time limit and is being unwound
+    /// (try / catch / finally don't intercept it).
+    pub terminating: bool,
     /// Images the page has loaded, by URL (None: failed). For script-side
     /// layout, naturalWidth / complete, and load events.
     pub images: FxHashMap<String, Option<std::sync::Arc<crate::image::Image>>>,
@@ -511,6 +514,9 @@ pub struct Interp {
 }
 
 pub const WINDOW: u32 = u32::MAX - 1;
+
+/// Thrown to unwind a task that overran its time limit.
+pub const TERMINATE: &str = "@@terminate";
 
 pub fn type_error(msg: impl Into<String>) -> Value {
     builtins::make_error_value("TypeError", &msg.into())
@@ -590,6 +596,7 @@ impl Interp {
             styles: None,
             co_stack: Vec::new(),
             script_running: 0,
+            terminating: false,
             images: FxHashMap::default(),
             img_fired: FxHashMap::default(),
             script_queue: Default::default(),
@@ -665,12 +672,24 @@ impl Interp {
     #[inline]
     fn tick(&mut self) -> R<()> {
         self.steps += 1;
-        if self.steps & 0xFFFF == 0 {
-            if self.steps > self.budget || self.deadline.is_some_and(|d| std::time::Instant::now() > d) {
-                return Err(builtins::make_error_value("Error", "script took too long and was stopped"));
+        if self.terminating {
+            return Err(Value::str(TERMINATE));
+        }
+        if self.steps & 0xFFFF == 0 && (self.steps > self.budget || self.deadline.is_some_and(|d| std::time::Instant::now() > d)) {
+            // Stop the whole task: scripts can't catch this.
+            self.terminating = true;
+            if trace_on() {
+                self.log(&format!("[trace] task stopped (time limit){}", trace_stack()));
             }
+            return Err(Value::str(TERMINATE));
         }
         Ok(())
+    }
+
+    /// Start a new task's time limit (and end any termination in progress).
+    pub fn set_deadline(&mut self, d: std::time::Instant) {
+        self.deadline = Some(d);
+        self.terminating = false;
     }
 
     // ---------------------------------------------------------- conversion
@@ -1602,6 +1621,9 @@ impl Interp {
     }
 
     pub fn describe_error(&mut self, e: &Value) -> String {
+        if matches!(e, Value::Str(s) if &**s == TERMINATE) {
+            return "Error: script took too long and was stopped".into();
+        }
         if let Value::Obj(_) = e {
             let name = self.get(e, "name").ok().and_then(|v| if let Value::Str(s) = v { Some(s) } else { None });
             let msg = self.get(e, "message").ok().and_then(|v| if let Value::Str(s) = v { Some(s) } else { None });
@@ -1807,6 +1829,9 @@ impl Interp {
             }
             Stmt::Try(block, catch, finally) => {
                 let r = self.block(block, env);
+                if self.terminating {
+                    return r;
+                }
                 let r = match (r, catch) {
                     (Err(e), Some((param, cb))) if !generator::is_return_marker(&e) => {
                         let scope = new_scope(Some(env.clone()), None, None, false);
@@ -2907,7 +2932,7 @@ pub(crate) fn trace_stack() -> String {
         s.borrow()
             .iter()
             .rev()
-            .take(4)
+            .take(std::env::var("BOLT_TRACE_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(4))
             .map(|d| {
                 let params: Vec<String> = d.params.iter().map(|p| match p {
                     Pattern::Ident(n) => n.to_string(),
@@ -2926,6 +2951,12 @@ fn trace_throw() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     *ON.get_or_init(|| std::env::var_os("BOLT_TRACE_THROW").is_some()) && COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 30
+}
+
+/// `BOLT_TRACE_SCRIPTS=1`: log each script as it runs.
+pub(crate) fn trace_scripts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BOLT_TRACE_SCRIPTS").is_some())
 }
 
 pub(crate) fn trace_on() -> bool {
