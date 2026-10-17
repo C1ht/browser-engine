@@ -27,7 +27,7 @@ fn key(v: &Value) -> Key {
         Value::Num(n) if *n == 0.0 => Key::Num(0f64.to_bits()),
         Value::Num(n) if n.is_nan() => Key::Num(f64::NAN.to_bits()),
         Value::Num(n) => Key::Num(n.to_bits()),
-        Value::BigInt(b) => Key::BigInt(*b),
+        Value::BigInt(b) => Key::BigInt(b.get()),
         Value::Str(s) => Key::Str(s.clone()),
         Value::Obj(o) => Key::Obj(Rc::as_ptr(o) as *const () as usize),
     }

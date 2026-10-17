@@ -57,7 +57,7 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    fn is_cmp(self) -> bool {
+    pub(crate) fn is_cmp(self) -> bool {
         matches!(self, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne | BinOp::StrictEq | BinOp::StrictNe)
     }
 
@@ -183,8 +183,6 @@ pub enum Op {
     Concat { dst: Reg, start: Reg, count: u16 },
     /// Evaluate an AST expression against the current scope.
     Island { dst: Reg, expr: u32 },
-    /// Execute an AST statement; a `return` inside it returns.
-    IslandStmt { stmt: u32 },
     /// Bind an AST pattern (declaration kind 0 var / 1 let / 2 const / 3 none).
     BindPattern { pat: u32, src: Reg, kind: u8 },
     /// Materialize an iterable into an array (destructuring).
@@ -226,18 +224,66 @@ pub struct Code {
     regexes: Vec<(Rc<str>, Rc<str>)>,
     /// AST nodes evaluated by the interpreter (kept alive by `def`).
     exprs: Vec<*const Expr>,
-    stmts: Vec<*const Stmt>,
     pats: Vec<*const Pattern>,
     nregs: usize,
     niters: usize,
     needs_env: bool,
     uses_arguments: bool,
     ics: Box<[Ic]>,
+    /// Calls + loop iterations (for the JIT).
+    hot: Cell<u32>,
+    /// Machine code (None: the JIT can't compile it).
+    jit: std::cell::OnceCell<Option<super::jit::JitCode>>,
+}
+
+impl Ic {
+    /// Field offsets for machine code: (ids, slot, depth).
+    pub(crate) fn offsets() -> (usize, usize, usize) {
+        (std::mem::offset_of!(Ic, ids), std::mem::offset_of!(Ic, slot), std::mem::offset_of!(Ic, depth))
+    }
+}
+
+impl Code {
+    pub(crate) fn ic_addr(&self, i: u32) -> Option<usize> {
+        self.ics.get(i as usize).map(|ic| ic as *const Ic as usize)
+    }
+
+    pub(crate) fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+    pub(crate) fn consts(&self) -> &[Value] {
+        &self.consts
+    }
+
+    /// Count a call / back edge; compile to machine code once hot.
+    #[inline]
+    fn heat(&self) -> bool {
+        let h = self.hot.get().wrapping_add(1);
+        self.hot.set(h);
+        h >= super::jit::jit_threshold() && self.jit.get().is_none() && {
+            let j = super::jit::compile(self);
+            if vm_trace() {
+                eprintln!("[jit] {} ({} ops)", if j.is_some() { "compiled" } else { "unsupported" }, self.ops.len());
+            }
+            let _ = self.jit.set(j);
+            true
+        }
+    }
+}
+
+/// How `vm_run` stopped.
+pub(crate) enum Exit {
+    Ret(Value),
+    /// Single-step mode: one op done.
+    Next,
+    /// Machine code became available at a loop back edge (continue there).
+    Osr,
 }
 
 /// An inline cache for a named property access: the shape ids along the
 /// receiver's prototype chain it was filled for, and the slot.
 #[derive(Default)]
+#[repr(C)]
 pub struct Ic {
     ids: [Cell<u64>; 4],
     slot: Cell<u32>,
@@ -252,7 +298,7 @@ const IC_OWN: u8 = 0;
 const IC_ADD: u8 = 1;
 
 enum IterState {
-    Keys(Vec<Rc<str>>, usize, Value),
+    Keys(Vec<Rc<str>>, usize),
     Values(Vec<Value>, usize),
     Lazy { iter: Value, next: Value },
 }
@@ -673,32 +719,6 @@ fn captured_expr(e: &Expr, out: &mut FxHashSet<Rc<str>>, nested: &mut bool) {
                 captured_expr(x, out, nested);
             }
         }
-    }
-}
-
-/// Does a statement contain `break` / `continue` that leaves it (labels
-/// defined outside, or unlabeled ones outside a loop / switch within it)?
-fn jumps_out(s: &Stmt, in_loop: bool, in_switch: bool, labels: &mut Vec<Rc<str>>) -> bool {
-    match s {
-        Stmt::Break(None) => !(in_loop || in_switch),
-        Stmt::Continue(None) => !in_loop,
-        Stmt::Break(Some(l)) | Stmt::Continue(Some(l)) => !labels.contains(l),
-        Stmt::If(_, a, b) => jumps_out(a, in_loop, in_switch, labels) || b.as_ref().is_some_and(|b| jumps_out(b, in_loop, in_switch, labels)),
-        Stmt::Block(b) => b.iter().any(|s| jumps_out(s, in_loop, in_switch, labels)),
-        Stmt::For(_, _, _, b) | Stmt::ForIn(_, _, b) | Stmt::ForOf(_, _, b) | Stmt::While(_, b) | Stmt::DoWhile(b, _) => jumps_out(b, true, in_switch, labels),
-        Stmt::Try(a, c, f) => {
-            a.iter().any(|s| jumps_out(s, in_loop, in_switch, labels))
-                || c.as_ref().is_some_and(|(_, c)| c.iter().any(|s| jumps_out(s, in_loop, in_switch, labels)))
-                || f.as_ref().is_some_and(|f| f.iter().any(|s| jumps_out(s, in_loop, in_switch, labels)))
-        }
-        Stmt::Switch(_, cases) => cases.iter().any(|(_, b)| b.iter().any(|s| jumps_out(s, in_loop, true, labels))),
-        Stmt::Labeled(l, b) => {
-            labels.push(l.clone());
-            let r = jumps_out(b, in_loop, in_switch, labels);
-            labels.pop();
-            r
-        }
-        _ => false,
     }
 }
 
@@ -2013,7 +2033,7 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Const { dst, k });
             }
             Expr::BigInt(n) => {
-                let k = self.konst(Value::BigInt(*n));
+                let k = self.konst(Value::big(*n));
                 self.emit(Op::Const { dst, k });
             }
             Expr::Str(s) => {
@@ -2641,13 +2661,14 @@ pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
                 classes: c.classes,
                 regexes: c.regexes,
                 exprs: c.exprs,
-                stmts: c.stmts,
                 pats: c.pats,
                 nregs: c.max as usize + 1,
                 niters: c.max_iters,
                 needs_env,
                 uses_arguments: c.uses_arguments,
                 ics: (0..c.nics).map(|_| Ic::default()).collect(),
+                hot: Cell::new(0),
+                jit: std::cell::OnceCell::new(),
             });
         }
         let more = c.island_names.clone();
@@ -2659,7 +2680,7 @@ pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
 
 // ------------------------------------------------------------------ runtime
 
-struct Frame {
+pub(crate) struct Frame {
     regs: Vec<Value>,
     envs: Vec<Env>,
     handlers: Vec<Handler>,
@@ -2753,9 +2774,17 @@ impl Interp {
 
     fn vm_frame(&mut self, code: &Rc<Code>, f: &mut Frame) -> R<Value> {
         let mut ip = 0usize;
+        if super::jit::jit_enabled() {
+            code.heat();
+        }
         loop {
-            match self.vm_run(code, f, &mut ip) {
-                Ok(v) => return Ok(v),
+            let r = match code.jit.get() {
+                Some(Some(j)) => self.jit_run(j, code, f, ip),
+                _ => self.vm_run::<false>(code, f, &mut ip),
+            };
+            match r {
+                Ok(Exit::Ret(v)) => return Ok(v),
+                Ok(Exit::Osr | Exit::Next) => {}
                 Err(e) => {
                     if self.terminating {
                         return Err(e);
@@ -2784,10 +2813,38 @@ impl Interp {
         f.envs.last().unwrap()
     }
 
+    /// Run machine code from op `ip`.
+    fn jit_run(&mut self, j: &super::jit::JitCode, code: &Code, f: &mut Frame, ip: usize) -> R<Exit> {
+        let mut ctx = super::jit::Ctx {
+            interp: self as *mut Interp,
+            frame: f as *mut Frame as *mut u8,
+            code: code as *const Code,
+            regs: f.regs.as_mut_ptr(),
+            table: std::ptr::null(),
+            consts: code.consts.as_ptr(),
+            step: jit_step as *const () as usize,
+            budget: super::jit::BUDGET,
+            out: None,
+        };
+        // SAFETY: the code was compiled for this function; ctx points at
+        // live state for the duration of the call.
+        let r = unsafe { j.run(&mut ctx, ip) };
+        let v = ctx.out.take().unwrap_or_default();
+        if r == super::jit::EXIT_ERR { Err(v) } else { Ok(Exit::Ret(v)) }
+    }
+
+    /// Execute ops from `ip` (STEP: just one).
     #[inline(never)]
-    fn vm_run(&mut self, code: &Code, f: &mut Frame, ip: &mut usize) -> R<Value> {
+    pub(crate) fn vm_run<const STEP: bool>(&mut self, code: &Code, f: &mut Frame, ip: &mut usize) -> R<Exit> {
         let ops = &code.ops[..];
+        let mut first = true;
         loop {
+            if STEP {
+                if !first {
+                    return Ok(Exit::Next);
+                }
+                first = false;
+            }
             let op = ops[*ip];
             *ip += 1;
             match op {
@@ -2901,8 +2958,8 @@ impl Interp {
                         (UnOp::Neg, Value::Num(n)) => Value::Num(-n),
                         (UnOp::Plus, Value::Num(n)) => Value::Num(*n),
                         (_, Value::BigInt(b)) => match op {
-                            UnOp::Neg => Value::BigInt(b.checked_neg().ok_or_else(bigint::too_big)?),
-                            UnOp::BitNot => Value::BigInt(!b),
+                            UnOp::Neg => Value::big(b.get().checked_neg().ok_or_else(bigint::too_big)?),
+                            UnOp::BitNot => Value::big(!b.get()),
                             _ => return Err(type_error("Cannot convert a BigInt value to a number")),
                         },
                         (UnOp::Neg, v) => Value::Num(-self.to_num(v)?),
@@ -2914,7 +2971,7 @@ impl Interp {
                 Op::Step { dst, src, delta } => {
                     let v = match &f.regs[src as usize] {
                         Value::Num(n) => Value::Num(n + delta as f64),
-                        Value::BigInt(b) => Value::BigInt(b.checked_add(delta as i128).ok_or_else(bigint::too_big)?),
+                        Value::BigInt(b) => Value::big(b.get().checked_add(delta as i128).ok_or_else(bigint::too_big)?),
                         v => {
                             let v = v.clone();
                             Value::Num(self.to_num(&v)? + delta as f64)
@@ -2936,6 +2993,10 @@ impl Interp {
                 Op::Loop { to } => {
                     self.tick()?;
                     *ip = to as usize;
+                    // Hot loop: continue in machine code.
+                    if !STEP && super::jit::jit_enabled() && { code.heat(); true } && matches!(code.jit.get(), Some(Some(_))) {
+                        return Ok(Exit::Osr);
+                    }
                 }
                 Op::JumpIf { cond, to } => {
                     if f.regs[cond as usize].truthy() {
@@ -2975,63 +3036,10 @@ impl Interp {
                         *ip = to as usize;
                     }
                 }
-                Op::GetProp { dst, obj, name, ic } => {
-                    if ic != NO_IC {
-                        if let Value::Obj(o) = &f.regs[obj as usize] {
-                            match ic_get(o, &code.ics[ic as usize]) {
-                                IcHit::Value(v) => {
-                                    f.regs[dst as usize] = v;
-                                    continue;
-                                }
-                                IcHit::Getter(g) => {
-                                    let o = f.regs[obj as usize].clone();
-                                    f.regs[dst as usize] = self.call(&g, o, &[])?;
-                                    continue;
-                                }
-                                IcHit::Miss => {}
-                            }
-                        }
-                    }
-                    let o = f.regs[obj as usize].clone();
-                    let key = &code.names[name as usize];
-                    f.regs[dst as usize] = self.get(&o, key)?;
-                    if ic != NO_IC {
-                        if let Value::Obj(o) = &o {
-                            ic_fill_get(o, key, &code.ics[ic as usize]);
-                        }
-                    }
-                }
-                Op::SetProp { obj, name, src, ic } => {
-                    if ic != NO_IC {
-                        if let Value::Obj(o) = &f.regs[obj as usize] {
-                            if ic_set(o, &code.ics[ic as usize], &f.regs[src as usize]) {
-                                continue;
-                            }
-                        }
-                    }
-                    let o = f.regs[obj as usize].clone();
-                    let v = f.regs[src as usize].clone();
-                    let key = &code.names[name as usize];
-                    let before = match &o {
-                        Value::Obj(ob) if ic != NO_IC => Some(ob.borrow().props.shape_id()),
-                        _ => None,
-                    };
-                    self.put(&o, key, v)?;
-                    if let (Some(before), Value::Obj(ob)) = (before, &o) {
-                        ic_fill_set(ob, key, before, &code.ics[ic as usize]);
-                    }
-                }
-                Op::GetIndex { dst, obj, key } => {
-                    let o = f.regs[obj as usize].clone();
-                    let k = f.regs[key as usize].clone();
-                    f.regs[dst as usize] = self.get_v(&o, &k)?;
-                }
-                Op::SetIndex { obj, key, src } => {
-                    let o = f.regs[obj as usize].clone();
-                    let k = f.regs[key as usize].clone();
-                    let v = f.regs[src as usize].clone();
-                    self.put_v(&o, &k, v)?;
-                }
+                Op::GetProp { dst, obj, name, ic } => self.op_get_prop(code, f, dst, obj, name, ic)?,
+                Op::SetProp { obj, name, src, ic } => self.op_set_prop(code, f, obj, name, src, ic)?,
+                Op::GetIndex { dst, obj, key } => self.op_get_index(f, dst, obj, key)?,
+                Op::SetIndex { obj, key, src } => self.op_set_index(f, obj, key, src)?,
                 Op::DelProp { dst, obj, name } => {
                     let o = f.regs[obj as usize].clone();
                     f.regs[dst as usize] = Value::Bool(self.delete(&o, &code.names[name as usize]));
@@ -3042,28 +3050,7 @@ impl Interp {
                     let k = self.key(&k)?;
                     f.regs[dst as usize] = Value::Bool(self.delete(&o, &k));
                 }
-                Op::Call { dst, f: fr, this, args, argc } => {
-                    // Compiled closure → compiled closure, skipping the
-                    // generic call path.
-                    if let Some((callee, env, home, fo)) = vm_callee(&f.regs[fr as usize]) {
-                        if self.depth < if self.co_stack.is_empty() { MAX_DEPTH } else { coro::MAX_DEPTH } && !prof::on() && !trace_on() && !trace_throw_on() {
-                            self.tick()?;
-                            self.depth += 1;
-                            let th = f.regs[this as usize].clone();
-                            let r = self.vm_call(&callee, env, th, &f.regs[args as usize..args as usize + argc as usize], Some(fo), home);
-                            self.depth -= 1;
-                            f.regs[dst as usize] = r?;
-                            continue;
-                        }
-                    }
-                    let func = f.regs[fr as usize].clone();
-                    if !Self::is_callable(&func) {
-                        return Err(type_error(format!("{} is not a function", Self::vm_describe(&func))));
-                    }
-                    let th = f.regs[this as usize].clone();
-                    let v = self.call(&func, th, &f.regs[args as usize..args as usize + argc as usize])?;
-                    f.regs[dst as usize] = v;
-                }
+                Op::Call { dst, f: fr, this, args, argc } => self.op_call(f, dst, fr, this, args, argc)?,
                 Op::CallArr { dst, f: fr, this, arr } => {
                     let func = f.regs[fr as usize].clone();
                     if !Self::is_callable(&func) {
@@ -3230,14 +3217,6 @@ impl Interp {
                     let e = unsafe { &*code.exprs[expr as usize] };
                     f.regs[dst as usize] = self.eval(e, &env)?;
                 }
-                Op::IslandStmt { stmt } => {
-                    let env = Self::vm_env(f).clone();
-                    // SAFETY: as for Island.
-                    let s = unsafe { &*code.stmts[stmt as usize] };
-                    if let Flow::Ret(v) = self.exec(s, &env)? {
-                        return Ok(v);
-                    }
-                }
                 Op::BindPattern { pat, src, kind } => {
                     let env = Self::vm_env(f).clone();
                     // SAFETY: as for Island.
@@ -3269,7 +3248,7 @@ impl Interp {
                         return Err(type_error(format!("Cannot destructure '{:?}'", v)));
                     }
                 }
-                Op::Return { src } => return Ok(std::mem::take(&mut f.regs[src as usize])),
+                Op::Return { src } => return Ok(Exit::Ret(std::mem::take(&mut f.regs[src as usize]))),
                 Op::Throw { src } => {
                     let v = f.regs[src as usize].clone();
                     if trace_throw() {
@@ -3327,7 +3306,7 @@ impl Interp {
                             None => IterState::Values(self.iterate(&v)?, 0),
                         }
                     } else {
-                        IterState::Keys(self.for_in_keys(&v), 0, v)
+                        IterState::Keys(self.for_in_keys(&v), 0)
                     };
                     f.iters[slot as usize] = Some(st);
                 }
@@ -3338,7 +3317,7 @@ impl Interp {
                             *i += 1;
                             v
                         }
-                        Some(IterState::Keys(keys, i, _)) => {
+                        Some(IterState::Keys(keys, i)) => {
                             let v = keys.get(*i).cloned().map(Value::Str);
                             *i += 1;
                             v
@@ -3744,4 +3723,230 @@ fn num_bin(op: BinOp, x: f64, y: f64) -> Option<Value> {
         BinOp::UShr => Value::Num(((to_i32(x) as u32) >> (to_i32(y) as u32 & 31)) as f64),
         _ => return None,
     })
+}
+
+/// Called by machine code: run op `ip` in the VM; the next op index, or an
+/// exit code (the value in `ctx.out`).
+unsafe extern "win64" fn jit_step(ctx: *mut super::jit::Ctx, ip: u64) -> u64 {
+    // SAFETY: ctx is the live context jit_run set up.
+    let ctx = unsafe { &mut *ctx };
+    let it = unsafe { &mut *ctx.interp };
+    let f = unsafe { &mut *(ctx.frame as *mut Frame) };
+    let code = unsafe { &*ctx.code };
+    let mut ip = ip as usize;
+    if let Op::Loop { .. } = code.ops[ip] {
+        // The back-edge budget ran out: count the iterations, then tick.
+        ctx.budget = super::jit::BUDGET;
+        it.steps += super::jit::BUDGET as u64 - 1;
+    }
+    match it.vm_run::<true>(code, f, &mut ip) {
+        Ok(Exit::Next | Exit::Osr) => ip as u64,
+        Ok(Exit::Ret(v)) => {
+            ctx.out = Some(v);
+            super::jit::EXIT_RET
+        }
+        Err(e) => {
+            ctx.out = Some(e);
+            super::jit::EXIT_ERR
+        }
+    }
+}
+
+impl Interp {
+    #[inline(always)]
+    fn op_get_prop(&mut self, code: &Code, f: &mut Frame, dst: Reg, obj: Reg, name: u32, ic: u32) -> R<()> {
+        if ic != NO_IC {
+            if let Value::Obj(o) = &f.regs[obj as usize] {
+                match ic_get(o, &code.ics[ic as usize]) {
+                    IcHit::Value(v) => {
+                        f.regs[dst as usize] = v;
+                        return Ok(());
+                    }
+                    IcHit::Getter(g) => {
+                        let o = f.regs[obj as usize].clone();
+                        f.regs[dst as usize] = self.call(&g, o, &[])?;
+                        return Ok(());
+                    }
+                    IcHit::Miss => {}
+                }
+            }
+        }
+        let o = f.regs[obj as usize].clone();
+        let key = &code.names[name as usize];
+        f.regs[dst as usize] = self.get(&o, key)?;
+        if ic != NO_IC {
+            if let Value::Obj(o) = &o {
+                ic_fill_get(o, key, &code.ics[ic as usize]);
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn op_set_prop(&mut self, code: &Code, f: &mut Frame, obj: Reg, name: u32, src: Reg, ic: u32) -> R<()> {
+        if ic != NO_IC {
+            if let Value::Obj(o) = &f.regs[obj as usize] {
+                if ic_set(o, &code.ics[ic as usize], &f.regs[src as usize]) {
+                    return Ok(());
+                }
+            }
+        }
+        let o = f.regs[obj as usize].clone();
+        let v = f.regs[src as usize].clone();
+        let key = &code.names[name as usize];
+        let before = match &o {
+            Value::Obj(ob) if ic != NO_IC => Some(ob.borrow().props.shape_id()),
+            _ => None,
+        };
+        self.put(&o, key, v)?;
+        if let (Some(before), Value::Obj(ob)) = (before, &o) {
+            ic_fill_set(ob, key, before, &code.ics[ic as usize]);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn op_get_index(&mut self, f: &mut Frame, dst: Reg, obj: Reg, key: Reg) -> R<()> {
+        // Arrays by number, in place.
+        let hit = match (&f.regs[obj as usize], &f.regs[key as usize]) {
+            (Value::Obj(o), Value::Num(n)) => match &o.borrow().kind {
+                Kind::Array(a) if (*n as usize) as f64 == *n => a.get(*n as usize).filter(|v| !matches!(v, Value::Hole)).cloned(),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(v) = hit {
+            f.regs[dst as usize] = v;
+            return Ok(());
+        }
+        let o = f.regs[obj as usize].clone();
+        let k = f.regs[key as usize].clone();
+        f.regs[dst as usize] = self.get_v(&o, &k)?;
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn op_set_index(&mut self, f: &mut Frame, obj: Reg, key: Reg, src: Reg) -> R<()> {
+        if let (Value::Obj(o), Value::Num(n)) = (&f.regs[obj as usize], &f.regs[key as usize]) {
+            if let Kind::Array(a) = &mut o.borrow_mut().kind {
+                let i = *n as usize;
+                if i as f64 == *n && i < a.len() {
+                    a[i] = f.regs[src as usize].clone();
+                    return Ok(());
+                }
+            }
+        }
+        let o = f.regs[obj as usize].clone();
+        let k = f.regs[key as usize].clone();
+        let v = f.regs[src as usize].clone();
+        self.put_v(&o, &k, v)
+    }
+
+    #[inline(always)]
+    fn op_call(&mut self, f: &mut Frame, dst: Reg, fr: Reg, this: Reg, args: Reg, argc: u16) -> R<()> {
+        // Compiled closure → compiled closure, skipping the generic call path.
+        if let Some((callee, env, home, fo)) = vm_callee(&f.regs[fr as usize]) {
+            if self.depth < if self.co_stack.is_empty() { MAX_DEPTH } else { coro::MAX_DEPTH } && !prof::on() && !trace_on() && !trace_throw_on() {
+                self.tick()?;
+                self.depth += 1;
+                let th = f.regs[this as usize].clone();
+                let r = self.vm_call(&callee, env, th, &f.regs[args as usize..args as usize + argc as usize], Some(fo), home);
+                self.depth -= 1;
+                f.regs[dst as usize] = r?;
+                return Ok(());
+            }
+        }
+        let func = f.regs[fr as usize].clone();
+        if !Self::is_callable(&func) {
+            return Err(type_error(format!("{} is not a function", Self::vm_describe(&func))));
+        }
+        let th = f.regs[this as usize].clone();
+        let v = self.call(&func, th, &f.regs[args as usize..args as usize + argc as usize])?;
+        f.regs[dst as usize] = v;
+        Ok(())
+    }
+}
+
+/// Machine-code helpers for single ops: the next op index, or EXIT_ERR.
+macro_rules! jit_helper {
+    ($name:ident, |$it:ident, $code:ident, $f:ident, $op:ident| $body:expr) => {
+        pub(crate) unsafe extern "win64" fn $name(ctx: *mut super::jit::Ctx, ip: u64) -> u64 {
+            // SAFETY: ctx is the live context jit_run set up.
+            let ctx = unsafe { &mut *ctx };
+            let $it = unsafe { &mut *ctx.interp };
+            let $f = unsafe { &mut *(ctx.frame as *mut Frame) };
+            let $code = unsafe { &*ctx.code };
+            let $op = $code.ops[ip as usize];
+            let r: R<()> = $body;
+            match r {
+                Ok(()) => ip + 1,
+                Err(e) => {
+                    ctx.out = Some(e);
+                    super::jit::EXIT_ERR
+                }
+            }
+        }
+    };
+}
+
+jit_helper!(jit_get_prop, |it, code, f, op| match op {
+    Op::GetProp { dst, obj, name, ic } => it.op_get_prop(code, f, dst, obj, name, ic),
+    _ => unreachable!(),
+});
+jit_helper!(jit_set_prop, |it, code, f, op| match op {
+    Op::SetProp { obj, name, src, ic } => it.op_set_prop(code, f, obj, name, src, ic),
+    _ => unreachable!(),
+});
+jit_helper!(jit_get_index, |it, code, f, op| match op {
+    Op::GetIndex { dst, obj, key } => it.op_get_index(f, dst, obj, key),
+    _ => unreachable!(),
+});
+jit_helper!(jit_set_index, |it, code, f, op| match op {
+    Op::SetIndex { obj, key, src } => it.op_set_index(f, obj, key, src),
+    _ => unreachable!(),
+});
+jit_helper!(jit_call, |it, code, f, op| match op {
+    Op::Call { dst, f: fr, this, args, argc } => it.op_call(f, dst, fr, this, args, argc),
+    _ => unreachable!(),
+});
+jit_helper!(jit_move, |it, code, f, op| {
+    let _ = it;
+    match op {
+        Op::Move { dst, src } => {
+            f.regs[dst as usize] = f.regs[src as usize].clone();
+            Ok(())
+        }
+        Op::Const { dst, k } => {
+            f.regs[dst as usize] = code.consts[k as usize].clone();
+            Ok(())
+        }
+        _ => unreachable!(),
+    }
+});
+
+/// `%` for machine code (integer fast path).
+pub(crate) extern "win64" fn jit_mod(x: f64, y: f64) -> f64 {
+    js_mod(x, y)
+}
+
+/// The helper machine code calls for an op (None: the generic `jit_step`).
+pub(crate) fn jit_helper_for(op: &Op) -> usize {
+    match op {
+        Op::GetProp { .. } => jit_get_prop as *const () as usize,
+        Op::SetProp { .. } => jit_set_prop as *const () as usize,
+        Op::GetIndex { .. } => jit_get_index as *const () as usize,
+        Op::SetIndex { .. } => jit_set_index as *const () as usize,
+        Op::Call { .. } => jit_call as *const () as usize,
+        Op::Move { .. } | Op::Const { .. } => jit_move as *const () as usize,
+        _ => jit_step as *const () as usize,
+    }
+}
+
+/// `*dst = (*src).clone()` for machine code (reference counts and drops).
+pub(crate) unsafe extern "win64" fn jit_assign(dst: *mut Value, src: *const Value) {
+    // SAFETY: both point at live Values (registers / property slots).
+    unsafe {
+        let v = (*src).clone();
+        *dst = v;
+    }
 }

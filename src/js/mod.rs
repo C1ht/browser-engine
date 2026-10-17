@@ -21,6 +21,7 @@ pub mod regex;
 pub mod web;
 pub mod vm;
 pub mod shape;
+pub mod jit;
 
 use crate::dom::{Document, NodeId};
 use crate::fx::FxHashMap;
@@ -44,7 +45,7 @@ pub enum Value {
     Bool(bool),
     Num(f64),
     /// BigInt (64-bit-and-then-some: values beyond i128 throw RangeError).
-    BigInt(i128),
+    BigInt(Big),
     Str(Rc<str>),
     Obj(ObjRef),
 }
@@ -83,7 +84,7 @@ impl Value {
             Value::Undef | Value::Null | Value::Hole => false,
             Value::Bool(b) => *b,
             Value::Num(n) => *n != 0.0 && !n.is_nan(),
-            Value::BigInt(n) => *n != 0,
+            Value::BigInt(n) => n.get() != 0,
             Value::Str(s) => !s.is_empty(),
             Value::Obj(_) => true,
         }
@@ -129,6 +130,45 @@ impl Prop {
 }
 
 pub use shape::Props;
+use shape::ShapeClass;
+
+/// The shape tree for objects of a kind (see `shape.rs`).
+pub fn shape_class(k: &Kind) -> ShapeClass {
+    match k {
+        Kind::Plain | Kind::Func(_) | Kind::Error | Kind::Date(_) | Kind::Regex(_) | Kind::Map(_) | Kind::Set(_) | Kind::Promise(_) => ShapeClass::Ordinary,
+        Kind::Array(_) => ShapeClass::Array,
+        _ => ShapeClass::Special,
+    }
+}
+
+/// A BigInt's value: an i128 stored with 8-byte alignment, so a `Value`
+/// stays 24 bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Big([u64; 2]);
+
+impl Big {
+    #[inline]
+    pub fn new(v: i128) -> Big {
+        Big([v as u64, (v >> 64) as u64])
+    }
+    #[inline]
+    pub fn get(self) -> i128 {
+        ((self.0[1] as i128) << 64) | self.0[0] as i128
+    }
+}
+
+impl std::fmt::Display for Big {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.get())
+    }
+}
+
+impl Value {
+    #[inline]
+    pub fn big(v: i128) -> Value {
+        Value::BigInt(Big::new(v))
+    }
+}
 
 pub enum PromiseState {
     Pending(Vec<(Value, Value, ObjRef)>),
@@ -589,7 +629,7 @@ impl Interp {
     // ------------------------------------------------------------- objects
 
     pub fn new_obj(&self, proto: Option<ObjRef>, kind: Kind) -> ObjRef {
-        Rc::new(RefCell::new(Obj { props: Props::default(), proto, kind }))
+        Rc::new(RefCell::new(Obj { props: Props::new(shape_class(&kind)), proto, kind }))
     }
 
     pub fn plain(&self) -> ObjRef {
@@ -680,7 +720,7 @@ impl Interp {
             Value::Num(n) => *n,
             // (A TypeError for implicit conversion per spec; Number(b) is
             // handled by the Number constructor.)
-            Value::BigInt(n) => *n as f64,
+            Value::BigInt(n) => n.get() as f64,
             Value::Str(s) => str_to_num(s),
             Value::Obj(_) => {
                 let p = self.to_primitive(v, false)?;
@@ -1350,6 +1390,9 @@ impl Interp {
                             d.props.insert(k, p);
                         }
                         d.kind = kind;
+                        let class = shape_class(&d.kind);
+                        let old = std::mem::take(&mut d.props);
+                        d.props = old.reclass(class);
                     }
                     if let Some(n) = node {
                         // `this` is now the element's wrapper.
@@ -2064,7 +2107,7 @@ impl Interp {
     pub fn eval(&mut self, e: &Expr, env: &Env) -> R<Value> {
         Ok(match e {
             Expr::Num(n) => Value::Num(*n),
-            Expr::BigInt(n) => Value::BigInt(*n),
+            Expr::BigInt(n) => Value::big(*n),
             Expr::Str(s) => Value::Str(s.clone()),
             Expr::Bool(b) => Value::Bool(*b),
             Expr::Null => Value::Null,
@@ -2189,9 +2232,10 @@ impl Interp {
                 }
                 let v = self.eval(x, env)?;
                 if let Value::BigInt(b) = v {
+                    let b = b.get();
                     return match *op {
-                        "-" => Ok(Value::BigInt(b.checked_neg().ok_or_else(bigint::too_big)?)),
-                        "~" => Ok(Value::BigInt(!b)),
+                        "-" => Ok(Value::big(b.checked_neg().ok_or_else(bigint::too_big)?)),
+                        "~" => Ok(Value::big(!b)),
                         "+" => Err(type_error("Cannot convert a BigInt value to a number")),
                         "!" => Ok(Value::Bool(b == 0)),
                         _ => Ok(Value::Undef),
@@ -2209,10 +2253,11 @@ impl Interp {
             Expr::Update { op, prefix, target } => {
                 let old = self.eval(target, env)?;
                 if let Value::BigInt(b) = old {
+                    let b = b.get();
                     let new = if *op == "++" { b.checked_add(1) } else { b.checked_sub(1) }.ok_or_else(bigint::too_big)?;
                     let p = expr_target(target)?;
-                    self.bind_ref(&p, Value::BigInt(new), env)?;
-                    return Ok(Value::BigInt(if *prefix { new } else { b }));
+                    self.bind_ref(&p, Value::big(new), env)?;
+                    return Ok(Value::big(if *prefix { new } else { b }));
                 }
                 let n = self.to_num(&old)?;
                 let new = if *op == "++" { n + 1.0 } else { n - 1.0 };
@@ -2577,7 +2622,7 @@ impl Interp {
             }
             (Value::Str(x), Value::Str(y)) => x == y,
             (Value::BigInt(x), Value::BigInt(y)) => x == y,
-            (Value::BigInt(x), Value::Str(s)) | (Value::Str(s), Value::BigInt(x)) => bigint::parse_str(s) == Some(*x),
+            (Value::BigInt(x), Value::Str(s)) | (Value::Str(s), Value::BigInt(x)) => bigint::parse_str(s) == Some(x.get()),
             _ => self.to_num(a)? == self.to_num(b)?,
         })
     }

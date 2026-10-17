@@ -20,7 +20,20 @@ const LINEAR_KEYS: usize = 8;
 
 thread_local! {
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    /// Ordinary objects, arrays, and everything else (DOM wrappers,
+    /// proxies, ...) start from different roots, so equal shape ids imply
+    /// the same kind class: inline caches needn't check the object kind.
     static ROOT: Rc<Shape> = Rc::new(Shape::new(Vec::new(), true));
+    static ARRAY_ROOT: Rc<Shape> = Rc::new(Shape::new(Vec::new(), true));
+    static SPECIAL_ROOT: Rc<Shape> = Rc::new(Shape::new(Vec::new(), true));
+}
+
+/// Which shape tree an object's properties belong to.
+#[derive(Clone, Copy, PartialEq)]
+pub enum ShapeClass {
+    Ordinary,
+    Array,
+    Special,
 }
 
 fn next_id() -> u64 {
@@ -31,6 +44,7 @@ fn next_id() -> u64 {
     })
 }
 
+#[repr(C)]
 pub struct Shape {
     /// Unique per shape (and per version of a dictionary shape): the key
     /// inline caches compare.
@@ -64,10 +78,6 @@ impl Shape {
 
     pub fn is_shared(&self) -> bool {
         self.shared
-    }
-
-    pub fn keys(&self) -> &[Rc<str>] {
-        &self.keys
     }
 
     /// The shared shape with `k` added.
@@ -107,6 +117,29 @@ impl Clone for Props {
 }
 
 impl Props {
+    pub fn new(class: ShapeClass) -> Props {
+        let shape = match class {
+            ShapeClass::Ordinary => ROOT.with(|r| r.clone()),
+            ShapeClass::Array => ARRAY_ROOT.with(|r| r.clone()),
+            ShapeClass::Special => SPECIAL_ROOT.with(|r| r.clone()),
+        };
+        Props { shape, vals: Vec::new() }
+    }
+
+    /// The same entries in another shape tree (an object changing kind).
+    pub fn reclass(self, class: ShapeClass) -> Props {
+        let mut p = Props::new(class);
+        for (k, v) in self.into_entries() {
+            p.insert(k, v);
+        }
+        p
+    }
+
+    /// Field offsets for machine code: (shape, values vector).
+    pub fn offsets() -> (usize, usize) {
+        (std::mem::offset_of!(Props, shape), std::mem::offset_of!(Props, vals))
+    }
+
     #[inline]
     pub fn shape_id(&self) -> u64 {
         self.shape.id
@@ -144,10 +177,6 @@ impl Props {
 
     pub fn len(&self) -> usize {
         self.vals.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.vals.is_empty()
     }
 
     /// Entries in insertion order.

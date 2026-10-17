@@ -1685,7 +1685,7 @@ fn this_num(it: &mut Interp, t: &Value) -> R<f64> {
 fn number_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let n = match a.first() {
         None => 0.0,
-        Some(Value::BigInt(b)) => *b as f64,
+        Some(Value::BigInt(b)) => b.get() as f64,
         Some(v) => it.to_num(v)?,
     };
     if it.constructing {

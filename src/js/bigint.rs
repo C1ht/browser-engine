@@ -46,7 +46,7 @@ pub fn parse_str(s: &str) -> Option<i128> {
 
 fn to_bigint(it: &mut Interp, v: &Value) -> R<i128> {
     match v {
-        Value::BigInt(n) => Ok(*n),
+        Value::BigInt(n) => Ok(n.get()),
         Value::Bool(b) => Ok(*b as i128),
         Value::Str(s) => parse_str(s).ok_or_else(|| super::syntax_error(&format!("Cannot convert {s} to a BigInt"))),
         Value::Num(n) => {
@@ -75,7 +75,7 @@ pub fn binary(it: &mut Interp, op: &str, a: &Value, b: &Value) -> R<Option<Value
             return Ok(None);
         }
         return match (&pa, &pb) {
-            (Value::BigInt(x), Value::BigInt(y)) => Ok(Some(Value::BigInt(x.checked_add(*y).ok_or_else(too_big)?))),
+            (Value::BigInt(x), Value::BigInt(y)) => Ok(Some(Value::big(x.get().checked_add(y.get()).ok_or_else(too_big)?))),
             _ => Err(type_error(format!("Cannot mix BigInt and other types, use explicit conversions ({pa:?} {op} {pb:?})"))),
         };
     }
@@ -83,16 +83,16 @@ pub fn binary(it: &mut Interp, op: &str, a: &Value, b: &Value) -> R<Option<Value
         let pa = it.to_primitive(a, false)?;
         let pb = it.to_primitive(b, false)?;
         let ord = match (&pa, &pb) {
-            (Value::BigInt(x), Value::BigInt(y)) => Some(x.cmp(y)),
-            (Value::BigInt(x), Value::Str(s)) => parse_str(s).map(|y| x.cmp(&y)),
-            (Value::Str(s), Value::BigInt(y)) => parse_str(s).map(|x| x.cmp(y)),
+            (Value::BigInt(x), Value::BigInt(y)) => Some(x.get().cmp(&y.get())),
+            (Value::BigInt(x), Value::Str(s)) => parse_str(s).map(|y| x.get().cmp(&y)),
+            (Value::Str(s), Value::BigInt(y)) => parse_str(s).map(|x| x.cmp(&y.get())),
             (Value::BigInt(x), o) => {
                 let y = it.to_num(o)?;
-                (*x as f64).partial_cmp(&y)
+                (x.get() as f64).partial_cmp(&y)
             }
             (o, Value::BigInt(y)) => {
                 let x = it.to_num(o)?;
-                x.partial_cmp(&(*y as f64))
+                x.partial_cmp(&(y.get() as f64))
             }
             _ => return Ok(None),
         };
@@ -114,6 +114,7 @@ pub fn binary(it: &mut Interp, op: &str, a: &Value, b: &Value) -> R<Option<Value
     let (Value::BigInt(x), Value::BigInt(y)) = (pa, pb) else {
         return Err(type_error("Cannot mix BigInt and other types, use explicit conversions"));
     };
+    let (x, y) = (x.get(), y.get());
     let r = match op {
         "-" => x.checked_sub(y),
         "*" => x.checked_mul(y),
@@ -149,7 +150,7 @@ pub fn binary(it: &mut Interp, op: &str, a: &Value, b: &Value) -> R<Option<Value
         ">>>" => return Err(type_error("BigInts have no unsigned right shift, use >> instead")),
         _ => return Ok(None),
     };
-    Ok(Some(Value::BigInt(r.ok_or_else(too_big)?)))
+    Ok(Some(Value::big(r.ok_or_else(too_big)?)))
 }
 
 fn as_uint_n(bits: u32, x: i128) -> R<i128> {
@@ -174,7 +175,7 @@ fn as_int_n(bits: u32, x: i128) -> i128 {
 }
 
 fn bigint_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
-    Ok(Value::BigInt(to_bigint(it, &arg(a, 0))?))
+    Ok(Value::big(to_bigint(it, &arg(a, 0))?))
 }
 
 fn bits_arg(it: &mut Interp, v: &Value) -> R<u32> {
@@ -188,18 +189,18 @@ fn bits_arg(it: &mut Interp, v: &Value) -> R<u32> {
 fn b_as_uint_n(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let bits = bits_arg(it, &arg(a, 0))?;
     let x = to_bigint(it, &arg(a, 1))?;
-    Ok(Value::BigInt(as_uint_n(bits, x)?))
+    Ok(Value::big(as_uint_n(bits, x)?))
 }
 
 fn b_as_int_n(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let bits = bits_arg(it, &arg(a, 0))?;
     let x = to_bigint(it, &arg(a, 1))?;
-    Ok(Value::BigInt(as_int_n(bits, x)))
+    Ok(Value::big(as_int_n(bits, x)))
 }
 
 fn this_bigint(t: &Value) -> R<i128> {
     match t {
-        Value::BigInt(n) => Ok(*n),
+        Value::BigInt(n) => Ok(n.get()),
         _ => Err(type_error("BigInt.prototype method called on incompatible receiver")),
     }
 }
@@ -232,7 +233,7 @@ fn b_to_string(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 }
 
 fn b_value_of(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
-    Ok(Value::BigInt(this_bigint(&t)?))
+    Ok(Value::big(this_bigint(&t)?))
 }
 
 pub fn install(it: &mut Interp) {
