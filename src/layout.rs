@@ -204,17 +204,23 @@ impl LayoutTree {
     /// none`, `visibility: hidden` and content clipped away don't hit.
     pub fn node_at(&self, x: f32, y: f32) -> Option<NodeId> {
         let mut st = HitState { x, y, best: None, order: 0 };
-        self.hit_walk(self.root, 0.0, 0.0, (0, false), &mut st);
+        self.hit_walk(self.root, 0.0, 0.0, (0, false, 0), &mut st);
         st.best.map(|(_, n)| self.pseudo_owner.get(&n).copied().unwrap_or(n))
     }
 
-    fn hit_walk(&self, id: u32, ox: f32, oy: f32, rank: (i32, bool), st: &mut HitState) {
+    fn hit_walk(&self, id: u32, ox: f32, oy: f32, rank: (i32, bool, u32), st: &mut HitState) {
         let b = &self.boxes[id as usize];
         let (bx, by) = (ox + b.x + b.rel.0, oy + b.y + b.rel.1);
-        // The outermost z-index decides; positioned boxes paint above flow.
-        let rank = match b.z {
-            Some(z) if rank == (0, false) => (z, true),
-            _ => (rank.0, rank.1 || b.positioned),
+        // The outermost z-index decides; positioned boxes paint above flow,
+        // in tree order (box indices follow the document) among themselves.
+        let rank = if b.positioned || b.z.is_some() {
+            let z = match b.z {
+                Some(z) if rank.0 == 0 && !rank.1 => z,
+                _ => rank.0,
+            };
+            (z, true, id)
+        } else {
+            rank
         };
         let (bw, bh) = (b.border_w(), b.border_h());
         let inside = st.x >= bx && st.x < bx + bw && st.y >= by && st.y < by + bh;
@@ -224,7 +230,7 @@ impl LayoutTree {
         let hit = |st: &mut HitState, n: NodeId, text: bool| {
             st.order += 1;
             // Text paints over its own container's background.
-            let key = (rank.0, rank.1, st.order * 2 + text as u64);
+            let key = (rank.0, rank.1, rank.2, st.order * 2 + text as u64);
             if st.best.as_ref().is_none_or(|(k, _)| key >= *k) {
                 st.best = Some((key, n));
             }
@@ -269,7 +275,7 @@ impl LayoutTree {
 struct HitState {
     x: f32,
     y: f32,
-    best: Option<((i32, bool, u64), NodeId)>,
+    best: Option<((i32, bool, u32, u64), NodeId)>,
     order: u64,
 }
 
@@ -2218,6 +2224,9 @@ impl<'a> Engine<'a> {
 
         // Cross sizes.
         let mut cross: Vec<f32> = vec![0.0; fis.len()];
+        // Stretched items whose absolutely positioned children need placing
+        // against the final height.
+        let mut stretched: Vec<u32> = Vec::new();
         for (i, f) in fis.iter().enumerate() {
             let c = f.id;
             if row {
@@ -2226,11 +2235,18 @@ impl<'a> Engine<'a> {
                 cross[i] = b.border_h() + b.m[0] + b.m[2];
             } else {
                 let b = &mut self.boxes[c as usize];
+                let mut resized = false;
                 if main_size.is_some() {
                     let pbv = b.p[0] + b.p[2] + b.b[0] + b.b[2];
-                    b.h = (f.size - pbv).max(0.0);
+                    let h = (f.size - pbv).max(0.0);
+                    resized = h != b.h;
+                    b.h = h;
                 }
                 cross[i] = b.border_w() + b.m[1] + b.m[3];
+                // Absolutely positioned descendants against the final height.
+                if resized && !self.boxes[c as usize].abs_kids.is_empty() {
+                    self.layout_abs(c);
+                }
             }
         }
         let mut line_cross: Vec<f32> = lines.iter().map(|&(s, e)| cross[s..e].iter().copied().fold(0.0, f32::max)).collect();
@@ -2299,7 +2315,11 @@ impl<'a> Engine<'a> {
                 let mut outer_cross = cross[s + k];
                 if al == Al::Stretch && cross_auto && row {
                     let pbv = b.p[0] + b.p[2] + b.b[0] + b.b[2];
-                    b.h = b.h.max(lc - b.m[0] - b.m[2] - pbv);
+                    let h = b.h.max(lc - b.m[0] - b.m[2] - pbv);
+                    if h != b.h && !b.abs_kids.is_empty() {
+                        stretched.push(c);
+                    }
+                    b.h = h;
                     outer_cross = lc;
                 }
                 let coff = match al {
@@ -2329,6 +2349,9 @@ impl<'a> Engine<'a> {
             cross_pos += lc + gap_cross;
         }
         self.boxes[id as usize].baseline = baseline;
+        for c in stretched {
+            self.layout_abs(c);
+        }
         if row {
             (cross_pos - gap_cross).max(0.0)
         } else {

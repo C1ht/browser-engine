@@ -74,6 +74,10 @@ pub enum DItem {
     Gradient(Box<GradData>),
     Clip { x: f32, y: f32, w: f32, h: f32 },
     Unclip,
+    /// Items between these are `position: fixed` content: viewport
+    /// coordinates, not scrolled, own clip (painted in stacking order).
+    FixedOn,
+    FixedOff,
     /// A transformed element: its items are rasterized offscreen, then
     /// drawn through the matrix.
     Layer(Box<LayerData>),
@@ -147,8 +151,6 @@ pub struct LinkArea {
 
 pub struct DisplayList {
     pub items: Vec<DItem>,
-    /// position: fixed content, in viewport coordinates.
-    pub fixed: Vec<DItem>,
     pub links: Vec<LinkArea>,
     pub fixed_links: Vec<LinkArea>,
     pub extra: String,
@@ -204,7 +206,6 @@ pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style], res: &Resource
         f: fonts(),
         dl: DisplayList {
             items: Vec::with_capacity(tree.boxes.len() * 2),
-            fixed: Vec::new(),
             links: Vec::new(),
             fixed_links: Vec::new(),
             extra: String::new(),
@@ -235,11 +236,7 @@ fn radii(st: &Style, w: f32, h: f32) -> [f32; 4] {
 
 impl Builder<'_> {
     fn push(&mut self, it: DItem) {
-        if self.in_fixed {
-            self.dl.fixed.push(it);
-        } else {
-            self.dl.items.push(it);
-        }
+        self.dl.items.push(it);
     }
 
     fn fade(&self, c: u32) -> u32 {
@@ -401,12 +398,12 @@ impl Builder<'_> {
                 [*x - 1.0, y - size * 1.2, w + 2.0, size * 1.6]
             }
             DItem::Layer(l) => l.tbounds,
-            DItem::Clip { .. } | DItem::Unclip => return None,
+            DItem::Clip { .. } | DItem::Unclip | DItem::FixedOn | DItem::FixedOff => return None,
         })
     }
 
     fn target(&mut self) -> &mut Vec<DItem> {
-        if self.in_fixed { &mut self.dl.fixed } else { &mut self.dl.items }
+        &mut self.dl.items
     }
 
     fn paint_box(&mut self, id: u32, ox: f32, oy: f32) {
@@ -493,8 +490,12 @@ impl Builder<'_> {
     /// collected, which belong to the enclosing context.
     fn paint_deferred(&mut self, d: &Deferred) -> Vec<Deferred> {
         let saved_fixed = self.in_fixed;
+        let enter_fixed = d.fixed && !saved_fixed;
         if d.fixed {
             self.in_fixed = true;
+        }
+        if enter_fixed {
+            self.push(DItem::FixedOn);
         }
         let saved_base = self.ctx_clip_base;
         let own_ctx = self.creates_context(d.id);
@@ -513,6 +514,9 @@ impl Builder<'_> {
         for _ in &d.clips {
             self.push(DItem::Unclip);
             self.clip_stack.pop();
+        }
+        if enter_fixed {
+            self.push(DItem::FixedOff);
         }
         self.in_fixed = saved_fixed;
         if own_ctx {
@@ -1250,7 +1254,7 @@ fn extent(it: &DItem) -> Option<(f32, f32)> {
         DItem::Gradient(d) => (d.clip[1], d.clip[1] + d.clip[3]),
         DItem::Shadow(d) => (d.s[1] - d.blur * 1.5 - 1.0, d.s[1] + d.s[3] + d.blur * 1.5 + 1.0),
         DItem::Layer(l) => (l.tbounds[1], l.tbounds[1] + l.tbounds[3]),
-        DItem::Clip { .. } | DItem::Unclip => return None,
+        DItem::Clip { .. } | DItem::Unclip | DItem::FixedOn | DItem::FixedOff => return None,
     })
 }
 
@@ -1287,6 +1291,8 @@ fn draw(s: &mut Surface, it: &DItem, texts: [&str; 2], f: &Fonts, cache: &GlyphC
                 s.clip = c;
             }
         }
+        // (Handled by the top-level painter.)
+        DItem::FixedOn | DItem::FixedOff => {}
         DItem::Layer(l) => draw_layer(s, l, texts, f, cache),
     }
 }
@@ -1369,15 +1375,22 @@ fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache
 /// Paint the page region starting at page y = `scroll` into `buf` (w × h).
 pub fn paint(dl: &DisplayList, layout_text: &str, cache: &mut GlyphCache, buf: &mut [u32], w: usize, h: usize, scroll: f32) {
     let (top, bottom) = (scroll, scroll + h as f32);
+    // Cull scrolled items outside the viewport (fixed ones always show).
+    let mut in_fixed = false;
     let visible: Vec<&DItem> = dl
         .items
         .iter()
-        .filter(|it| extent(it).is_none_or(|(t, b)| t < bottom && b > top))
+        .filter(|it| {
+            match it {
+                DItem::FixedOn => in_fixed = true,
+                DItem::FixedOff => in_fixed = false,
+                _ => {}
+            }
+            in_fixed || extent(it).is_none_or(|(t, b)| t < bottom && b > top)
+        })
         .collect();
-    let fixed: Vec<&DItem> = dl.fixed.iter().collect();
     let texts = [layout_text, dl.extra.as_str()];
     prepare_glyphs(&visible, texts, cache);
-    prepare_glyphs(&fixed, texts, cache);
     let cache: &GlyphCache = cache;
     let f = fonts();
     let bg = dl.bg;
@@ -1390,15 +1403,24 @@ pub fn paint(dl: &DisplayList, layout_text: &str, cache: &mut GlyphCache, buf: &
         let rows = chunk.len() / w;
         let mut clips = Vec::new();
         let mut s = Surface::new(chunk, w, rows, 0.0, scroll + (i * band) as f32);
+        // Fixed content: viewport coordinates and its own clip.
+        let mut saved: Option<(f32, (i32, i32, i32, i32), usize)> = None;
         for it in &visible {
-            draw(&mut s, it, texts, f, cache, &mut clips);
-        }
-        // position: fixed content is drawn on top, unaffected by scrolling.
-        s.oy = (i * band) as f32;
-        s.clip = (0, 0, w as i32, rows as i32);
-        clips.clear();
-        for it in &fixed {
-            draw(&mut s, it, texts, f, cache, &mut clips);
+            match it {
+                DItem::FixedOn => {
+                    saved = Some((s.oy, s.clip, clips.len()));
+                    s.oy = (i * band) as f32;
+                    s.clip = (0, 0, w as i32, rows as i32);
+                }
+                DItem::FixedOff => {
+                    if let Some((oy, clip, n)) = saved.take() {
+                        s.oy = oy;
+                        s.clip = clip;
+                        clips.truncate(n);
+                    }
+                }
+                _ => draw(&mut s, it, texts, f, cache, &mut clips),
+            }
         }
     };
     if threads == 1 {

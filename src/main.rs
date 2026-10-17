@@ -374,6 +374,9 @@ fn screenshot(a: &Args, out: &str) {
                     None => String::new(),
                 };
                 println!("[abs box{i}] {desc} n={} x={} y={} w={} h={} fixed={}", b.node, b.x, b.y, b.w, b.h, b.fixed);
+                if std::env::var_os("BOLT_DUMP_ABS_TREES").is_some() {
+                    dump_boxes(&page, i as u32, 1);
+                }
             }
         }
     }
