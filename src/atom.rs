@@ -66,8 +66,18 @@ struct Interner {
     names: Vec<&'static str>,
 }
 
+/// One table for the whole process: documents are parsed on loader threads
+/// and used on the UI thread, so atom ids must mean the same everywhere.
+static INTERNER: std::sync::OnceLock<std::sync::RwLock<Interner>> = std::sync::OnceLock::new();
+
+fn interner() -> &'static std::sync::RwLock<Interner> {
+    INTERNER.get_or_init(|| std::sync::RwLock::new(Interner::new()))
+}
+
 thread_local! {
-    static INTERNER: RefCell<Interner> = RefCell::new(Interner::new());
+    /// This thread's copy of the (append-only) name list, for lock-free
+    /// `name()`; refreshed from the global table on a miss.
+    static NAMES: RefCell<Vec<&'static str>> = RefCell::new(STATIC.to_vec());
 }
 
 impl Interner {
@@ -83,18 +93,19 @@ impl Interner {
 
 /// Intern `s` exactly (case-sensitive; used for ids and classes).
 pub fn intern(s: &str) -> Atom {
-    INTERNER.with(|i| {
-        let mut i = i.borrow_mut();
-        if let Some(&a) = i.map.get(s) {
-            return a;
-        }
-        // Atoms live for the whole process; names are leaked deliberately.
-        let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
-        let a = Atom(i.names.len() as u32);
-        i.names.push(leaked);
-        i.map.insert(leaked, a);
-        a
-    })
+    if let Some(&a) = interner().read().unwrap_or_else(|e| e.into_inner()).map.get(s) {
+        return a;
+    }
+    let mut i = interner().write().unwrap_or_else(|e| e.into_inner());
+    if let Some(&a) = i.map.get(s) {
+        return a;
+    }
+    // Atoms live for the whole process; names are leaked deliberately.
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    let a = Atom(i.names.len() as u32);
+    i.names.push(leaked);
+    i.map.insert(leaked, a);
+    a
 }
 
 /// Intern an ASCII-case-insensitive name (tags, attributes).
@@ -108,9 +119,32 @@ pub fn intern_lower(s: &str) -> Atom {
 
 /// Look up an atom without creating it.
 pub fn lookup(s: &str) -> Option<Atom> {
-    INTERNER.with(|i| i.borrow().map.get(s).copied())
+    interner().read().unwrap_or_else(|e| e.into_inner()).map.get(s).copied()
 }
 
 pub fn name(a: Atom) -> &'static str {
-    INTERNER.with(|i| i.borrow().names[a.0 as usize])
+    NAMES.with(|n| {
+        let mut n = n.borrow_mut();
+        if let Some(s) = n.get(a.0 as usize) {
+            return *s;
+        }
+        let g = interner().read().unwrap_or_else(|e| e.into_inner());
+        let have = n.len();
+        n.extend_from_slice(&g.names[have..]);
+        n.get(a.0 as usize).copied().unwrap_or("")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atoms_are_shared_across_threads() {
+        // A document parsed on a loader thread is used on the UI thread.
+        let a = std::thread::spawn(|| intern("x-made-on-another-thread")).join().unwrap();
+        assert_eq!(name(a), "x-made-on-another-thread");
+        assert_eq!(lookup("x-made-on-another-thread"), Some(a));
+        assert_eq!(intern("x-made-on-another-thread"), a);
+    }
 }
