@@ -362,6 +362,21 @@ fn screenshot(a: &Args, out: &str) {
     for src in &a.eval {
         println!("[eval] {}", page.eval(src).unwrap_or_else(|| "(no script engine)".into()));
     }
+    if std::env::var_os("BOLT_DUMP_BOXES").is_some() {
+        if std::env::var_os("BOLT_FORCE_RELAYOUT").is_some() {
+            page.relayout(w as f32, vh);
+        }
+        dump_boxes(&page, page.tree.root, 0);
+        for (i, b) in page.tree.boxes.iter().enumerate() {
+            if b.abs || b.fixed {
+                let desc = match page.doc.elem(b.node) {
+                    Some(e) => format!("<{}{}{}>", atom::name(e.tag), e.id.map(|i| format!("#{}", atom::name(i))).unwrap_or_default(), e.classes.iter().map(|c| format!(".{}", atom::name(*c))).collect::<String>()),
+                    None => String::new(),
+                };
+                println!("[abs box{i}] {desc} n={} x={} y={} w={} h={} fixed={}", b.node, b.x, b.y, b.w, b.h, b.fixed);
+            }
+        }
+    }
     for &(x, y) in &a.probe {
         let mut n = page.tree.node_at(x, y).unwrap_or(dom::NONE);
         let rects = page.tree.node_rects();

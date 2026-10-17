@@ -91,6 +91,7 @@ pub fn install(it: &mut Interp) {
     let object = Rc::new(RefCell::new(Obj { props: Props::default(), proto: None, kind: Kind::Plain }));
     it.p.object = Some(object.clone());
     let function = it.new_obj(Some(object.clone()), Kind::Func(Func::Native(|_, _, _| Ok(Value::Undef), "")));
+    super::func_props(&function, Rc::from(""), 0);
     it.p.function = Some(function.clone());
     it.global.borrow_mut().proto = Some(object.clone());
     let mk = |it: &Interp| it.new_obj(Some(object.clone()), Kind::Plain);
@@ -116,8 +117,8 @@ pub fn install(it: &mut Interp) {
     // --- constructors
     let ctor = |it: &mut Interp, name: &'static str, f: NativeFn, proto: &ObjRef| -> ObjRef {
         let c = it.new_obj(it.p.function.clone(), Kind::Func(Func::Native(f, name)));
+        super::func_props(&c, Rc::from(name), native_arity(name));
         Interp::set_hidden(&c, "prototype", Value::Obj(proto.clone()));
-        Interp::set_hidden(&c, "name", Value::str(name));
         Interp::set_hidden(proto, "constructor", Value::Obj(c.clone()));
         Interp::set_hidden(&it.global, name, Value::Obj(c.clone()));
         c
@@ -233,7 +234,7 @@ pub fn install(it: &mut Interp) {
     for (n, v) in [("MAX_SAFE_INTEGER", 9007199254740991.0), ("MIN_SAFE_INTEGER", -9007199254740991.0), ("EPSILON", f64::EPSILON), ("MAX_VALUE", f64::MAX), ("MIN_VALUE", 5e-324), ("POSITIVE_INFINITY", f64::INFINITY), ("NEGATIVE_INFINITY", f64::NEG_INFINITY), ("NaN", f64::NAN)] {
         Interp::set_hidden(&nc, n, Value::Num(v));
     }
-    for (n, f) in [("toFixed", num_to_fixed as NativeFn), ("toString", num_to_string), ("toPrecision", num_to_precision), ("toLocaleString", num_to_locale), ("valueOf", num_value_of)] {
+    for (n, f) in [("toFixed", num_to_fixed as NativeFn), ("toString", num_to_string), ("toPrecision", num_to_precision), ("toExponential", num_to_exponential), ("toLocaleString", num_to_locale), ("valueOf", num_value_of)] {
         it.def_method(&np, n, f);
     }
     let bp = it.p.boolean.clone().unwrap();
@@ -272,6 +273,13 @@ pub fn install(it: &mut Interp) {
         ("fround", m_fround),
         ("imul", m_imul),
         ("clz32", m_clz32),
+        ("sinh", m_sinh),
+        ("cosh", m_cosh),
+        ("tanh", m_tanh),
+        ("asinh", m_asinh),
+        ("acosh", m_acosh),
+        ("atanh", m_atanh),
+        ("expm1", m_expm1),
     ] {
         it.def_method(&math, n, f);
     }
@@ -385,14 +393,27 @@ pub fn install(it: &mut Interp) {
     // Map / Set
     let mp = it.p.map.clone().unwrap();
     ctor(it, "Map", map_ctor, &mp);
-    ctor(it, "WeakMap", map_ctor, &mp);
+    // WeakMap / WeakSet: their own prototypes (no iteration or size).
+    let wmp = it.new_obj(Some(object.clone()), Kind::Plain);
+    ctor(it, "WeakMap", weak_map_ctor, &wmp);
+    for (n, f) in [("get", map_get as NativeFn), ("set", map_set), ("has", map_has), ("delete", map_delete)] {
+        it.def_method(&wmp, n, f);
+    }
+    Interp::set_hidden(&wmp, "@@toStringTag", Value::str("WeakMap"));
+    it.p.web.insert("WeakMap", wmp);
+    let wsp = it.new_obj(Some(object.clone()), Kind::Plain);
+    ctor(it, "WeakSet", weak_set_ctor, &wsp);
+    for (n, f) in [("add", set_add as NativeFn), ("has", set_has), ("delete", set_delete)] {
+        it.def_method(&wsp, n, f);
+    }
+    Interp::set_hidden(&wsp, "@@toStringTag", Value::str("WeakSet"));
+    it.p.web.insert("WeakSet", wsp);
     for (n, f) in [("get", map_get as NativeFn), ("set", map_set), ("has", map_has), ("delete", map_delete), ("clear", coll_clear), ("forEach", map_for_each), ("keys", map_keys), ("values", map_values), ("entries", map_entries), ("@@iterator", map_entries)] {
         it.def_method(&mp, n, f);
     }
     it.def_getter(&mp, "size", coll_size);
     let stp = it.p.set.clone().unwrap();
     ctor(it, "Set", set_ctor, &stp);
-    ctor(it, "WeakSet", set_ctor, &stp);
     for (n, f) in [("add", set_add as NativeFn), ("has", set_has), ("delete", set_delete), ("clear", coll_clear), ("forEach", set_for_each), ("values", set_values), ("keys", set_values), ("entries", set_entries), ("@@iterator", set_values)] {
         it.def_method(&stp, n, f);
     }
@@ -417,13 +438,23 @@ pub fn install(it: &mut Interp) {
 
     // Symbol
     let sym = it.native(symbol_fn, "Symbol");
+    let sp = it.new_obj(Some(object.clone()), Kind::Plain);
     if let Value::Obj(s) = &sym {
-        Interp::set_hidden(s, "iterator", Value::str("@@iterator"));
-        Interp::set_hidden(s, "asyncIterator", Value::str("@@asyncIterator"));
-        Interp::set_hidden(s, "toStringTag", Value::str("@@toStringTag"));
-        Interp::set_hidden(s, "hasInstance", Value::str("@@hasInstance"));
+        for w in super::WELL_KNOWN_SYMBOLS {
+            Interp::set_hidden(s, &w[2..], Value::str(w));
+        }
         it.def_method(s, "for", symbol_for);
+        it.def_method(s, "keyFor", symbol_key_for);
+        Interp::set_hidden(s, "prototype", Value::Obj(sp.clone()));
     }
+    Interp::set_hidden(&sp, "constructor", sym.clone());
+    for (n, f) in [("toString", symbol_to_string as NativeFn), ("valueOf", symbol_value_of), ("@@toPrimitive", symbol_value_of)] {
+        it.def_method(&sp, n, f);
+    }
+    let desc = it.native(symbol_description_get, "description");
+    sp.borrow_mut().props.insert("description".into(), Prop { v: Value::Undef, get: Some(desc), set: None, enumerable: false });
+    Interp::set_hidden(&sp, "@@toStringTag", Value::str("Symbol"));
+    it.p.symbol = Some(sp);
     Interp::set_hidden(&g, "Symbol", sym);
 
     // Globals
@@ -487,9 +518,11 @@ fn object_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
 impl Interp {
     fn proto_for(&self, v: &Value) -> Option<ObjRef> {
         match v {
+            Value::Str(s) if super::is_symbol_str(s) => self.p.symbol.clone(),
             Value::Str(_) => self.p.string.clone(),
             Value::Num(_) => self.p.number.clone(),
             Value::Bool(_) => self.p.boolean.clone(),
+            Value::BigInt(_) => self.p.bigint.clone(),
             _ => self.p.object.clone(),
         }
     }
@@ -557,33 +590,65 @@ fn obj_set_proto(_: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
 fn obj_define_property(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let (o, k, d) = (arg(a, 0), arg(a, 1), arg(a, 2));
     let key = it.key(&k)?;
-    let get = it.get(&d, "get")?;
-    let set = it.get(&d, "set")?;
-    let enumerable = it.get(&d, "enumerable")?.truthy();
+    if !matches!(d, Value::Obj(_)) {
+        return Err(type_error("Property description must be an object"));
+    }
+    // Only the fields the descriptor has change (a partial descriptor such
+    // as { writable: false } keeps the value).
+    let has = |it: &mut Interp, f: &str| it.has_prop(&d, f);
+    let (has_value, has_get, has_set, has_enum) = (has(it, "value"), has(it, "get"), has(it, "set"), has(it, "enumerable"));
+    let get = if has_get { it.get(&d, "get")? } else { Value::Undef };
+    let set = if has_set { it.get(&d, "set")? } else { Value::Undef };
+    let value = if has_value { Some(it.get(&d, "value")?) } else { None };
+    let enumerable = if has_enum { Some(it.get(&d, "enumerable")?.truthy()) } else { None };
     if let Value::Obj(ob) = &o {
-        // (Check callability before borrowing: the accessor may be `o` itself.)
-        let (has_get, has_set) = (Interp::is_callable(&get), Interp::is_callable(&set));
-        if has_get || has_set {
-            let mut b = ob.borrow_mut();
-            let prev = b.props.get(&key).cloned();
-            let mut p = prev.unwrap_or(Prop { v: Value::Undef, get: None, set: None, enumerable });
+        // A function's lazily created prototype exists before it's redefined.
+        if &*key == "prototype" && ob.borrow().props.get("prototype").is_none() {
+            it.get(&o, "prototype")?;
+        }
+        if matches!(ob.borrow().kind, Kind::Array(_)) && (array_index(&key).is_some() || &*key == "length") && !has_get && !has_set {
+            if let Some(v) = value {
+                it.put(&o, &key, v)?;
+            }
+            return Ok(o);
+        }
+        let accessor = has_get || has_set;
+        // (Callability is checked before borrowing: the accessor may be the
+        // object itself.)
+        let (get_ok, set_ok) = (Interp::is_callable(&get), Interp::is_callable(&set));
+        let mut b = ob.borrow_mut();
+        let prev = b.props.get(&key).cloned();
+        let mut p = prev.clone().unwrap_or(Prop { v: Value::Undef, get: None, set: None, enumerable: false });
+        if accessor {
+            let was_data = prev.as_ref().is_some_and(|p| p.get.is_none() && p.set.is_none());
+            if was_data {
+                p.v = Value::Undef;
+            }
             if has_get {
-                p.get = Some(get);
+                p.get = get_ok.then_some(get);
             }
             if has_set {
-                p.set = Some(set);
+                p.set = set_ok.then_some(set);
             }
-            b.props.insert(key, p);
-        } else {
-            let v = it.get(&d, "value")?;
-            if matches!(ob.borrow().kind, Kind::Array(_)) {
-                it.put(&o, &key, v)?;
-            } else {
-                ob.borrow_mut().props.insert(key, Prop { v, get: None, set: None, enumerable });
-            }
+        } else if let Some(v) = value {
+            p.v = v;
+            p.get = None;
+            p.set = None;
+        } else if it_is_data_descriptor(&d) {
+            p.get = None;
+            p.set = None;
         }
+        if let Some(e) = enumerable {
+            p.enumerable = e;
+        }
+        b.props.insert(key, p);
     }
     Ok(o)
+}
+
+/// Does a descriptor have `writable` (a data descriptor without a value)?
+fn it_is_data_descriptor(d: &Value) -> bool {
+    matches!(d, Value::Obj(o) if o.borrow().props.get("writable").is_some())
 }
 fn obj_define_properties(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let (o, ps) = (arg(a, 0), arg(a, 1));
@@ -596,6 +661,9 @@ fn obj_define_properties(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
 fn obj_get_own_desc(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let (o, k) = (arg(a, 0), arg(a, 1));
     let key = it.key(&k)?;
+    if &*key == "prototype" {
+        it.materialize_prototype(&o);
+    }
     let Value::Obj(ob) = &o else { return Ok(Value::Undef) };
     let p = ob.borrow().props.get(&key).cloned();
     let Some(p) = p else {
@@ -611,7 +679,13 @@ fn obj_get_own_desc(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
         if it.has_prop(&o, &key) {
             let v = it.get(&o, &key)?;
             let d = it.plain();
+            // Array length: writable, not enumerable / configurable;
+            // elements and other virtual properties: all true.
+            let length = &*key == "length" && matches!(ob.borrow().kind, Kind::Array(_) | Kind::Typed(_));
             Interp::set_prop(&d, "value", v);
+            Interp::set_prop(&d, "writable", Value::Bool(true));
+            Interp::set_prop(&d, "enumerable", Value::Bool(!length));
+            Interp::set_prop(&d, "configurable", Value::Bool(!length));
             return Ok(Value::Obj(d));
         }
         return Ok(Value::Undef);
@@ -654,6 +728,9 @@ fn obj_is(_: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
 }
 fn obj_has_own(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let k = it.key(&arg(a, 0))?;
+    if &*k == "prototype" {
+        it.materialize_prototype(&t);
+    }
     Ok(Value::Bool(match &t {
         Value::Obj(o) => {
             let b = o.borrow();
@@ -731,7 +808,15 @@ fn fn_apply(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     it.call(&t, arg(a, 0), &args)
 }
 fn fn_bind(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
-    Ok(Value::Obj(it.new_obj(it.p.function.clone(), Kind::Func(Func::Bound(t, arg(a, 0), a.get(1..).unwrap_or(&[]).to_vec())))))
+    let tname = it.get(&t, "name").ok().and_then(|v| if let Value::Str(s) = v { Some(s) } else { None }).unwrap_or_else(|| Rc::from(""));
+    let tlen = match it.get(&t, "length") {
+        Ok(Value::Num(n)) => n.max(0.0) as usize,
+        _ => 0,
+    };
+    let extra = a.len().saturating_sub(1);
+    let b = it.new_obj(it.p.function.clone(), Kind::Func(Func::Bound(t, arg(a, 0), a.get(1..).unwrap_or(&[]).to_vec())));
+    super::func_props(&b, format!("bound {tname}").into(), tlen.saturating_sub(extra));
+    Ok(Value::Obj(b))
 }
 fn fn_to_string(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
     let name = match &t {
@@ -930,7 +1015,25 @@ fn generic(it: &mut Interp, f: NativeFn, mutates: bool, t: Value, a: &[Value]) -
     }
     let len = it.get(&t, "length")?;
     let n = it.to_num(&len)?;
-    let n = if n.is_finite() && n > 0.0 { (n as usize).min(1 << 28) } else { 0 };
+    // push on an array-like: per spec, without copying it (feature tests
+    // use lengths like 2^32).
+    if f as usize == arr_push as *const () as usize {
+        let n = if n.is_finite() && n > 0.0 { n.floor().min(9007199254740991.0) } else { 0.0 };
+        if n + a.len() as f64 > 9007199254740991.0 {
+            return Err(type_error("Pushing to an array-like past the maximum length"));
+        }
+        for (i, v) in a.iter().enumerate() {
+            let k = super::num_to_str(n + i as f64);
+            it.put(&t, &k, v.clone())?;
+        }
+        let new_len = Value::Num(n + a.len() as f64);
+        it.put(&t, "length", new_len.clone())?;
+        return Ok(new_len);
+    }
+    let n = if n.is_finite() && n > 0.0 { n as usize } else { 0 };
+    if n > 1 << 24 {
+        return Err(super::range_error("Array-like object too large"));
+    }
     let mut items = Vec::with_capacity(n);
     for i in 0..n {
         items.push(it.get(&t, &i.to_string())?);
@@ -1264,6 +1367,12 @@ fn arr_at(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
 // ----------------------------------------------------------------- String
 
 fn string_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    // String(symbol) describes it (other conversions of symbols keep the key).
+    if let (false, Some(Value::Str(s))) = (it.constructing, a.first()) {
+        if super::is_symbol_str(s) {
+            return Ok(Value::str(&format!("Symbol({})", super::symbol_description(s).unwrap_or_default())));
+        }
+    }
     let s = if a.is_empty() { Rc::from("") } else { it.to_str(&a[0])? };
     if it.constructing {
         return Ok(Value::Obj(it.new_obj(it.p.string.clone(), Kind::Boxed(Value::Str(s)))));
@@ -1805,20 +1914,131 @@ fn num_to_fixed(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     if !n.is_finite() || n.abs() >= 1e21 {
         return Ok(Value::str(&num_to_str(n)));
     }
-    Ok(Value::str(&format!("{n:.d$}")))
+    Ok(Value::str(&js_fixed(n, d)))
+}
+/// The digits of |n| rounded to `keep` significant digits the JS way (exact
+/// ties round up), and the decimal exponent of the first digit.
+fn js_sig_digits(n: f64, keep: usize) -> (Vec<u8>, i32) {
+    let s = format!("{:.*e}", keep + 30, n.abs());
+    let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+    let mut e: i32 = e.parse().unwrap_or(0);
+    let all: Vec<u8> = m.bytes().filter(|b| b.is_ascii_digit()).map(|b| b - b'0').collect();
+    let mut d = all[..keep.min(all.len())].to_vec();
+    if all.get(keep).is_some_and(|&x| x >= 5) {
+        let mut i = d.len();
+        loop {
+            if i == 0 {
+                d.insert(0, 1);
+                d.pop();
+                e += 1;
+                break;
+            }
+            i -= 1;
+            if d[i] == 9 {
+                d[i] = 0;
+            } else {
+                d[i] += 1;
+                break;
+            }
+        }
+    }
+    (d, e)
+}
+
+/// n in exponential notation with `frac` fraction digits ("1.25e+3").
+fn js_exponential(n: f64, frac: usize) -> String {
+    let (d, e) = js_sig_digits(n, frac + 1);
+    let mut s = String::new();
+    if n < 0.0 {
+        s.push('-');
+    }
+    s.push((b'0' + d[0]) as char);
+    if frac > 0 {
+        s.push('.');
+        s.extend(d[1..].iter().map(|&x| (b'0' + x) as char));
+    }
+    s + &format!("e{}{}", if e < 0 { "-" } else { "+" }, e.abs())
+}
+
+/// n with `frac` fraction digits (ties round up, as toFixed specifies).
+fn js_fixed(n: f64, frac: usize) -> String {
+    let s = format!("{:.*}", frac + 30, n.abs());
+    let (int, rest) = s.split_once('.').unwrap_or((&s, ""));
+    let mut digits: Vec<u8> = int.bytes().chain(rest.bytes().take(frac)).map(|b| b - b'0').collect();
+    if rest.as_bytes().get(frac).is_some_and(|&b| b >= b'5') {
+        let mut i = digits.len();
+        loop {
+            if i == 0 {
+                digits.insert(0, 1);
+                break;
+            }
+            i -= 1;
+            if digits[i] == 9 {
+                digits[i] = 0;
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+    }
+    let int_len = digits.len() - frac;
+    let mut out = String::new();
+    if n < 0.0 {
+        out.push('-');
+    }
+    out.extend(digits[..int_len].iter().map(|&x| (b'0' + x) as char));
+    if frac > 0 {
+        out.push('.');
+        out.extend(digits[int_len..].iter().map(|&x| (b'0' + x) as char));
+    }
+    out
+}
+
+/// Rust's "1.5e3" / "1.5e-3" in JS form ("1.5e+3").
+fn js_exponent(s: String) -> String {
+    match s.split_once('e') {
+        Some((m, e)) if !e.starts_with('-') => format!("{m}e+{e}"),
+        _ => s,
+    }
+}
+fn num_to_exponential(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let n = this_num(it, &t)?;
+    let digits = match a.first() {
+        None | Some(Value::Undef) => None,
+        Some(v) => Some(it.to_num(v)?),
+    };
+    if !n.is_finite() {
+        return Ok(Value::str(&num_to_str(n)));
+    }
+    let s = match digits {
+        None => format!("{n:e}"),
+        Some(d) if !(0.0..=100.0).contains(&d) => return Err(super::range_error("toExponential() argument must be between 0 and 100")),
+        Some(d) => return Ok(Value::str(&js_exponential(n, d as usize))),
+    };
+    Ok(Value::str(&js_exponent(s)))
 }
 fn num_to_precision(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let n = this_num(it, &t)?;
     if a.is_empty() || matches!(a[0], Value::Undef) {
         return Ok(Value::str(&num_to_str(n)));
     }
-    let p = (num(it, a, 0)? as i32).clamp(1, 100);
-    if n == 0.0 || !n.is_finite() {
-        return Ok(Value::str(&format!("{:.*}", (p - 1) as usize, n)));
+    let p = num(it, a, 0)?;
+    if !n.is_finite() {
+        return Ok(Value::str(&num_to_str(n)));
     }
-    let e = n.abs().log10().floor() as i32;
-    let d = (p - 1 - e).max(0) as usize;
-    Ok(Value::str(&format!("{n:.d$}")))
+    if !(1.0..=100.0).contains(&p) {
+        return Err(super::range_error("toPrecision() argument must be between 1 and 100"));
+    }
+    let p = p as i32;
+    if n == 0.0 {
+        return Ok(Value::str(&format!("{:.*}", (p - 1) as usize, 0.0)));
+    }
+    // The exponent after rounding to p digits decides the notation.
+    let (_, e) = js_sig_digits(n, p as usize);
+    if e < -6 || e >= p {
+        return Ok(Value::str(&js_exponential(n, (p - 1) as usize)));
+    }
+    Ok(Value::str(&js_fixed(n, (p - 1 - e).max(0) as usize)))
 }
 fn num_to_string(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let n = this_num(it, &t)?;
@@ -1896,6 +2116,7 @@ math1! {
     m_abs => f64::abs, m_floor => f64::floor, m_ceil => f64::ceil,
     m_round => |x| (x + 0.5).floor(), m_trunc => f64::trunc,
     m_sign => |x| if x.is_nan() { x } else if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { x },
+    m_sinh => f64::sinh, m_cosh => f64::cosh, m_tanh => f64::tanh, m_asinh => f64::asinh, m_acosh => f64::acosh, m_atanh => f64::atanh, m_expm1 => f64::exp_m1,
     m_sqrt => f64::sqrt, m_cbrt => f64::cbrt, m_sin => f64::sin, m_cos => f64::cos, m_tan => f64::tan,
     m_asin => f64::asin, m_acos => f64::acos, m_atan => f64::atan, m_exp => f64::exp, m_log => f64::ln,
     m_log2 => f64::log2, m_log10 => f64::log10, m_log1p => f64::ln_1p, m_fround => |x| x as f32 as f64,
@@ -2524,6 +2745,20 @@ fn coll_items(it: &mut Interp, a: &[Value]) -> R<Vec<Value>> {
         v => it.iterate(&v),
     }
 }
+fn weak_map_ctor(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let m = map_ctor(it, t, a)?;
+    if let Value::Obj(o) = &m {
+        o.borrow_mut().proto = it.p.web.get("WeakMap").cloned();
+    }
+    Ok(m)
+}
+fn weak_set_ctor(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
+    let m = set_ctor(it, t, a)?;
+    if let Value::Obj(o) = &m {
+        o.borrow_mut().proto = it.p.web.get("WeakSet").cloned();
+    }
+    Ok(m)
+}
 fn map_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let mut m = OrdMap::default();
     for e in coll_items(it, a)? {
@@ -3080,6 +3315,32 @@ fn symbol_fn(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     };
     Ok(Value::str(&format!("@@sym:{}:{desc}", it.symbols)))
 }
+fn this_symbol(t: &Value) -> R<Rc<str>> {
+    match t {
+        Value::Str(s) if super::is_symbol_str(s) => Ok(s.clone()),
+        Value::Obj(o) => match &o.borrow().kind {
+            Kind::Boxed(Value::Str(s)) if super::is_symbol_str(s) => Ok(s.clone()),
+            _ => Err(type_error("Symbol.prototype method called on a non-symbol")),
+        },
+        _ => Err(type_error("Symbol.prototype method called on a non-symbol")),
+    }
+}
+fn symbol_to_string(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    let s = this_symbol(&t)?;
+    Ok(Value::str(&format!("Symbol({})", super::symbol_description(&s).unwrap_or_default())))
+}
+fn symbol_value_of(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    Ok(Value::Str(this_symbol(&t)?))
+}
+fn symbol_description_get(_: &mut Interp, t: Value, _: &[Value]) -> R<Value> {
+    Ok(super::symbol_description(&this_symbol(&t)?).map_or(Value::Undef, |d| Value::str(&d)))
+}
+fn symbol_key_for(_: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    Ok(match arg(a, 0) {
+        Value::Str(s) => s.strip_prefix("@@sym:for:").map_or(Value::Undef, Value::str),
+        _ => Value::Undef,
+    })
+}
 fn symbol_for(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let k = it.to_str(&arg(a, 0))?;
     Ok(Value::str(&format!("@@sym:for:{k}")))
@@ -3187,4 +3448,25 @@ fn atob(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let s = it.to_str(&arg(a, 0))?;
     let bytes = crate::image::data_url(&format!("data:;base64,{s}")).unwrap_or_default();
     Ok(Value::str(&bytes.iter().map(|&b| b as char).collect::<String>()))
+}
+
+/// `length` of built-in functions (by name; 0 when not listed).
+pub fn native_arity(name: &str) -> usize {
+    match name {
+        "Date" => 7,
+        "Int8Array" | "Uint8Array" | "Uint8ClampedArray" | "Int16Array" | "Uint16Array" | "Int32Array" | "Uint32Array" | "Float32Array" | "Float64Array" | "defineProperty" | "reduceRight" => 3,
+        "RegExp" | "Proxy" | "AggregateError" | "slice" | "splice" | "then" | "apply" | "assign" | "create" | "setPrototypeOf" | "replace" | "replaceAll" | "split" | "substring" | "substr" | "max" | "min" | "parseInt"
+        | "set" | "padStart" | "padEnd" | "lastIndexOf" | "setTimeout" | "setInterval" | "defineProperties" | "addEventListener" | "removeEventListener" | "insertBefore" | "replaceChild" | "setAttribute" | "fill" | "copyWithin"
+        | "getOwnPropertyDescriptor" | "is" | "atan2" | "pow" | "hypot" | "imul" | "localeCompare" | "postMessage" | "DataView" => 2,
+        "Object" | "Function" | "Array" | "String" | "Number" | "Boolean" | "BigInt" | "Error" | "TypeError" | "RangeError" | "SyntaxError" | "ReferenceError" | "EvalError" | "URIError" | "Promise" | "ArrayBuffer"
+        | "SharedArrayBuffer" | "URL" | "WeakRef" | "FinalizationRegistry" | "push" | "indexOf" | "includes" | "map" | "forEach" | "filter" | "reduce" | "concat" | "join" | "catch" | "call" | "bind" | "keys" | "values" | "entries"
+        | "freeze" | "seal" | "getPrototypeOf" | "hasOwnProperty" | "charAt" | "charCodeAt" | "codePointAt" | "parseFloat" | "get" | "has" | "delete" | "add" | "find" | "findIndex" | "findLast" | "findLastIndex" | "some" | "every"
+        | "sort" | "from" | "isArray" | "resolve" | "reject" | "all" | "race" | "allSettled" | "any" | "fromCharCode" | "fromCodePoint" | "startsWith" | "endsWith" | "repeat" | "at" | "flatMap" | "unshift" | "test" | "exec" | "match"
+        | "matchAll" | "search" | "normalize" | "isPrototypeOf" | "propertyIsEnumerable" | "getOwnPropertyNames" | "getOwnPropertySymbols" | "isFrozen" | "isSealed" | "isExtensible" | "preventExtensions" | "fromEntries" | "isInteger"
+        | "isFinite" | "isNaN" | "isSafeInteger" | "abs" | "floor" | "ceil" | "round" | "sqrt" | "sign" | "trunc" | "log" | "exp" | "sin" | "cos" | "tan" | "stringify" | "parse" | "querySelector" | "querySelectorAll"
+        | "getElementById" | "appendChild" | "removeChild" | "contains" | "getAttribute" | "removeAttribute" | "hasAttribute" | "createElement" | "createTextNode" | "dispatchEvent" | "matches" | "closest" | "clearTimeout"
+        | "clearInterval" | "requestAnimationFrame" | "cancelAnimationFrame" | "queueMicrotask" | "structuredClone" | "fetch" | "encodeURIComponent" | "decodeURIComponent" | "encodeURI" | "decodeURI" | "escape" | "unescape"
+        | "eval" | "Event" | "CustomEvent" | "groupBy" | "observe" | "for" | "keyFor" | "construct" | "ownKeys" | "toFixed" | "toPrecision" | "toExponential" => 1,
+        _ => 0,
+    }
 }

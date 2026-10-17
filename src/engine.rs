@@ -440,6 +440,12 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     it.ready_state = "loading";
     it.set_deadline(t0 + std::time::Duration::from_millis(script_budget() as u64));
     it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: css.clone(), base: base.to_owned() }));
+    // BOLT_INJECT=file.js: run a script before the page's own (debugging).
+    if let Some(src) = std::env::var_os("BOLT_INJECT").and_then(|p| std::fs::read_to_string(p).ok()) {
+        if let Err(e) = it.run_script(&src) {
+            eprintln!("[inject] {e}");
+        }
+    }
     // Parser-blocking classic scripts run in order; `defer` and module
     // scripts after them (in order), then `async` ones. Scripts that don't
     // fit the startup budget are queued and run one per event loop turn.
@@ -1495,6 +1501,36 @@ impl Page {
         }
         self.layouts += 1;
         self.sync_js_geometry();
+        self.fire_link_events();
+    }
+
+    /// Fire `load` at `<link rel=stylesheet>` elements whose sheet has been
+    /// fetched (webpack and other loaders wait for it).
+    fn fire_link_events(&mut self) {
+        let Some(it) = &self.js else { return };
+        let mut due = Vec::new();
+        for n in 0..self.doc.nodes.len() as NodeId {
+            let Some(e) = self.doc.elem(n) else { continue };
+            if e.tag != k::link {
+                continue;
+            }
+            let Some(u) = stylesheet_link(e, &self.base) else { continue };
+            if self.css.contains_key(&u) && it.link_fired.get(&n) != Some(&u) && self.doc.contains(0, n) {
+                due.push((n, u));
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
+        self.with_js(|it| {
+            for (n, u) in due {
+                if js::trace_scripts() {
+                    eprintln!("[link] load {n} {u}");
+                }
+                it.link_fired.insert(n, u);
+                js::dombind::dispatch_nobubble(it, n, "load");
+            }
+        });
     }
 
     /// Images used by rendered elements that haven't been fetched yet.

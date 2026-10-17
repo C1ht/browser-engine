@@ -266,7 +266,6 @@ pub struct GenStart {
 
 /// An event listener: target (node or WINDOW), type, callback, options.
 pub struct Listener {
-    pub target: u32,
     pub ty: Rc<str>,
     pub f: Value,
     pub capture: bool,
@@ -362,8 +361,30 @@ pub struct Timer {
     pub args: Vec<Value>,
 }
 
+/// Well-known symbols (stored as "@@name" strings).
+pub const WELL_KNOWN_SYMBOLS: &[&str] = &[
+    "@@iterator", "@@asyncIterator", "@@toStringTag", "@@hasInstance", "@@toPrimitive", "@@species",
+    "@@isConcatSpreadable", "@@unscopables", "@@match", "@@matchAll", "@@replace", "@@search", "@@split",
+];
+
+/// Symbols are strings "@@sym:<id>:<description>" / "@@sym:for:<key>" or a
+/// well-known "@@name".
+pub fn is_symbol_str(s: &str) -> bool {
+    s.starts_with("@@sym:") || WELL_KNOWN_SYMBOLS.contains(&s)
+}
+
+/// A symbol's description (None: not a symbol, or no description).
+pub fn symbol_description(s: &str) -> Option<String> {
+    if let Some(rest) = s.strip_prefix("@@sym:") {
+        let d = rest.strip_prefix("for:").unwrap_or_else(|| rest.split_once(':').map_or("", |(_, d)| d));
+        return (!d.is_empty() || rest.starts_with("for:")).then(|| d.to_string());
+    }
+    WELL_KNOWN_SYMBOLS.contains(&s).then(|| format!("Symbol.{}", &s[2..]))
+}
+
 #[derive(Default)]
 pub struct Protos {
+    pub symbol: Option<ObjRef>,
     pub object: Option<ObjRef>,
     pub function: Option<ObjRef>,
     pub array: Option<ObjRef>,
@@ -406,7 +427,8 @@ pub struct Interp {
     pub next_timer: u32,
     pub micro: VecDeque<(Value, Vec<Value>)>,
     /// Event listeners, in registration order.
-    pub listeners: Vec<Listener>,
+    /// Event listeners by target node (registration order within a target).
+    pub listeners: FxHashMap<u32, Vec<Listener>>,
     /// document.readyState and document.currentScript.
     pub ready_state: &'static str,
     pub current_script: NodeId,
@@ -494,6 +516,8 @@ pub struct Interp {
     pub images: FxHashMap<String, Option<std::sync::Arc<crate::image::Image>>>,
     /// <img> elements whose load / error event has fired (for which URL).
     pub img_fired: FxHashMap<NodeId, String>,
+    /// <link rel=stylesheet> elements whose load event has fired.
+    pub link_fired: FxHashMap<NodeId, String>,
     /// Page scripts that didn't fit the startup budget: run one per event
     /// loop turn (the window stays responsive), in order.
     pub script_queue: std::collections::VecDeque<NodeId>,
@@ -548,7 +572,7 @@ impl Interp {
             timers: Vec::new(),
             next_timer: 1,
             micro: VecDeque::new(),
-            listeners: Vec::new(),
+            listeners: FxHashMap::default(),
             ready_state: "complete",
             current_script: crate::dom::NONE,
             node_objs: FxHashMap::default(),
@@ -602,6 +626,7 @@ impl Interp {
             vm_env_pool: Vec::new(),
             images: FxHashMap::default(),
             img_fired: FxHashMap::default(),
+            link_fired: FxHashMap::default(),
             script_queue: Default::default(),
             script_sources: None,
             load_events_pending: false,
@@ -641,7 +666,9 @@ impl Interp {
     }
 
     pub fn native(&self, f: NativeFn, name: &'static str) -> Value {
-        Value::Obj(self.new_obj(self.p.function.clone(), Kind::Func(Func::Native(f, name))))
+        let o = self.new_obj(self.p.function.clone(), Kind::Func(Func::Native(f, name)));
+        func_props(&o, Rc::from(name), builtins::native_arity(name));
+        Value::Obj(o)
     }
 
     pub fn set_prop(o: &ObjRef, k: &str, v: Value) {
@@ -765,7 +792,7 @@ impl Interp {
             Value::Bool(_) => "boolean",
             Value::Num(_) => "number",
             Value::BigInt(_) => "bigint",
-            Value::Str(s) => if s.starts_with("@@sym:") { "symbol" } else { "string" },
+            Value::Str(s) => if is_symbol_str(s) { "symbol" } else { "string" },
             Value::Obj(_) => {
                 if Self::is_callable(v) { "function" } else { "object" }
             }
@@ -776,6 +803,7 @@ impl Interp {
 
     fn proto_of_prim(&self, v: &Value) -> Option<ObjRef> {
         match v {
+            Value::Str(s) if is_symbol_str(s) => self.p.symbol.clone(),
             Value::Str(_) => self.p.string.clone(),
             Value::Num(_) => self.p.number.clone(),
             Value::BigInt(_) => self.p.bigint.clone(),
@@ -1060,7 +1088,24 @@ impl Interp {
         false
     }
 
+    /// A function's `prototype` object is created on first use; anything
+    /// that inspects own properties creates it first (`'prototype' in f`).
+    pub fn materialize_prototype(&mut self, v: &Value) {
+        if let Value::Obj(o) = v {
+            let lazy = {
+                let b = o.borrow();
+                matches!(&b.kind, Kind::Func(Func::Closure { def, .. }) if !def.arrow) && b.props.get("prototype").is_none()
+            };
+            if lazy {
+                let _ = self.get(v, "prototype");
+            }
+        }
+    }
+
     pub fn has_prop(&mut self, target: &Value, key: &str) -> bool {
+        if key == "prototype" {
+            self.materialize_prototype(target);
+        }
         if let Value::Obj(o) = target {
             if matches!(o.borrow().kind, Kind::Proxy(_)) {
                 return proxy::has(self, o, key);
@@ -1116,11 +1161,8 @@ impl Interp {
     /// symbol keys (getOwnPropertySymbols). Engine-internal `@@` keys are
     /// in neither.
     pub fn own_property_keys(&mut self, v: &Value, symbols: bool) -> Vec<Rc<str>> {
-        const WELL_KNOWN: &[&str] = &[
-            "@@iterator", "@@asyncIterator", "@@toStringTag", "@@hasInstance", "@@toPrimitive", "@@species",
-            "@@isConcatSpreadable", "@@unscopables", "@@match", "@@matchAll", "@@replace", "@@search", "@@split",
-        ];
-        let is_symbol = |k: &str| k.starts_with("@@sym:") || WELL_KNOWN.contains(&k);
+        self.materialize_prototype(v);
+        let is_symbol = |k: &str| is_symbol_str(k);
         match v {
             Value::Str(s) if !symbols => {
                 let mut out: Vec<Rc<str>> = (0..utf16_len(s)).map(|i| Rc::from(i.to_string())).collect();
@@ -1158,6 +1200,9 @@ impl Interp {
     pub fn call(&mut self, f: &Value, this: Value, args: &[Value]) -> R<Value> {
         self.tick()?;
         let Value::Obj(fo) = f else {
+            if trace_on() {
+                self.log(&format!("[trace] call of {f:?}{}", trace_stack()));
+            }
             return Err(type_error(format!("{:?} is not a function", f)));
         };
         enum C {
@@ -1571,7 +1616,9 @@ impl Interp {
     pub fn make_closure(&mut self, def: &Rc<FuncDef>, env: &Env) -> Value {
         let this = if def.arrow { Some(Self::this_val(env)) } else { None };
         let home = if def.arrow { Self::home_of(env) } else { None };
-        Value::Obj(self.new_obj(self.p.function.clone(), Kind::Func(Func::Closure { def: def.clone(), env: env.clone(), this, home })))
+        let f = self.new_obj(self.p.function.clone(), Kind::Func(Func::Closure { def: def.clone(), env: env.clone(), this, home }));
+        func_props(&f, def.name.clone().unwrap_or_else(|| Rc::from("")), formal_length(def));
+        Value::Obj(f)
     }
 
     // ---------------------------------------------------------- statements
@@ -2647,6 +2694,7 @@ impl Interp {
             _ => self.p.function.clone(),
         };
         let class = self.new_obj(ctor_proto, Kind::Func(Func::Class(info)));
+        func_props(&class, cd.name.clone().unwrap_or_else(|| Rc::from("")), cd.ctor.as_ref().map_or(0, |c| formal_length(c)));
         let proto_parent = match &parent {
             Some(Value::Null) => None,
             Some(p @ Value::Obj(_)) => self.get(p, "prototype")?.obj().cloned(),
@@ -2662,7 +2710,14 @@ impl Interp {
         for (is_static, key, kind, f) in &cd.methods {
             let target = if *is_static { class.clone() } else { proto.clone() };
             let k = self.prop_key(key, &scope)?;
-            let fv = Value::Obj(self.new_obj(self.p.function.clone(), Kind::Func(Func::Closure { def: f.clone(), env: scope.clone(), this: None, home: Some(target.clone()) })));
+            let fo = self.new_obj(self.p.function.clone(), Kind::Func(Func::Closure { def: f.clone(), env: scope.clone(), this: None, home: Some(target.clone()) }));
+            let fname: Rc<str> = match kind {
+                MethodKind::Get => format!("get {k}").into(),
+                MethodKind::Set => format!("set {k}").into(),
+                _ => k.clone(),
+            };
+            func_props(&fo, fname, formal_length(f));
+            let fv = Value::Obj(fo);
             let mut t = target.borrow_mut();
             match kind {
                 MethodKind::Method => t.props.insert(k, Prop { v: fv, get: None, set: None, enumerable: false }),
@@ -2850,10 +2905,26 @@ fn expr_has_closure(e: &Expr) -> bool {
     }
 }
 
+/// A function's own `length` and `name` (non-enumerable, in spec order).
+pub fn func_props(f: &ObjRef, name: Rc<str>, len: usize) {
+    let mut b = f.borrow_mut();
+    b.props.insert("length".into(), Prop { v: Value::Num(len as f64), get: None, set: None, enumerable: false });
+    b.props.insert("name".into(), Prop { v: Value::Str(name), get: None, set: None, enumerable: false });
+}
+
+/// Parameters before the first default / rest (a function's `length`).
+pub fn formal_length(def: &FuncDef) -> usize {
+    def.params.iter().take_while(|p| !matches!(p, Pattern::Default(..))).count()
+}
+
 fn name_fn(v: &Value, p: &Pattern) {
     if let (Value::Obj(o), Pattern::Ident(n)) = (v, p) {
         let mut ob = o.borrow_mut();
-        if matches!(ob.kind, Kind::Func(Func::Closure { .. }) | Kind::Func(Func::Class(_))) && ob.props.get("name").is_none() {
+        let unnamed = match ob.props.get("name") {
+            None => true,
+            Some(p) => matches!(&p.v, Value::Str(s) if s.is_empty()),
+        };
+        if matches!(ob.kind, Kind::Func(Func::Closure { .. }) | Kind::Func(Func::Class(_))) && unnamed {
             ob.props.insert("name".into(), Prop { v: Value::Str(n.clone()), get: None, set: None, enumerable: false });
         }
     }

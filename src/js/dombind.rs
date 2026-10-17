@@ -659,7 +659,8 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         // document-only
         "body" | "head" | "documentElement" | "scrollingElement" if doc_node && id != 0 => {
             // A document from document.implementation.
-            let html = it.doc.children(id).find(|&c| it.doc.tag(c) == Some(k::html)).unwrap_or(NONE);
+            // (An XML document's root needn't be <html>.)
+            let html = it.doc.children(id).find(|&c| it.doc.tag(c) == Some(k::html)).or_else(|| it.doc.children(id).find(|&c| it.doc.elem(c).is_some())).unwrap_or(NONE);
             let n = match key {
                 "body" | "head" if html != NONE => {
                     let want = if key == "body" { k::body } else { k::head };
@@ -680,6 +681,23 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
         "body" if doc_node => node_obj(it, it.doc.body),
         "head" if doc_node => node_obj(it, it.doc.head),
         "documentElement" | "scrollingElement" if doc_node => node_obj(it, it.doc.html),
+        "title" if doc_node && id != 0 => {
+            // A detached document: its own <title>.
+            let mut stack = vec![id];
+            let mut found = NONE;
+            while let Some(n) = stack.pop() {
+                if it.doc.tag(n) == Some(k::title) {
+                    found = n;
+                    break;
+                }
+                stack.extend(it.doc.children(n).collect::<Vec<_>>().into_iter().rev());
+            }
+            let mut text = String::new();
+            if found != NONE {
+                it.doc.text_content(found, &mut text);
+            }
+            Value::str(text.trim())
+        }
         "title" if doc_node => Value::str(&it.doc.title()),
         "readyState" if doc_node => Value::str(it.ready_state),
         "currentScript" if doc_node => node_obj(it, it.current_script),
@@ -1565,8 +1583,13 @@ fn add_listener(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
             return Ok(Value::Undef);
         }
     }
-    if !it.listeners.iter().any(|l| l.target == target && l.ty == ty && l.capture == capture && strict_eq(&l.f, &f)) {
-        it.listeners.push(crate::js::Listener { target, ty, f, capture, once, passive, signal });
+    let list = it.listeners.entry(target).or_default();
+    if !list.iter().any(|l| l.ty == ty && l.capture == capture && strict_eq(&l.f, &f)) {
+        list.push(crate::js::Listener { ty: ty.clone(), f, capture, once, passive, signal });
+        if list.len() == 5000 && crate::js::trace_on() {
+            let msg = format!("[trace] 5000 listeners on node {target} (latest '{ty}'){}", crate::js::trace_stack());
+            it.log(&msg);
+        }
     }
     Ok(Value::Undef)
 }
@@ -1579,7 +1602,9 @@ fn remove_listener(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
         object_remove_listener(it, &t, &ty, &f, capture)?;
         return Ok(Value::Undef);
     }
-    it.listeners.retain(|l| !(l.target == target && l.ty == ty && l.capture == capture && strict_eq(&l.f, &f)));
+    if let Some(list) = it.listeners.get_mut(&target) {
+        list.retain(|l| !(l.ty == ty && l.capture == capture && strict_eq(&l.f, &f)));
+    }
     Ok(Value::Undef)
 }
 fn dispatch_event_m(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
@@ -1629,7 +1654,9 @@ fn dispatch_obj(it: &mut Interp, target: u32, ty: &str, ev: Value) -> R<bool> {
             n = if p == NONE { it.doc.shadow_hosts.get(&n).copied().unwrap_or(NONE) } else { p };
         }
     }
-    if target == WINDOW || target == 0 || it.doc.connected(target) {
+    // (The window isn't on the path of `load` events: an image or stylesheet
+    // loading isn't the page loading.)
+    if target == WINDOW || ((target == 0 || it.doc.connected(target)) && ty != "load") {
         path.push(WINDOW);
     }
     let path_objs: Vec<Value> = path.iter().map(|&n| if n == WINDOW { Value::Obj(it.global.clone()) } else { node_obj(it, n) }).collect();
@@ -1651,20 +1678,28 @@ fn dispatch_obj(it: &mut Interp, target: u32, ty: &str, ev: Value) -> R<bool> {
         // Listeners registered for this phase (snapshot).
         let ls: Vec<(Value, bool, bool, Option<Value>)> = it
             .listeners
-            .iter()
-            .filter(|l| l.target == cur && &*l.ty == ty && (phase == 2 || l.capture == (phase == 1)))
-            .map(|l| (l.f.clone(), l.once, l.passive, l.signal.clone()))
-            .collect();
+            .get(&cur)
+            .map(|list| {
+                list.iter()
+                    .filter(|l| &*l.ty == ty && (phase == 2 || l.capture == (phase == 1)))
+                    .map(|l| (l.f.clone(), l.once, l.passive, l.signal.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut fs: Vec<(Value, bool, bool)> = Vec::new();
         for (f, once, passive, signal) in ls {
             if let Some(s) = &signal {
                 if it.get(s, "aborted")?.truthy() {
-                    it.listeners.retain(|l| !(l.target == cur && strict_eq(&l.f, &f)));
+                    if let Some(list) = it.listeners.get_mut(&cur) {
+                        list.retain(|l| !strict_eq(&l.f, &f));
+                    }
                     continue;
                 }
             }
             if once {
-                it.listeners.retain(|l| !(l.target == cur && &*l.ty == ty && strict_eq(&l.f, &f)));
+                if let Some(list) = it.listeners.get_mut(&cur) {
+                    list.retain(|l| !(&*l.ty == ty && strict_eq(&l.f, &f)));
+                }
             }
             fs.push((f, passive, false));
         }
@@ -1757,6 +1792,40 @@ fn event_ctor(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
 
 // ------------------------------------------------------------- document
 
+/// Elements under a viewport point, topmost first (by layout rectangles in
+/// tree order; elements with pointer-events: none are skipped).
+fn hits_at(it: &mut Interp, a: &[Value]) -> R<Vec<NodeId>> {
+    let x = it.to_num(&arg(a, 0))? as f32;
+    let y = it.to_num(&arg(a, 1))? as f32;
+    it.ensure_layout();
+    let py = y + it.scroll_y;
+    let styles = it.styles.as_ref().map(|(_, s)| s.clone());
+    let mut hits = Vec::new();
+    for n in descendants(it, 0) {
+        if it.doc.elem(n).is_none() {
+            continue;
+        }
+        let Some(&[rx, ry, rw, rh]) = it.rects.get(&n) else { continue };
+        if rw <= 0.0 || rh <= 0.0 || x < rx || x >= rx + rw || py < ry || py >= ry + rh {
+            continue;
+        }
+        if styles.as_ref().and_then(|s| s.get(n as usize)).is_some_and(|s| s.no_pointer) {
+            continue;
+        }
+        hits.push(n);
+    }
+    hits.reverse();
+    Ok(hits)
+}
+fn d_element_from_point(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let hits = hits_at(it, a)?;
+    Ok(hits.first().map_or(Value::Null, |&n| node_obj(it, n)))
+}
+fn d_elements_from_point(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let hits = hits_at(it, a)?;
+    let v = hits.into_iter().map(|n| node_obj(it, n)).collect();
+    Ok(it.array(v))
+}
 fn d_get_by_id(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     let s = it.to_str(&arg(a, 0))?;
     let Some(want) = atom::lookup(&s) else { return Ok(Value::Null) };
@@ -2357,6 +2426,8 @@ pub fn install(it: &mut Interp) {
         ("assignedElements", n_assigned_elements),
         ("getRootNode", n_get_root_node),
         ("getElementById", d_get_by_id),
+        ("elementFromPoint", d_element_from_point),
+        ("elementsFromPoint", d_elements_from_point),
         ("createElement", d_create_element),
         ("createElementNS", d_create_element_ns),
         ("createTextNode", d_create_text),
