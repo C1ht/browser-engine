@@ -13,6 +13,8 @@
 use super::parser::*;
 use super::*;
 use crate::fx::FxHashSet;
+use super::shape::Shape;
+use std::cell::{Cell, RefCell};
 
 pub type Reg = u16;
 
@@ -21,9 +23,12 @@ const R_THIS: Reg = 0;
 const R_CALLEE: Reg = 1;
 const R_ARGUMENTS: Reg = 2;
 const R_REST: Reg = 3;
-const R_ARG0: Reg = 4;
+/// Always undefined (never written).
+const R_UNDEF: Reg = 4;
+const R_ARG0: Reg = 5;
 
 const NONE: u32 = u32::MAX;
+const NO_IC: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum BinOp {
@@ -52,6 +57,10 @@ pub enum BinOp {
 }
 
 impl BinOp {
+    fn is_cmp(self) -> bool {
+        matches!(self, BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::Ne | BinOp::StrictEq | BinOp::StrictNe)
+    }
+
     fn from_str(s: &str) -> Option<BinOp> {
         Some(match s {
             "+" => BinOp::Add,
@@ -142,8 +151,13 @@ pub enum Op {
     JumpIfNullish { src: Reg, to: u32 },
     JumpIfNotNullish { src: Reg, to: u32 },
     JumpIfNotUndef { src: Reg, to: u32 },
-    GetProp { dst: Reg, obj: Reg, name: u32 },
-    SetProp { obj: Reg, name: u32, src: Reg },
+    /// Compare and branch: jump when `(a op b) == when`.
+    CmpJump { op: BinOp, a: Reg, b: Reg, to: u32, when: bool },
+    /// Same with a constant right operand.
+    CmpJumpK { op: BinOp, a: Reg, k: u32, to: u32, when: bool },
+    BinK { op: BinOp, dst: Reg, a: Reg, k: u32 },
+    GetProp { dst: Reg, obj: Reg, name: u32, ic: u32 },
+    SetProp { obj: Reg, name: u32, src: Reg, ic: u32 },
     GetIndex { dst: Reg, obj: Reg, key: Reg },
     SetIndex { obj: Reg, key: Reg, src: Reg },
     DelProp { dst: Reg, obj: Reg, name: u32 },
@@ -157,7 +171,7 @@ pub enum Op {
     ArraySpread { arr: Reg, src: Reg },
     ArrayHole { arr: Reg },
     Object { dst: Reg },
-    DefProp { obj: Reg, name: u32, src: Reg, method: bool },
+    DefProp { obj: Reg, name: u32, src: Reg, method: bool, ic: u32 },
     DefPropKey { obj: Reg, key: Reg, src: Reg, method: bool },
     DefAccessor { obj: Reg, key: Reg, func: Reg, getter: bool },
     ObjSpread { obj: Reg, src: Reg },
@@ -197,7 +211,13 @@ pub enum Op {
 }
 
 pub struct Code {
-    pub def: Rc<FuncDef>,
+    /// From the function definition (which owns this code).
+    arrow: bool,
+    strict: bool,
+    nparams: usize,
+    has_rest: bool,
+    is_gen: bool,
+    is_async: bool,
     ops: Vec<Op>,
     consts: Vec<Value>,
     names: Vec<Rc<str>>,
@@ -212,7 +232,24 @@ pub struct Code {
     niters: usize,
     needs_env: bool,
     uses_arguments: bool,
+    ics: Box<[Ic]>,
 }
+
+/// An inline cache for a named property access: the shape ids along the
+/// receiver's prototype chain it was filled for, and the slot.
+#[derive(Default)]
+pub struct Ic {
+    ids: [Cell<u64>; 4],
+    slot: Cell<u32>,
+    /// Get: prototype depth of the holder. Set: IC_OWN, or IC_ADD + the
+    /// number of prototypes checked.
+    depth: Cell<u8>,
+    /// Set / define: the shape after adding the key.
+    add: RefCell<Option<Rc<Shape>>>,
+}
+
+const IC_OWN: u8 = 0;
+const IC_ADD: u8 = 1;
 
 enum IterState {
     Keys(Vec<Rc<str>>, usize, Value),
@@ -454,7 +491,7 @@ fn idents_stmt(s: &Stmt, out: &mut FxHashSet<Rc<str>>) {
 /// Names referenced inside nested functions and classes of a statement list
 /// (they must live in a scope object to be captured).
 fn captured_stmt(s: &Stmt, out: &mut FxHashSet<Rc<str>>, nested: &mut bool) {
-    let mut sub = |e: &Expr, out: &mut FxHashSet<Rc<str>>, nested: &mut bool| captured_expr(e, out, nested);
+    let sub = |e: &Expr, out: &mut FxHashSet<Rc<str>>, nested: &mut bool| captured_expr(e, out, nested);
     match s {
         Stmt::Expr(e) | Stmt::Throw(e) => sub(e, out, nested),
         Stmt::Var(_, ds) => {
@@ -917,6 +954,8 @@ struct Compiler<'a> {
     scope_pushed: Vec<bool>,
     /// Registers below this hold declared variables (never reused as temps).
     floor: Reg,
+    /// Inline caches allocated.
+    nics: u32,
 }
 
 type CResult = Result<(), ()>;
@@ -935,6 +974,7 @@ impl<'a> Compiler<'a> {
         match &mut self.ops[at] {
             Op::Jump { to: t } | Op::Loop { to: t } | Op::JumpIf { to: t, .. } | Op::JumpIfNot { to: t, .. } | Op::JumpIfNullish { to: t, .. } | Op::JumpIfNotNullish { to: t, .. } | Op::JumpIfNotUndef { to: t, .. } => *t = to,
             Op::IterNext { end, .. } => *end = to,
+            Op::CmpJump { to: t, .. } | Op::CmpJumpK { to: t, .. } => *t = to,
             Op::TryPush { target, .. } => *target = to,
             _ => {}
         }
@@ -970,6 +1010,16 @@ impl<'a> Compiler<'a> {
         i
     }
 
+    /// An inline cache for a named property access (none for names with
+    /// special semantics).
+    fn ic_for(&mut self, name: u32) -> u32 {
+        if matches!(&*self.names[name as usize], "length" | "__proto__") {
+            return NO_IC;
+        }
+        self.nics += 1;
+        self.nics - 1
+    }
+
     fn konst(&mut self, v: Value) -> u32 {
         self.consts.push(v);
         (self.consts.len() - 1) as u32
@@ -999,6 +1049,19 @@ impl<'a> Compiler<'a> {
         };
         self.scopes.last_mut().unwrap().insert(n.clone(), b);
         b
+    }
+
+    /// Bind a name of the function scope to a fixed register (parameters,
+    /// the callee, `arguments`), or copy it into the scope object.
+    fn bind_fixed(&mut self, n: &Rc<str>, r: Reg) {
+        if self.env_names.contains(n) {
+            self.scopes.last_mut().unwrap().insert(n.clone(), Binding::Env);
+            let name = self.name(n);
+            self.emit(Op::DeclName { name, src: r });
+        } else {
+            self.reg_names.insert(n.clone());
+            self.scopes.last_mut().unwrap().insert(n.clone(), Binding::Reg(r));
+        }
     }
 
     /// Store `src` into a declared binding (let/const/var initialization).
@@ -1031,6 +1094,123 @@ impl<'a> Compiler<'a> {
         }
     }
 
+    /// The register a variable lives in, if it's a register variable.
+    fn var_reg(&self, e: &Expr) -> Option<Reg> {
+        match e {
+            Expr::Ident(n) => match self.lookup(n) {
+                Some(Binding::Reg(r)) => Some(r),
+                _ => None,
+            },
+            Expr::This if !self.def.arrow => Some(R_THIS),
+            _ => None,
+        }
+    }
+
+    /// Compile `e` as an operand: a register variable is used in place
+    /// (unless an expression evaluated after it, `later`, assigns it).
+    fn operand(&mut self, e: &'a Expr, later: &[&Expr]) -> Result<Reg, ()> {
+        if let Some(r) = self.var_reg(e) {
+            let safe = match e {
+                Expr::Ident(n) => !later.iter().any(|l| mutates(l, n)),
+                _ => true,
+            };
+            if safe {
+                return Ok(r);
+            }
+        }
+        let r = self.reg();
+        self.expr(e, r)?;
+        Ok(r)
+    }
+
+    /// Branch on a condition: the returned jumps (to be patched) are taken
+    /// when the condition's truthiness equals `when`.
+    fn branch(&mut self, c: &'a Expr, when: bool) -> Result<Vec<usize>, ()> {
+        let mark = self.next;
+        let r = self.branch_inner(c, when);
+        self.next = mark.max(self.floor);
+        r
+    }
+
+    fn branch_inner(&mut self, c: &'a Expr, when: bool) -> Result<Vec<usize>, ()> {
+        match c {
+            Expr::Binary(op, a, b) => {
+                if let Some(bop) = BinOp::from_str(op).filter(|o| o.is_cmp()) {
+                    if let Expr::Num(n) = &**b {
+                        let ra = self.operand(a, &[])?;
+                        let k = self.konst(Value::Num(*n));
+                        return Ok(vec![self.emit(Op::CmpJumpK { op: bop, a: ra, k, to: NONE, when })]);
+                    }
+                    let ra = self.operand(a, &[b])?;
+                    let rb = self.operand(b, &[])?;
+                    return Ok(vec![self.emit(Op::CmpJump { op: bop, a: ra, b: rb, to: NONE, when })]);
+                }
+            }
+            Expr::Unary("!", x) => return self.branch_inner(x, !when),
+            Expr::Logical(op, a, b) if matches!(*op, "&&" | "||") => {
+                // `a && b` is false if a is; `a || b` true if a is.
+                let short = *op == "||";
+                if short == when {
+                    let mut j = self.branch(a, when)?;
+                    j.extend(self.branch(b, when)?);
+                    return Ok(j);
+                }
+                let skip = self.branch(a, !when)?;
+                let j = self.branch(b, when)?;
+                let h = self.here();
+                for x in skip {
+                    self.patch(x, h);
+                }
+                return Ok(j);
+            }
+            _ => {}
+        }
+        let r = self.operand(c, &[])?;
+        Ok(vec![self.emit(if when { Op::JumpIf { cond: r, to: NONE } } else { Op::JumpIfNot { cond: r, to: NONE } })])
+    }
+
+    fn patch_all(&mut self, js: Vec<usize>, to: u32) {
+        for j in js {
+            self.patch(j, to);
+        }
+    }
+
+    /// An expression whose value is unused (statements, for-loop updates).
+    fn expr_discard(&mut self, e: &'a Expr) -> CResult {
+        let mark = self.next;
+        match e {
+            // i++ / --i on a register variable.
+            Expr::Update { op, target, .. } if self.var_reg(target).is_some() && matches!(**target, Expr::Ident(_)) => {
+                let r = self.var_reg(target).unwrap();
+                let delta: i8 = if *op == "++" { 1 } else { -1 };
+                self.emit(Op::Step { dst: r, src: r, delta });
+            }
+            // x = v straight into x's register (v doesn't read x).
+            Expr::Assign("=", target, v) if matches!(&**target, Pattern::Ident(_)) => {
+                let Pattern::Ident(n) = &**target else { unreachable!() };
+                match self.lookup(n) {
+                    Some(Binding::Reg(rx)) if !reads(v, n) => {
+                        self.expr(v, rx)?;
+                        if matches!(**v, Expr::Func(_) | Expr::Class(_)) {
+                            let name = self.name(n);
+                            self.emit(Op::SetFnName { f: rx, name });
+                        }
+                    }
+                    _ => {
+                        let r = self.reg();
+                        self.expr(e, r)?;
+                    }
+                }
+            }
+            _ => {
+                let r = self.reg();
+                self.expr(e, r)?;
+            }
+        }
+        self.next = mark.max(self.floor);
+        Ok(())
+    }
+
     fn island(&mut self, e: &Expr, dst: Reg) {
         idents_expr(e, &mut self.island_names);
         self.island_names.insert("arguments".into());
@@ -1059,20 +1239,21 @@ impl<'a> Compiler<'a> {
         if !def.arrow && mentions_arguments {
             self.uses_arguments = true;
             let n: Rc<str> = "arguments".into();
-            let b = self.declare(&n);
-            self.init_binding(&n, b, R_ARGUMENTS);
+            self.bind_fixed(&n, R_ARGUMENTS);
         }
         // A named function expression can refer to itself.
         if let Some(name) = &def.name {
             if !def.arrow {
-                let b = self.declare(name);
-                self.init_binding(name, b, R_CALLEE);
+                self.bind_fixed(name, R_CALLEE);
             }
         }
-        // Parameters.
+        // Parameters (simple ones live in their argument registers).
         for (i, p) in def.params.iter().enumerate() {
             let src = R_ARG0 + i as Reg;
-            self.bind_pattern(p, src, Some(VarKind::Let))?;
+            match p {
+                Pattern::Ident(n) => self.bind_fixed(n, src),
+                p => self.bind_pattern(p, src, Some(VarKind::Let))?,
+            }
         }
         if let Some(r) = &def.rest {
             self.bind_pattern(r, R_REST, Some(VarKind::Let))?;
@@ -1201,12 +1382,22 @@ impl<'a> Compiler<'a> {
     fn stmt_inner(&mut self, s: &'a Stmt) -> CResult {
         let label = self.pending_label.take();
         match s {
-            Stmt::Expr(e) => {
-                let r = self.reg();
-                self.expr(e, r)?;
-            }
+            Stmt::Expr(e) => self.expr_discard(e)?,
             Stmt::Var(kind, decls) => {
                 for (p, init) in decls {
+                    // `let x = e` straight into x's register.
+                    if let (Pattern::Ident(n), Some(e)) = (p, init) {
+                        if let Some(Binding::Reg(rx)) = self.lookup_local_decl(n, Some(*kind)) {
+                            if !reads(e, n) {
+                                self.expr(e, rx)?;
+                                if matches!(e, Expr::Func(_) | Expr::Class(_)) {
+                                    let name = self.name(n);
+                                    self.emit(Op::SetFnName { f: rx, name });
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     match init {
                         Some(e) => {
                             let r = self.reg();
@@ -1237,33 +1428,38 @@ impl<'a> Compiler<'a> {
                 self.init_binding(&n, b, r);
             }
             Stmt::Return(e) => {
-                let r = self.reg();
-                match e {
-                    Some(e) => self.expr(e, r)?,
-                    None => {
-                        self.emit(Op::Undef { dst: r });
+                // A finally block could change a variable: copy then.
+                let r = match e {
+                    Some(e) if self.fins.is_empty() => self.operand(e, &[])?,
+                    Some(e) => {
+                        let r = self.reg();
+                        self.expr(e, r)?;
+                        r
                     }
-                }
+                    None => {
+                        let r = self.reg();
+                        self.emit(Op::Undef { dst: r });
+                        r
+                    }
+                };
                 self.unwind_all()?;
                 self.emit(Op::Return { src: r });
             }
             Stmt::If(c, a, b) => {
-                let r = self.reg();
-                self.expr(c, r)?;
-                let j = self.emit(Op::JumpIfNot { cond: r, to: NONE });
+                let j = self.branch(c, false)?;
                 self.stmt(a)?;
                 match b {
                     Some(b) => {
                         let j2 = self.emit(Op::Jump { to: NONE });
                         let h = self.here();
-                        self.patch(j, h);
+                        self.patch_all(j, h);
                         self.stmt(b)?;
                         let h = self.here();
                         self.patch(j2, h);
                     }
                     None => {
                         let h = self.here();
-                        self.patch(j, h);
+                        self.patch_all(j, h);
                     }
                 }
             }
@@ -1280,13 +1476,11 @@ impl<'a> Compiler<'a> {
             Stmt::While(c, body) => {
                 let top = self.here();
                 self.push_ctl(label, true);
-                let r = self.reg();
-                self.expr(c, r)?;
-                let exit = self.emit(Op::JumpIfNot { cond: r, to: NONE });
+                let exit = self.branch(c, false)?;
                 self.stmt(body)?;
                 self.emit(Op::Loop { to: top });
                 let end = self.here();
-                self.patch(exit, end);
+                self.patch_all(exit, end);
                 self.pop_ctl(Some(top));
             }
             Stmt::DoWhile(body, c) => {
@@ -1294,10 +1488,11 @@ impl<'a> Compiler<'a> {
                 self.push_ctl(label, true);
                 self.stmt(body)?;
                 let cont = self.here();
-                let r = self.reg();
-                self.expr(c, r)?;
-                let j = self.emit(Op::JumpIf { cond: r, to: top });
-                let _ = j;
+                // Back edges tick (the script time limit).
+                let again = self.branch(c, false)?;
+                self.emit(Op::Loop { to: top });
+                let h = self.here();
+                self.patch_all(again, h);
                 self.pop_ctl(Some(cont));
             }
             Stmt::ForIn(init, obj, body) => self.for_each(label, init, obj, body, false)?,
@@ -1442,13 +1637,7 @@ impl<'a> Compiler<'a> {
         let top = self.here();
         self.push_ctl(label, true);
         let exit = match test {
-            Some(t) => {
-                let r = self.reg();
-                self.expr(t, r)?;
-                let j = self.emit(Op::JumpIfNot { cond: r, to: NONE });
-                self.next = r;
-                Some(j)
-            }
+            Some(t) => Some(self.branch(t, false)?),
             None => None,
         };
         self.stmt(body)?;
@@ -1457,14 +1646,12 @@ impl<'a> Compiler<'a> {
             self.emit(Op::CopyScope);
         }
         if let Some(u) = update {
-            let r = self.reg();
-            self.expr(u, r)?;
-            self.next = r;
+            self.expr_discard(u)?;
         }
         self.emit(Op::Loop { to: top });
         if let Some(j) = exit {
             let end = self.here();
-            self.patch(j, end);
+            self.patch_all(j, end);
         }
         self.pop_ctl(Some(cont));
         self.scopes.pop();
@@ -1717,7 +1904,8 @@ impl<'a> Compiler<'a> {
                     let ob = self.reg();
                     self.expr(o, ob)?;
                     let name = self.name(k);
-                    self.emit(Op::SetProp { obj: ob, name, src });
+                    let ic = self.ic_for(name);
+                    self.emit(Op::SetProp { obj: ob, name, src, ic });
                     Ok(())
                 }
                 Expr::Index(o, k, _) => {
@@ -1740,7 +1928,8 @@ impl<'a> Compiler<'a> {
                     match k {
                         PropKey::Name(n) => {
                             let name = self.name(n);
-                            self.emit(Op::GetProp { dst: v, obj: src, name });
+                            let ic = self.ic_for(name);
+                            self.emit(Op::GetProp { dst: v, obj: src, name, ic });
                         }
                         PropKey::Computed(e) => {
                             let kr = self.reg();
@@ -1925,7 +2114,8 @@ impl<'a> Compiler<'a> {
                             self.expr(ve, v)?;
                             let name = self.name(n);
                             let method = matches!(ve, Expr::Func(_) | Expr::Class(_));
-                            self.emit(Op::DefProp { obj: o, name, src: v, method });
+                            let ic = self.ic_for(name);
+                            self.emit(Op::DefProp { obj: o, name, src: v, method, ic });
                         }
                         PropDef::Value(PropKey::Computed(ke), ve) => {
                             self.expr(ke, kr)?;
@@ -2031,10 +2221,12 @@ impl<'a> Compiler<'a> {
                         self.expr(o, ob)?;
                         let name = self.name(k);
                         let old = self.reg();
-                        self.emit(Op::GetProp { dst: old, obj: ob, name });
+                        let ic = self.ic_for(name);
+                        self.emit(Op::GetProp { dst: old, obj: ob, name, ic });
                         let new = self.reg();
                         self.emit(Op::Step { dst: new, src: old, delta });
-                        self.emit(Op::SetProp { obj: ob, name, src: new });
+                        let ic = self.ic_for(name);
+                        self.emit(Op::SetProp { obj: ob, name, src: new, ic });
                         if *prefix {
                             self.emit(Op::Move { dst, src: new });
                         } else {
@@ -2062,10 +2254,20 @@ impl<'a> Compiler<'a> {
             }
             Expr::Binary(op, a, b) => match BinOp::from_str(op) {
                 Some(op) => {
-                    self.expr(a, dst)?;
-                    let rb = self.reg();
-                    self.expr(b, rb)?;
-                    self.emit(Op::Bin { op, dst, a: dst, b: rb });
+                    let ra = match self.var_reg(a) {
+                        Some(_) => self.operand(a, &[b])?,
+                        None => {
+                            self.expr(a, dst)?;
+                            dst
+                        }
+                    };
+                    if let Expr::Num(n) = &**b {
+                        let k = self.konst(Value::Num(*n));
+                        self.emit(Op::BinK { op, dst, a: ra, k });
+                        return Ok(());
+                    }
+                    let rb = self.operand(b, &[])?;
+                    self.emit(Op::Bin { op, dst, a: ra, b: rb });
                 }
                 None => self.island(e, dst),
             },
@@ -2081,12 +2283,11 @@ impl<'a> Compiler<'a> {
                 self.patch(j, h);
             }
             Expr::Cond(c, a, b) => {
-                self.expr(c, dst)?;
-                let j = self.emit(Op::JumpIfNot { cond: dst, to: NONE });
+                let j = self.branch(c, false)?;
                 self.expr(a, dst)?;
                 let j2 = self.emit(Op::Jump { to: NONE });
                 let h = self.here();
-                self.patch(j, h);
+                self.patch_all(j, h);
                 self.expr(b, dst)?;
                 let h = self.here();
                 self.patch(j2, h);
@@ -2151,34 +2352,59 @@ impl<'a> Compiler<'a> {
     fn chain(&mut self, e: &'a Expr, dst: Reg, this_out: Option<Reg>, exits: &mut Vec<usize>) -> CResult {
         match e {
             Expr::Member(o, k, opt) => {
-                let ob = this_out.unwrap_or_else(|| self.reg());
-                self.chain_part(o, ob, exits)?;
+                let ob = match (this_out, self.var_reg(o)) {
+                    (None, Some(r)) => r,
+                    (Some(t), _) => {
+                        self.chain_part(o, t, exits)?;
+                        t
+                    }
+                    (None, None) => {
+                        let t = self.reg();
+                        self.chain_part(o, t, exits)?;
+                        t
+                    }
+                };
                 if *opt {
                     exits.push(self.emit(Op::JumpIfNullish { src: ob, to: NONE }));
                 }
                 let name = self.name(k);
-                self.emit(Op::GetProp { dst, obj: ob, name });
+                let ic = self.ic_for(name);
+                self.emit(Op::GetProp { dst, obj: ob, name, ic });
             }
             Expr::Index(o, k, opt) => {
-                let ob = this_out.unwrap_or_else(|| self.reg());
-                self.chain_part(o, ob, exits)?;
+                let ob = match (this_out, self.var_reg(o)) {
+                    (None, Some(r)) if !matches!(&**o, Expr::Ident(n) if mutates(k, n)) => r,
+                    (Some(t), _) => {
+                        self.chain_part(o, t, exits)?;
+                        t
+                    }
+                    _ => {
+                        let t = self.reg();
+                        self.chain_part(o, t, exits)?;
+                        t
+                    }
+                };
                 if *opt {
                     exits.push(self.emit(Op::JumpIfNullish { src: ob, to: NONE }));
                 }
-                let kr = self.reg();
-                self.expr(k, kr)?;
+                let kr = self.operand(k, &[])?;
                 self.emit(Op::GetIndex { dst, obj: ob, key: kr });
             }
             Expr::Call(callee, args, opt) => {
-                let f = self.reg();
-                let this = self.reg();
-                match &**callee {
-                    Expr::Member(..) | Expr::Index(..) => self.chain(callee, f, Some(this), exits)?,
-                    _ => {
-                        self.chain_part(callee, f, exits)?;
-                        self.emit(Op::Undef { dst: this });
+                let (f, this) = match &**callee {
+                    Expr::Member(..) | Expr::Index(..) => {
+                        let f = self.reg();
+                        let this = self.reg();
+                        self.chain(callee, f, Some(this), exits)?;
+                        (f, this)
                     }
-                }
+                    Expr::Ident(n) if self.var_reg(callee).is_some() && !args.iter().any(|a| matches!(a, ArrItem::Item(e) | ArrItem::Spread(e) if mutates(e, n))) => (self.var_reg(callee).unwrap(), R_UNDEF),
+                    _ => {
+                        let f = self.reg();
+                        self.chain_part(callee, f, exits)?;
+                        (f, R_UNDEF)
+                    }
+                };
                 if *opt {
                     exits.push(self.emit(Op::JumpIfNullish { src: f, to: NONE }));
                 }
@@ -2278,7 +2504,8 @@ impl<'a> Compiler<'a> {
                 }
             },
             T::Prop(ob, name) => {
-                c.emit(Op::GetProp { dst: into, obj: *ob, name: *name });
+                let ic = c.ic_for(*name);
+                c.emit(Op::GetProp { dst: into, obj: *ob, name: *name, ic });
             }
             T::Index(ob, kr) => {
                 c.emit(Op::GetIndex { dst: into, obj: *ob, key: *kr });
@@ -2287,7 +2514,8 @@ impl<'a> Compiler<'a> {
         let write = |c: &mut Self, from: Reg| match &t {
             T::Name(n) => c.assign_name(n, from),
             T::Prop(ob, name) => {
-                c.emit(Op::SetProp { obj: *ob, name: *name, src: from });
+                let ic = c.ic_for(*name);
+                c.emit(Op::SetProp { obj: *ob, name: *name, src: from, ic });
             }
             T::Index(ob, kr) => {
                 c.emit(Op::SetIndex { obj: *ob, key: *kr, src: from });
@@ -2390,6 +2618,7 @@ pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
             failed: false,
             scope_pushed: Vec::new(),
             floor: 0,
+            nics: 0,
         };
         if c.function(def).is_err() || c.failed {
             return None;
@@ -2399,7 +2628,12 @@ pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
         if conflicts.is_empty() {
             let needs_env = nested || islands || env_names.iter().any(|n| c.reg_names.contains(n)) || !env_names.is_empty() || (!def.arrow && uses_this_or_super(def) && nested);
             return Some(Code {
-                def: def.clone(),
+                arrow: def.arrow,
+                strict: def.strict,
+                nparams: def.params.len(),
+                has_rest: def.rest.is_some(),
+                is_gen: def.is_gen,
+                is_async: def.is_async,
                 ops: c.ops,
                 consts: c.consts,
                 names: c.names,
@@ -2413,6 +2647,7 @@ pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
                 niters: c.max_iters,
                 needs_env,
                 uses_arguments: c.uses_arguments,
+                ics: (0..c.nics).map(|_| Ic::default()).collect(),
             });
         }
         let more = c.island_names.clone();
@@ -2435,16 +2670,11 @@ impl Interp {
     /// The VM code for a function, compiling it on first use (None: the
     /// tree-walking interpreter runs it).
     pub(crate) fn vm_code(&mut self, def: &Rc<FuncDef>) -> Option<Rc<Code>> {
-        let key = Rc::as_ptr(def) as usize;
-        let calls = match self.vm_cache.get_mut(&key) {
-            Some(VmEntry::Code(c)) => return c.clone(),
-            Some(VmEntry::Calls(n)) => {
+        let calls = match &mut *def.vm.borrow_mut() {
+            VmEntry::Code(c) => return c.clone(),
+            VmEntry::Calls(n) => {
                 *n += 1;
                 *n
-            }
-            None => {
-                self.vm_cache.insert(key, VmEntry::Calls(1));
-                1
             }
         };
         // Functions run once (module wrappers, setup code) aren't worth
@@ -2460,24 +2690,28 @@ impl Interp {
                 Some(c) => self.log(&format!("[vm] compiled {} in {us}us ({} ops, {} regs, env {}, islands {})", def.name.as_deref().unwrap_or("<anon>"), c.ops.len(), c.nregs, c.needs_env, c.exprs.len() + c.pats.len())),
                 None => self.log(&format!("[vm] fallback {}", def.name.as_deref().unwrap_or("<anon>"))),
             }
+            if let (Some(c), true) = (&code, std::env::var("BOLT_VM_TRACE").is_ok_and(|v| v == "2")) {
+                for (i, op) in c.ops.iter().enumerate() {
+                    eprintln!("[vm]   {i:4} {op:?}");
+                }
+            }
         }
-        self.vm_cache.insert(key, VmEntry::Code(code.clone()));
+        *def.vm.borrow_mut() = VmEntry::Code(code.clone());
         code
     }
 
     /// Run a compiled function.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn vm_call(&mut self, code: &Rc<Code>, closure_env: Env, this: Value, args: &[Value], fobj: Option<ObjRef>, home: Option<ObjRef>) -> R<Value> {
-        let def = &code.def;
-        let this = if def.arrow {
+        let this = if code.arrow {
             Value::Undef
-        } else if !def.strict && this.is_nullish() {
+        } else if !code.strict && this.is_nullish() {
             Value::Obj(self.global.clone())
         } else {
             this
         };
         let env = if code.needs_env {
-            if def.arrow {
+            if code.arrow {
                 new_scope(Some(closure_env), None, None, true)
             } else {
                 new_scope(Some(closure_env), Some(this.clone()), home.or(fobj.clone()), true)
@@ -2485,7 +2719,9 @@ impl Interp {
         } else {
             closure_env
         };
-        let mut regs = vec![Value::Undef; code.nregs];
+        // Register files and scope stacks are recycled between calls.
+        let mut regs = self.vm_pool.pop().unwrap_or_default();
+        regs.resize(code.nregs, Value::Undef);
         regs[R_THIS as usize] = this;
         if let Some(f) = &fobj {
             regs[R_CALLEE as usize] = Value::Obj(f.clone());
@@ -2493,17 +2729,32 @@ impl Interp {
         if code.uses_arguments {
             regs[R_ARGUMENTS as usize] = self.array(args.to_vec());
         }
-        let np = def.params.len();
+        let np = code.nparams;
         for (i, a) in args.iter().take(np).enumerate() {
             regs[R_ARG0 as usize + i] = a.clone();
         }
-        if def.rest.is_some() {
+        if code.has_rest {
             regs[R_REST as usize] = self.array(args.get(np..).map(|s| s.to_vec()).unwrap_or_default());
         }
-        let mut f = Frame { regs, envs: vec![env], handlers: Vec::new(), iters: (0..code.niters).map(|_| None).collect() };
+        let mut envs = self.vm_env_pool.pop().unwrap_or_default();
+        envs.push(env);
+        let iters = if code.niters == 0 { Vec::new() } else { (0..code.niters).map(|_| None).collect() };
+        let mut f = Frame { regs, envs, handlers: Vec::new(), iters };
+        let r = self.vm_frame(code, &mut f);
+        let Frame { mut regs, mut envs, .. } = f;
+        regs.clear();
+        envs.clear();
+        if self.vm_pool.len() < 256 {
+            self.vm_pool.push(regs);
+            self.vm_env_pool.push(envs);
+        }
+        r
+    }
+
+    fn vm_frame(&mut self, code: &Rc<Code>, f: &mut Frame) -> R<Value> {
         let mut ip = 0usize;
         loop {
-            match self.vm_run(code, &mut f, &mut ip) {
+            match self.vm_run(code, f, &mut ip) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
                     if self.terminating {
@@ -2568,6 +2819,35 @@ impl Interp {
                     };
                     f.regs[dst as usize] = v;
                 }
+                Op::BinK { op, dst, a, k } => {
+                    let v = match (&f.regs[a as usize], &code.consts[k as usize]) {
+                        (Value::Num(x), Value::Num(y)) => match num_bin(op, *x, *y) {
+                            Some(v) => v,
+                            None => {
+                                let (x, y) = (f.regs[a as usize].clone(), code.consts[k as usize].clone());
+                                self.binary(op.as_str(), &x, &y)?
+                            }
+                        },
+                        _ => {
+                            let (x, y) = (f.regs[a as usize].clone(), code.consts[k as usize].clone());
+                            self.binary(op.as_str(), &x, &y)?
+                        }
+                    };
+                    f.regs[dst as usize] = v;
+                }
+                Op::CmpJumpK { op, a, k, to, when } => {
+                    let t = match (&f.regs[a as usize], &code.consts[k as usize]) {
+                        (Value::Num(x), Value::Num(y)) => num_cmp(op, *x, *y),
+                        (x, y) if matches!(op, BinOp::StrictEq | BinOp::StrictNe) => strict_eq(x, y) == (op == BinOp::StrictEq),
+                        _ => {
+                            let (x, y) = (f.regs[a as usize].clone(), code.consts[k as usize].clone());
+                            self.binary(op.as_str(), &x, &y)?.truthy()
+                        }
+                    };
+                    if t == when {
+                        *ip = to as usize;
+                    }
+                }
                 Op::Bin { op, dst, a, b } => {
                     let v = match (&f.regs[a as usize], &f.regs[b as usize]) {
                         (Value::Num(x), Value::Num(y)) => {
@@ -2577,7 +2857,7 @@ impl Interp {
                                 BinOp::Sub => Value::Num(x - y),
                                 BinOp::Mul => Value::Num(x * y),
                                 BinOp::Div => Value::Num(x / y),
-                                BinOp::Mod => Value::Num(x % y),
+                                BinOp::Mod => Value::Num(js_mod(x, y)),
                                 BinOp::Lt => Value::Bool(x < y),
                                 BinOp::Gt => Value::Bool(x > y),
                                 BinOp::Le => Value::Bool(x <= y),
@@ -2677,19 +2957,69 @@ impl Interp {
                         *ip = to as usize;
                     }
                 }
+                Op::CmpJump { op, a, b, to, when } => {
+                    let t = match (&f.regs[a as usize], &f.regs[b as usize]) {
+                        (Value::Num(x), Value::Num(y)) => num_cmp(op, *x, *y),
+                        (x, y) if matches!(op, BinOp::StrictEq | BinOp::StrictNe) => strict_eq(x, y) == (op == BinOp::StrictEq),
+                        _ => {
+                            let (x, y) = (f.regs[a as usize].clone(), f.regs[b as usize].clone());
+                            self.binary(op.as_str(), &x, &y)?.truthy()
+                        }
+                    };
+                    if t == when {
+                        *ip = to as usize;
+                    }
+                }
                 Op::JumpIfNotUndef { src, to } => {
                     if !matches!(f.regs[src as usize], Value::Undef) {
                         *ip = to as usize;
                     }
                 }
-                Op::GetProp { dst, obj, name } => {
+                Op::GetProp { dst, obj, name, ic } => {
+                    if ic != NO_IC {
+                        if let Value::Obj(o) = &f.regs[obj as usize] {
+                            match ic_get(o, &code.ics[ic as usize]) {
+                                IcHit::Value(v) => {
+                                    f.regs[dst as usize] = v;
+                                    continue;
+                                }
+                                IcHit::Getter(g) => {
+                                    let o = f.regs[obj as usize].clone();
+                                    f.regs[dst as usize] = self.call(&g, o, &[])?;
+                                    continue;
+                                }
+                                IcHit::Miss => {}
+                            }
+                        }
+                    }
                     let o = f.regs[obj as usize].clone();
-                    f.regs[dst as usize] = self.get(&o, &code.names[name as usize])?;
+                    let key = &code.names[name as usize];
+                    f.regs[dst as usize] = self.get(&o, key)?;
+                    if ic != NO_IC {
+                        if let Value::Obj(o) = &o {
+                            ic_fill_get(o, key, &code.ics[ic as usize]);
+                        }
+                    }
                 }
-                Op::SetProp { obj, name, src } => {
+                Op::SetProp { obj, name, src, ic } => {
+                    if ic != NO_IC {
+                        if let Value::Obj(o) = &f.regs[obj as usize] {
+                            if ic_set(o, &code.ics[ic as usize], &f.regs[src as usize]) {
+                                continue;
+                            }
+                        }
+                    }
                     let o = f.regs[obj as usize].clone();
                     let v = f.regs[src as usize].clone();
-                    self.put(&o, &code.names[name as usize], v)?;
+                    let key = &code.names[name as usize];
+                    let before = match &o {
+                        Value::Obj(ob) if ic != NO_IC => Some(ob.borrow().props.shape_id()),
+                        _ => None,
+                    };
+                    self.put(&o, key, v)?;
+                    if let (Some(before), Value::Obj(ob)) = (before, &o) {
+                        ic_fill_set(ob, key, before, &code.ics[ic as usize]);
+                    }
                 }
                 Op::GetIndex { dst, obj, key } => {
                     let o = f.regs[obj as usize].clone();
@@ -2713,13 +3043,25 @@ impl Interp {
                     f.regs[dst as usize] = Value::Bool(self.delete(&o, &k));
                 }
                 Op::Call { dst, f: fr, this, args, argc } => {
+                    // Compiled closure → compiled closure, skipping the
+                    // generic call path.
+                    if let Some((callee, env, home, fo)) = vm_callee(&f.regs[fr as usize]) {
+                        if self.depth < if self.co_stack.is_empty() { MAX_DEPTH } else { coro::MAX_DEPTH } && !prof::on() && !trace_on() && !trace_throw_on() {
+                            self.tick()?;
+                            self.depth += 1;
+                            let th = f.regs[this as usize].clone();
+                            let r = self.vm_call(&callee, env, th, &f.regs[args as usize..args as usize + argc as usize], Some(fo), home);
+                            self.depth -= 1;
+                            f.regs[dst as usize] = r?;
+                            continue;
+                        }
+                    }
                     let func = f.regs[fr as usize].clone();
                     if !Self::is_callable(&func) {
                         return Err(type_error(format!("{} is not a function", Self::vm_describe(&func))));
                     }
                     let th = f.regs[this as usize].clone();
-                    let a = f.regs[args as usize..args as usize + argc as usize].to_vec();
-                    let v = self.call(&func, th, &a)?;
+                    let v = self.call(&func, th, &f.regs[args as usize..args as usize + argc as usize])?;
                     f.regs[dst as usize] = v;
                 }
                 Op::CallArr { dst, f: fr, this, arr } => {
@@ -2737,8 +3079,8 @@ impl Interp {
                     if !Self::is_callable(&func) {
                         return Err(type_error("not a constructor"));
                     }
-                    let a = f.regs[args as usize..args as usize + argc as usize].to_vec();
-                    f.regs[dst as usize] = self.construct(&func, &a)?;
+                    let v = self.construct(&func, &f.regs[args as usize..args as usize + argc as usize])?;
+                    f.regs[dst as usize] = v;
                 }
                 Op::NewArr { dst, f: fr, arr } => {
                     let func = f.regs[fr as usize].clone();
@@ -2777,10 +3119,40 @@ impl Interp {
                     }
                 }
                 Op::Object { dst } => f.regs[dst as usize] = Value::Obj(self.plain()),
-                Op::DefProp { obj, name, src, method } => {
+                Op::DefProp { obj, name, src, method, ic } => {
+                    // Object literals: the same literal makes the same shapes.
+                    if !method && ic != NO_IC {
+                        if let Value::Obj(o) = &f.regs[obj as usize] {
+                            let icr = &code.ics[ic as usize];
+                            let mut ob = o.borrow_mut();
+                            if ob.props.shape_id() == icr.ids[0].get() {
+                                if let Some(sh) = icr.add.borrow().clone() {
+                                    ob.props.push_with_shape(sh, Prop::data(f.regs[src as usize].clone()));
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     let key = code.names[name as usize].clone();
                     let v = f.regs[src as usize].clone();
-                    self.vm_def_prop(&f.regs[obj as usize].clone(), key, v, method);
+                    let o = f.regs[obj as usize].clone();
+                    let before = match &o {
+                        Value::Obj(ob) => ob.borrow().props.shape_id(),
+                        _ => 0,
+                    };
+                    self.vm_def_prop(&o, key.clone(), v, method);
+                    if ic != NO_IC && &*key != "__proto__" {
+                        if let Value::Obj(ob) = &o {
+                            let b = ob.borrow();
+                            let n = b.props.len();
+                            // Cache only a fresh key added along a shared transition.
+                            if before != b.props.shape_id() && b.props.shape().is_shared() && n > 0 && b.props.find(&key) == Some(n - 1) {
+                                let icr = &code.ics[ic as usize];
+                                icr.ids[0].set(before);
+                                *icr.add.borrow_mut() = Some(b.props.shape().clone());
+                            }
+                        }
+                    }
                 }
                 Op::DefPropKey { obj, key, src, method } => {
                     let k = f.regs[key as usize].clone();
@@ -2853,8 +3225,8 @@ impl Interp {
                 }
                 Op::Island { dst, expr } => {
                     let env = Self::vm_env(f).clone();
-                    // SAFETY: the expression belongs to `code.def`, which
-                    // `code` keeps alive.
+                    // SAFETY: the expression belongs to the function
+                    // definition, which owns `code`.
                     let e = unsafe { &*code.exprs[expr as usize] };
                     f.regs[dst as usize] = self.eval(e, &env)?;
                 }
@@ -3078,6 +3450,18 @@ pub enum VmEntry {
     Code(Option<Rc<Code>>),
 }
 
+impl Default for VmEntry {
+    fn default() -> VmEntry {
+        VmEntry::Calls(0)
+    }
+}
+
+impl std::fmt::Debug for VmEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("VmEntry")
+    }
+}
+
 /// `BOLT_VM_TRACE=1` logs each function's compilation.
 pub fn vm_trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3088,4 +3472,276 @@ pub fn vm_trace() -> bool {
 pub fn vm_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("BOLT_VM").map_or(true, |v| v != "0"))
+}
+
+// ------------------------------------------------------------------ inline caches
+
+enum IcHit {
+    Value(Value),
+    Getter(Value),
+    Miss,
+}
+
+/// Object kinds whose named properties are plain own / prototype lookups
+/// (no DOM bindings, proxies or typed-array views).
+#[inline]
+fn ic_kind_ok(k: &Kind) -> bool {
+    matches!(k, Kind::Plain | Kind::Func(_) | Kind::Error | Kind::Date(_) | Kind::Regex(_) | Kind::Map(_) | Kind::Set(_) | Kind::Promise(_) | Kind::Array(_))
+}
+
+#[inline]
+fn ic_read(p: &Prop) -> IcHit {
+    match (&p.get, &p.set) {
+        (None, None) => IcHit::Value(p.v.clone()),
+        (Some(g), _) => IcHit::Getter(g.clone()),
+        (None, Some(_)) => IcHit::Value(Value::Undef),
+    }
+}
+
+#[inline]
+fn ic_get(o: &ObjRef, ic: &Ic) -> IcHit {
+    let ob = o.borrow();
+    if ob.props.shape_id() != ic.ids[0].get() || !ic_kind_ok(&ob.kind) {
+        return IcHit::Miss;
+    }
+    let slot = ic.slot.get() as usize;
+    match ic.depth.get() {
+        0 => ic_read(ob.props.slot(slot)),
+        1 => {
+            let Some(p) = &ob.proto else { return IcHit::Miss };
+            let pb = p.borrow();
+            if pb.props.shape_id() != ic.ids[1].get() {
+                return IcHit::Miss;
+            }
+            ic_read(pb.props.slot(slot))
+        }
+        2 => {
+            let Some(p) = &ob.proto else { return IcHit::Miss };
+            let pb = p.borrow();
+            if pb.props.shape_id() != ic.ids[1].get() {
+                return IcHit::Miss;
+            }
+            let Some(p2) = &pb.proto else { return IcHit::Miss };
+            let p2b = p2.borrow();
+            if p2b.props.shape_id() != ic.ids[2].get() {
+                return IcHit::Miss;
+            }
+            ic_read(p2b.props.slot(slot))
+        }
+        _ => IcHit::Miss,
+    }
+}
+
+/// After a slow lookup: remember where `key` was found (own, or up to two
+/// prototypes up).
+fn ic_fill_get(o: &ObjRef, key: &str, ic: &Ic) {
+    let ob = o.borrow();
+    if !ic_kind_ok(&ob.kind) {
+        return;
+    }
+    let id0 = ob.props.shape_id();
+    if let Some(i) = ob.props.find(key) {
+        ic.ids[0].set(id0);
+        ic.slot.set(i as u32);
+        ic.depth.set(0);
+        return;
+    }
+    let Some(p) = ob.proto.clone() else { return };
+    let pb = p.borrow();
+    let id1 = pb.props.shape_id();
+    if let Some(i) = pb.props.find(key) {
+        ic.ids[0].set(id0);
+        ic.ids[1].set(id1);
+        ic.slot.set(i as u32);
+        ic.depth.set(1);
+        return;
+    }
+    let Some(p2) = pb.proto.clone() else { return };
+    let p2b = p2.borrow();
+    if let Some(i) = p2b.props.find(key) {
+        ic.ids[0].set(id0);
+        ic.ids[1].set(id1);
+        ic.ids[2].set(p2b.props.shape_id());
+        ic.slot.set(i as u32);
+        ic.depth.set(2);
+    }
+}
+
+#[inline]
+fn ic_set_kind_ok(k: &Kind) -> bool {
+    matches!(k, Kind::Plain | Kind::Func(_) | Kind::Error | Kind::Date(_) | Kind::Regex(_) | Kind::Map(_) | Kind::Set(_) | Kind::Promise(_))
+}
+
+/// A cached store: an existing own data property, or an add along a cached
+/// shape transition (no prototype has the key). False: take the slow path.
+#[inline]
+fn ic_set(o: &ObjRef, ic: &Ic, v: &Value) -> bool {
+    let mut ob = o.borrow_mut();
+    if ob.props.shape_id() != ic.ids[0].get() || !ic_set_kind_ok(&ob.kind) {
+        return false;
+    }
+    match ic.depth.get() {
+        IC_OWN => {
+            let p = ob.props.slot_mut(ic.slot.get() as usize);
+            if p.get.is_some() || p.set.is_some() {
+                return false;
+            }
+            p.v = v.clone();
+            true
+        }
+        d @ IC_ADD..=4 => {
+            // The prototypes must still be the ones that lacked the key.
+            let n = (d - IC_ADD) as usize;
+            let mut cur = ob.proto.clone();
+            for i in 0..n {
+                let Some(p) = cur else { return false };
+                let next = {
+                    let pb = p.borrow();
+                    if pb.props.shape_id() != ic.ids[1 + i].get() {
+                        return false;
+                    }
+                    pb.proto.clone()
+                };
+                cur = next;
+            }
+            if cur.is_some() {
+                return false;
+            }
+            let Some(sh) = ic.add.borrow().clone() else { return false };
+            ob.props.push_with_shape(sh, Prop::data(v.clone()));
+            true
+        }
+        _ => false,
+    }
+}
+
+/// After a slow store: cache it if it hit an own data property or added the
+/// key along a shared shape transition.
+fn ic_fill_set(o: &ObjRef, key: &str, before: u64, ic: &Ic) {
+    let ob = o.borrow();
+    if !ic_set_kind_ok(&ob.kind) {
+        return;
+    }
+    let Some(i) = ob.props.find(key) else { return };
+    if ob.props.shape_id() == before {
+        let p = ob.props.slot(i);
+        if p.get.is_none() && p.set.is_none() {
+            ic.ids[0].set(before);
+            ic.slot.set(i as u32);
+            ic.depth.set(IC_OWN);
+        }
+        return;
+    }
+    // An add: the new key is last, the shape shared, and no prototype
+    // (at most three) has the key.
+    if i + 1 != ob.props.len() || !ob.props.shape().is_shared() {
+        return;
+    }
+    let mut ids = [0u64; 3];
+    let mut n = 0;
+    let mut cur = ob.proto.clone();
+    while let Some(p) = cur {
+        if n == 3 {
+            return;
+        }
+        let next = {
+            let pb = p.borrow();
+            if pb.props.find(key).is_some() || matches!(pb.kind, Kind::Proxy(_)) {
+                return;
+            }
+            ids[n] = pb.props.shape_id();
+            pb.proto.clone()
+        };
+        n += 1;
+        cur = next;
+    }
+    ic.ids[0].set(before);
+    for (j, id) in ids.iter().enumerate().take(n) {
+        ic.ids[1 + j].set(*id);
+    }
+    ic.depth.set(IC_ADD + n as u8);
+    *ic.add.borrow_mut() = Some(ob.props.shape().clone());
+}
+
+/// A closure whose code is compiled (not a generator / async function):
+/// what a direct VM call needs.
+#[inline]
+fn vm_callee(v: &Value) -> Option<(Rc<Code>, Env, Option<ObjRef>, ObjRef)> {
+    let Value::Obj(o) = v else { return None };
+    let ob = o.borrow();
+    let Kind::Func(Func::Closure { def, env, home, .. }) = &ob.kind else { return None };
+    let VmEntry::Code(Some(code)) = &*def.vm.borrow() else { return None };
+    if code.is_gen || code.is_async {
+        return None;
+    }
+    Some((code.clone(), env.clone(), home.clone(), o.clone()))
+}
+
+/// Does evaluating `e` assign the variable `n` (not counting nested
+/// functions, which can't reach register variables)?
+fn mutates(e: &Expr, n: &str) -> bool {
+    match e {
+        Expr::Assign(_, p, v) => {
+            let mut ids = FxHashSet::default();
+            idents_pat(p, &mut ids);
+            ids.contains(n) || mutates(v, n)
+        }
+        Expr::Update { target, .. } => matches!(&**target, Expr::Ident(x) if &**x == n) || mutates(target, n),
+        _ => {
+            let mut found = false;
+            walk_expr_children(e, &mut |c| found = found || mutates(c, n));
+            found
+        }
+    }
+}
+
+/// Does `e` mention the variable `n` at all?
+fn reads(e: &Expr, n: &str) -> bool {
+    let mut ids = FxHashSet::default();
+    idents_expr(e, &mut ids);
+    ids.contains(n)
+}
+
+#[inline]
+fn num_cmp(op: BinOp, x: f64, y: f64) -> bool {
+    match op {
+        BinOp::Lt => x < y,
+        BinOp::Gt => x > y,
+        BinOp::Le => x <= y,
+        BinOp::Ge => x >= y,
+        BinOp::Eq | BinOp::StrictEq => x == y,
+        _ => x != y,
+    }
+}
+
+/// `%` with an integer fast path (fmod is slow).
+#[inline]
+fn js_mod(x: f64, y: f64) -> f64 {
+    if x >= 0.0 && x.is_sign_positive() && y > 0.0 && x <= 9007199254740991.0 && y <= 9007199254740991.0 {
+        let (xi, yi) = (x as u64, y as u64);
+        if xi as f64 == x && yi as f64 == y {
+            return (xi % yi) as f64;
+        }
+    }
+    x % y
+}
+
+/// Number-number binary operators (None: not a numeric operator).
+#[inline]
+fn num_bin(op: BinOp, x: f64, y: f64) -> Option<Value> {
+    Some(match op {
+        BinOp::Add => Value::Num(x + y),
+        BinOp::Sub => Value::Num(x - y),
+        BinOp::Mul => Value::Num(x * y),
+        BinOp::Div => Value::Num(x / y),
+        BinOp::Mod => Value::Num(js_mod(x, y)),
+        BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge | BinOp::Eq | BinOp::StrictEq | BinOp::Ne | BinOp::StrictNe => Value::Bool(num_cmp(op, x, y)),
+        BinOp::BitAnd => Value::Num((to_i32(x) & to_i32(y)) as f64),
+        BinOp::BitOr => Value::Num((to_i32(x) | to_i32(y)) as f64),
+        BinOp::BitXor => Value::Num((to_i32(x) ^ to_i32(y)) as f64),
+        BinOp::Shl => Value::Num(to_i32(x).wrapping_shl(to_i32(y) as u32 & 31) as f64),
+        BinOp::Shr => Value::Num((to_i32(x) >> (to_i32(y) as u32 & 31)) as f64),
+        BinOp::UShr => Value::Num(((to_i32(x) as u32) >> (to_i32(y) as u32 & 31)) as f64),
+        _ => return None,
+    })
 }

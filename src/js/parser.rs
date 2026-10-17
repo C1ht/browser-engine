@@ -91,6 +91,8 @@ pub struct FuncDef {
     pub is_gen: bool,
     /// Strict mode code (`this` isn't coerced to the global object).
     pub strict: bool,
+    /// Bytecode compiled for this function (see `vm.rs`).
+    pub vm: std::cell::RefCell<super::vm::VmEntry>,
 }
 
 #[derive(Debug)]
@@ -893,13 +895,13 @@ impl Parser {
         };
         let (params, rest) = self.params()?;
         let (body, strict) = self.func_body(is_gen)?;
-        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen, strict }))
+        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen, strict, vm: Default::default() }))
     }
 
     fn method(&mut self, name: Option<Name>, is_async: bool, is_gen: bool) -> PResult<Rc<FuncDef>> {
         let (params, rest) = self.params()?;
         let (body, strict) = self.func_body(is_gen)?;
-        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen, strict }))
+        Ok(Rc::new(FuncDef { name, params, rest, body: Body::Block(body), arrow: false, is_async, is_gen, strict, vm: Default::default() }))
     }
 
     fn class_rest(&mut self, need_name: bool) -> PResult<Rc<ClassDef>> {
@@ -935,7 +937,7 @@ impl Parser {
                     // static initialization block: run as a static method-less field
                     self.next();
                     let body = self.block_body()?;
-                    let f = Rc::new(FuncDef { name: None, params: vec![], rest: None, body: Body::Block(body), arrow: false, is_async: false, is_gen: false, strict: true });
+                    let f = Rc::new(FuncDef { name: None, params: vec![], rest: None, body: Body::Block(body), arrow: false, is_async: false, is_gen: false, strict: true, vm: Default::default() });
                     cd.fields.push((true, PropKey::Name("".into()), Some(Expr::Call(Box::new(Expr::Func(f)), vec![], false))));
                     continue;
                 }
@@ -1010,7 +1012,7 @@ impl Parser {
         } else {
             Body::Expr(self.assign(false)?)
         };
-        Ok(Expr::Func(Rc::new(FuncDef { name: None, params, rest, body, arrow: true, is_async, is_gen: false, strict: self.strict })))
+        Ok(Expr::Func(Rc::new(FuncDef { name: None, params, rest, body, arrow: true, is_async, is_gen: false, strict: self.strict, vm: Default::default() })))
     }
 
     fn assign(&mut self, no_in: bool) -> PResult<Expr> {

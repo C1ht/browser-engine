@@ -20,6 +20,7 @@ pub mod parser;
 pub mod regex;
 pub mod web;
 pub mod vm;
+pub mod shape;
 
 use crate::dom::{Document, NodeId};
 use crate::fx::FxHashMap;
@@ -127,51 +128,7 @@ impl Prop {
     }
 }
 
-/// Insertion-ordered property map (linear for small objects, indexed when large).
-#[derive(Default, Clone)]
-pub struct Props {
-    pub list: Vec<(Rc<str>, Prop)>,
-    index: Option<FxHashMap<Rc<str>, usize>>,
-}
-
-impl Props {
-    pub fn find(&self, k: &str) -> Option<usize> {
-        match &self.index {
-            Some(ix) => ix.get(k).copied(),
-            None => self.list.iter().position(|(n, _)| &**n == k),
-        }
-    }
-    pub fn get(&self, k: &str) -> Option<&Prop> {
-        self.find(k).map(|i| &self.list[i].1)
-    }
-    pub fn get_mut(&mut self, k: &str) -> Option<&mut Prop> {
-        self.find(k).map(move |i| &mut self.list[i].1)
-    }
-    pub fn insert(&mut self, k: Rc<str>, p: Prop) {
-        if let Some(i) = self.find(&k) {
-            self.list[i].1 = p;
-            return;
-        }
-        if let Some(ix) = &mut self.index {
-            ix.insert(k.clone(), self.list.len());
-        }
-        self.list.push((k, p));
-        if self.index.is_none() && self.list.len() > 12 {
-            self.index = Some(self.list.iter().enumerate().map(|(i, (k, _))| (k.clone(), i)).collect());
-        }
-    }
-    pub fn remove(&mut self, k: &str) -> bool {
-        if let Some(i) = self.find(k) {
-            self.list.remove(i);
-            if self.index.is_some() {
-                self.index = Some(self.list.iter().enumerate().map(|(i, (k, _))| (k.clone(), i)).collect());
-            }
-            true
-        } else {
-            false
-        }
-    }
-}
+pub use shape::Props;
 
 pub enum PromiseState {
     Pending(Vec<(Value, Value, ObjRef)>),
@@ -512,9 +469,9 @@ pub struct Interp {
     pub submit_form: Option<NodeId>,
     /// fetch / XMLHttpRequest requests in flight.
     pub requests: Vec<web::Pending>,
-    /// Bytecode for functions run by the VM, by FuncDef address (None:
-    /// the tree-walking interpreter runs it).
-    pub vm_cache: FxHashMap<usize, vm::VmEntry>,
+    /// Recycled VM register files / scope stacks.
+    pub vm_pool: Vec<Vec<Value>>,
+    pub vm_env_pool: Vec<Vec<Env>>,
 }
 
 pub const WINDOW: u32 = u32::MAX - 1;
@@ -601,7 +558,8 @@ impl Interp {
             co_stack: Vec::new(),
             script_running: 0,
             terminating: false,
-            vm_cache: FxHashMap::default(),
+            vm_pool: Vec::new(),
+            vm_env_pool: Vec::new(),
             images: FxHashMap::default(),
             img_fired: FxHashMap::default(),
             script_queue: Default::default(),
@@ -1107,7 +1065,7 @@ impl Interp {
                     Kind::Typed(t) => out.extend((0..t.len).map(|i| Rc::from(i.to_string()))),
                     _ => {}
                 }
-                out.extend(ob.props.list.iter().filter(|(k, p)| p.enumerable && !k.starts_with("@@")).map(|(k, _)| k.clone()));
+                out.extend(ob.props.iter().filter(|(k, p)| p.enumerable && !k.starts_with("@@")).map(|(k, _)| k.clone()));
                 out
             }
             _ => Vec::new(),
@@ -1145,7 +1103,6 @@ impl Interp {
                 }
                 out.extend(
                     ob.props
-                        .list
                         .iter()
                         .filter(|(k, _)| if symbols { is_symbol(k) } else { !k.starts_with("@@") })
                         .map(|(k, _)| k.clone()),
@@ -1389,7 +1346,7 @@ impl Interp {
                     let node = if let Kind::Node(n) = kind { Some(n) } else { None };
                     {
                         let mut d = dst.borrow_mut();
-                        for (k, p) in props.list {
+                        for (k, p) in props.into_entries() {
                             d.props.insert(k, p);
                         }
                         d.kind = kind;
@@ -1916,7 +1873,7 @@ impl Interp {
         if let Value::Obj(ob) = o {
             let mut cur = ob.borrow().proto.clone();
             while let Some(p) = cur {
-                let inherited: Vec<Rc<str>> = p.borrow().props.list.iter().filter(|(k, pr)| pr.enumerable && !k.starts_with("@@")).map(|(k, _)| k.clone()).collect();
+                let inherited: Vec<Rc<str>> = p.borrow().props.iter().filter(|(k, pr)| pr.enumerable && !k.starts_with("@@")).map(|(k, _)| k.clone()).collect();
                 for k in inherited {
                     if !keys.contains(&k) {
                         keys.push(k);
@@ -2447,7 +2404,7 @@ impl Interp {
                     }
                     if trace_on() {
                         let keys: Vec<String> = match &ov {
-                            Value::Obj(ob) => ob.borrow().props.list.iter().take(12).map(|(k, _)| k.to_string()).collect(),
+                            Value::Obj(ob) => ob.borrow().props.iter().take(12).map(|(k, _)| k.to_string()).collect(),
                             _ => Vec::new(),
                         };
                         let ctor = self.get(&ov, "constructor").ok().and_then(|c| self.get(&c, "name").ok()).unwrap_or_default();
