@@ -742,9 +742,10 @@ impl<'a> Engine<'a> {
                     k::iframe | k::video | k::canvas | k::embed | k::object => (300.0, 150.0),
                     _ => (0.0, 0.0),
                 };
-                let img = if tag == k::img || tag == k::svg { self.res.img(c).cloned() } else { None };
+                let img = if tag == k::img || tag == k::svg || tag == k::iframe { self.res.img(c).cloned() } else { None };
                 let b = &mut self.boxes[bx as usize];
-                b.repl = img.as_ref().map_or(size, |i| (i.iw, i.ih));
+                // (An iframe's size doesn't come from its document.)
+                b.repl = if tag == k::iframe { size } else { img.as_ref().map_or(size, |i| (i.iw, i.ih)) };
                 b.fluid = img.as_ref().is_some_and(|i| i.fluid);
                 b.img = tag == k::img;
                 b.image = img;

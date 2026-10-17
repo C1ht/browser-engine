@@ -452,7 +452,7 @@ pub const INITIAL: Style = Style {
     valign: VAlign::Baseline,
     border_box: false,
     collapse: false,
-    spacing: 2.0,
+    spacing: 0.0,
     width: Len::Auto,
     height: Len::Auto,
     min_w: Len::Px(0.0),

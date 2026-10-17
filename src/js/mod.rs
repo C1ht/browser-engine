@@ -22,6 +22,7 @@ pub mod web;
 pub mod vm;
 pub mod shape;
 pub mod jit;
+pub mod messaging;
 
 use crate::dom::{Document, NodeId};
 use crate::fx::FxHashMap;
@@ -533,6 +534,10 @@ pub struct Interp {
     pub submit_form: Option<NodeId>,
     /// fetch / XMLHttpRequest requests in flight.
     pub requests: Vec<web::Pending>,
+    /// MessagePorts this interpreter receives messages for.
+    pub owned_ports: crate::fx::FxHashSet<u64>,
+    /// Window messages to other frames, moved by the page.
+    pub frame_outbox: Vec<messaging::FrameMsg>,
     /// Recycled VM register files / scope stacks.
     pub vm_pool: Vec<Vec<Value>>,
     pub vm_env_pool: Vec<Vec<Env>>,
@@ -623,6 +628,8 @@ impl Interp {
             script_running: 0,
             terminating: false,
             vm_pool: Vec::new(),
+            owned_ports: Default::default(),
+            frame_outbox: Vec::new(),
             vm_env_pool: Vec::new(),
             images: FxHashMap::default(),
             img_fired: FxHashMap::default(),
@@ -645,6 +652,7 @@ impl Interp {
         observe::install(&mut it);
         custom::install(&mut it);
         web::install(&mut it);
+        messaging::install(&mut it);
         if let Err(e) = it.run_script(include_str!("prelude.js")) {
             eprintln!("js prelude: {e}");
         }
@@ -2306,6 +2314,36 @@ impl Interp {
                 }
             }
             Expr::Update { op, prefix, target } => {
+                // Member targets: object and key evaluated once (`f().x++`,
+                // `a[i++]++`).
+                let member = match &**target {
+                    Expr::Member(o, k, _) if !matches!(**o, Expr::Super) => Some((o, Some(Value::Str(k.clone())), None)),
+                    Expr::Index(o, k, _) => Some((o, None, Some(k))),
+                    _ => None,
+                };
+                if let Some((o, key, key_expr)) = member {
+                    let ov = self.eval(o, env)?;
+                    let kv = match (key, key_expr) {
+                        (Some(k), _) => k,
+                        (None, Some(k)) => self.eval(k, env)?,
+                        _ => Value::Undef,
+                    };
+                    let old = self.get_v(&ov, &kv)?;
+                    let (new, ret) = match old {
+                        Value::BigInt(b) => {
+                            let b = b.get();
+                            let n = if *op == "++" { b.checked_add(1) } else { b.checked_sub(1) }.ok_or_else(bigint::too_big)?;
+                            (Value::big(n), Value::big(if *prefix { n } else { b }))
+                        }
+                        v => {
+                            let n = self.to_num(&v)?;
+                            let new = if *op == "++" { n + 1.0 } else { n - 1.0 };
+                            (Value::Num(new), Value::Num(if *prefix { new } else { n }))
+                        }
+                    };
+                    self.put_v(&ov, &kv, new)?;
+                    return Ok(ret);
+                }
                 let old = self.eval(target, env)?;
                 if let Value::BigInt(b) = old {
                     let b = b.get();
@@ -2818,7 +2856,12 @@ impl Interp {
         self.now = now;
         let mut ran = 0;
         for _ in 0..1000 {
+            // MessagePort messages are tasks too.
+            let polled = self.poll_ports();
             let Some(idx) = self.timers.iter().enumerate().filter(|(_, t)| t.at <= now).min_by(|a, b| a.1.at.partial_cmp(&b.1.at).unwrap()).map(|(i, _)| i) else {
+                if polled {
+                    continue;
+                }
                 break;
             };
             let t = &mut self.timers[idx];

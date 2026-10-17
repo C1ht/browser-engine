@@ -275,6 +275,7 @@ pub fn load(url: &str) -> Result<Loaded, String> {
 pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
     let t = Instant::now();
     let (url, html) = match url {
+        "about:srcdoc" => (url.to_owned(), post.unwrap_or("").to_owned()),
         "about:home" | "about:" => (url.to_owned(), HOME.to_owned()),
         "about:blank" => (url.to_owned(), String::new()),
         "about:features" => (url.to_owned(), FEATURES.to_owned()),
@@ -286,6 +287,9 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
         }
     };
     let fetch_html = ms(t);
+    if js::trace_scripts() {
+        eprintln!("[load] html {:.0}ms {url}", fetch_html);
+    }
     let tp = Instant::now();
     let doc = html::parse(&html);
     let parse_ms = ms(tp);
@@ -303,6 +307,9 @@ pub fn load_req(url: &str, post: Option<&str>) -> Result<Loaded, String> {
         .collect();
     // Stylesheets and scripts download together in one parallel batch.
     let all: Vec<String> = urls.iter().chain(&script_urls).cloned().collect();
+    if js::trace_scripts() {
+        eprintln!("[load] fetching {} subresources", all.len());
+    }
     let mut bodies = net::fetch_many(&all).into_iter().map(|b| b.map(|b| net::decode(&b)).unwrap_or_default());
     let css = urls.iter().map(|u| (u.clone(), bodies.next().unwrap_or_default())).collect();
     let scripts = script_urls.iter().map(|u| (u.clone(), bodies.next().unwrap_or_default())).collect();
@@ -437,6 +444,18 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     let t0 = Instant::now();
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
+    // An iframe's document: window.parent / top are the containing page.
+    if let Some((parent, name)) = FRAME_PARENT.with(|p| p.borrow_mut().take()) {
+        let lit = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], "");
+        let js = format!(
+            "(function(){{ var p = window['@@makeParentProxy'](\"{}\"); window.parent = p; window.top = p; window.frameElement = null; window.name = \"{}\"; }})();",
+            lit(&parent),
+            lit(&name)
+        );
+        if let Err(e) = it.run_script(&js) {
+            eprintln!("[frame] setup: {e}");
+        }
+    }
     it.ready_state = "loading";
     it.set_deadline(t0 + std::time::Duration::from_millis(script_budget() as u64));
     it.layout_src = Some(std::rc::Rc::new(js::LayoutSrc { css: css.clone(), base: base.to_owned() }));
@@ -668,6 +687,51 @@ pub struct Page {
     pub elem_scroll: FxHashMap<NodeId, (f32, f32)>,
     vw: f32,
     vh: f32,
+    /// Documents of <iframe> elements.
+    frames: FxHashMap<NodeId, Frame>,
+    /// The frame keyboard input goes to (its element).
+    focus_frame: Option<NodeId>,
+    /// Nesting level (0: a top-level page).
+    depth: u32,
+}
+
+/// An <iframe>'s document: loaded in the background, then a child page
+/// rendered into an image the iframe element shows.
+struct Frame {
+    url: String,
+    state: FrameState,
+    /// Content box size the child page is laid out at.
+    w: f32,
+    h: f32,
+    /// Its rendered image's key in `res.images`.
+    key: Option<String>,
+    /// The child's relayout count when last rendered (u64::MAX: never).
+    rendered: u64,
+    /// The element's name attribute (the frame window's `name`).
+    name: String,
+    /// Images fetched in the background for the frame's document.
+    img_tx: std::sync::mpsc::Sender<(String, Option<Arc<Image>>)>,
+    img_rx: std::sync::mpsc::Receiver<(String, Option<Arc<Image>>)>,
+    glyphs: crate::fonts::GlyphCache,
+}
+
+enum FrameState {
+    Loading(std::sync::mpsc::Receiver<Result<Loaded, String>>),
+    Ready(Box<Page>),
+    Failed,
+}
+
+thread_local! {
+    /// The containing page's URL while an iframe's page is being created.
+    static FRAME_PARENT: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Iframes nest at most this deep.
+const MAX_FRAME_DEPTH: u32 = 3;
+
+fn frames_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("BOLT_FRAMES").map_or(true, |v| v != "0"))
 }
 
 /// An editing key sent to the focused text field.
@@ -687,7 +751,6 @@ pub enum Edit {
     Escape,
 }
 
-/// What a click on the page did.
 /// Mouse / pointer event fields at page point (x, y).
 fn mouse_fields(it: &mut js::Interp, e: &js::Value, x: f32, y: f32, buttons: f64, pointer: bool) {
     for (k, v) in [("clientX", x), ("clientY", y), ("pageX", x), ("pageY", y), ("screenX", x), ("screenY", y), ("x", x), ("y", y), ("offsetX", 0.0), ("offsetY", 0.0)] {
@@ -709,6 +772,7 @@ fn mouse_fields(it: &mut js::Interp, e: &js::Value, x: f32, y: f32, buttons: f64
     }
 }
 
+/// What a click on the page did.
 #[derive(Debug, PartialEq)]
 pub enum Click {
     /// Nothing special: follow a link under the pointer, if any.
@@ -780,6 +844,16 @@ fn inline_svgs(doc: &Document, styles: &[Style], res: &mut Resources) {
 }
 
 impl Page {
+    /// The document of an iframe nested `depth` levels deep.
+    fn new_child(l: Loaded, vw: f32, vh: f32, depth: u32, parent_url: &str, name: &str) -> Page {
+        FRAME_PARENT.with(|p| *p.borrow_mut() = Some((parent_url.to_owned(), name.to_owned())));
+        let mut p = Page::new(l, vw, vh);
+        FRAME_PARENT.with(|p| *p.borrow_mut() = None);
+        p.depth = depth;
+        p.update_frames();
+        p
+    }
+
     pub fn new(l: Loaded, vw: f32, vh: f32) -> Page {
         let mut t = Timings { fetch: l.fetch_ms, parse: l.parse_ms, ..Default::default() };
         let base = base_of(&l.doc, &l.url);
@@ -791,7 +865,7 @@ impl Page {
         doc.target = target_of(&doc, &l.url);
         let sheets = sheets_for(&doc, &base, &mut css);
         let (styles, tree, dl) = render(&doc, &sheets, &base, &mut res, vw, vh, &mut t);
-        let mut page = Page { pointer_at: None, url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, elem_scroll: FxHashMap::default(), vw, vh };
+        let mut page = Page { pointer_at: None, url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, elem_scroll: FxHashMap::default(), vw, vh, frames: FxHashMap::default(), focus_frame: None, depth: 0 };
         page.sync_js_geometry();
         page.script_requests();
         // Initial IntersectionObserver / ResizeObserver callbacks (lazy
@@ -801,6 +875,7 @@ impl Page {
                 break;
             }
         }
+        page.update_frames();
         page
     }
 
@@ -1136,6 +1211,18 @@ impl Page {
     /// A complete click without a real pointer (headless runs): pointer /
     /// mouse down and up, then `click`.
     pub fn click_full(&mut self, x: f32, y: f32) -> Click {
+        if js::trace_scripts() {
+            let states: Vec<String> = self.frames.iter().map(|(n, f)| format!("{n}:{}", match f.state { FrameState::Loading(_) => "loading", FrameState::Ready(_) => "ready", FrameState::Failed => "failed" })).collect();
+            eprintln!("[frame] click at {x},{y}: node {:?}, frames {states:?}", self.tree.node_at(x, y));
+        }
+        if let Some((n, fx, fy)) = self.frame_at(x, y) {
+            self.focus_frame = Some(n);
+            if let Some(Frame { state: FrameState::Ready(p), .. }) = self.frames.get_mut(&n) {
+                let scroll = p.scroll;
+                p.click_full(fx, fy + scroll);
+            }
+            return Click::Handled;
+        }
         let node = self.tree.node_at(x, y);
         self.pointer_at = Some((x, y));
         self.set_pointer(node, true);
@@ -1144,6 +1231,19 @@ impl Page {
     }
 
     pub fn click(&mut self, x: f32, y: f32) -> Click {
+        // Inside an iframe: the click is its document's.
+        if let Some((n, fx, fy)) = self.frame_at(x, y) {
+            self.focus_frame = Some(n);
+            if let Some(Frame { state: FrameState::Ready(p), .. }) = self.frames.get_mut(&n) {
+                let scroll = p.scroll;
+                let node = p.tree.node_at(fx, fy + scroll);
+                p.set_pointer(node, true);
+                p.set_pointer(node, false);
+                p.click(fx, fy + scroll);
+            }
+            return Click::Handled;
+        }
+        self.focus_frame = None;
         let Some(node) = self.tree.node_at(x, y) else {
             self.set_focus(NONE);
             return Click::Default;
@@ -1218,6 +1318,12 @@ impl Page {
     /// Apply an editing key to the focused field. Returns a navigation if
     /// it submitted a form.
     pub fn key(&mut self, e: Edit) -> Option<Nav> {
+        if let Some(f) = self.focus_frame.and_then(|n| self.frames.get_mut(&n)) {
+            if let FrameState::Ready(p) = &mut f.state {
+                p.key(e);
+                return None;
+            }
+        }
         let n = self.focused()?;
         let name = match &e {
             Edit::Insert(s) => s.clone(),
@@ -1434,6 +1540,15 @@ impl Page {
 
     /// Run due timers (`now` = ms since load). Returns true if the page changed.
     pub fn tick(&mut self, now: f64) -> bool {
+        let frames_changed = self.tick_frames(now);
+        self.tick_page(now) || frames_changed
+    }
+
+    fn tick_page(&mut self, now: f64) -> bool {
+        // MessagePort messages (possibly from other frames).
+        if self.js.as_ref().is_some_and(|it| !it.owned_ports.is_empty()) {
+            self.with_js(|it| it.poll_ports());
+        }
         // Page scripts deferred past the startup budget: one per turn.
         if self.js.as_ref().is_some_and(|it| !it.script_queue.is_empty() || it.load_events_pending) {
             let base = self.base.clone();
@@ -1478,18 +1593,43 @@ impl Page {
 
     /// Whether scripts still have timers or requests outstanding (for
     /// headless runs deciding when the page has settled).
-    pub fn has_pending_work(&self, _now: f64) -> bool {
+    pub fn has_pending_work(&self, now: f64) -> bool {
         self.js.as_ref().is_some_and(|it| it.next_timer_at().is_some() || it.has_pending_requests())
+            || self.frames.values().any(|f| match &f.state {
+                FrameState::Loading(_) => true,
+                FrameState::Ready(p) => p.has_pending_work(now),
+                FrameState::Failed => false,
+            })
+    }
+
+    /// Iframe documents still being fetched (at any depth).
+    pub fn frames_loading(&self) -> bool {
+        self.frames.values().any(|f| match &f.state {
+            FrameState::Loading(_) => true,
+            FrameState::Ready(p) => !p.res.pending.is_empty() || p.frames_loading(),
+            FrameState::Failed => false,
+        })
     }
 
     pub fn has_pending_requests(&self) -> bool {
         self.js.as_ref().is_some_and(|it| it.has_pending_requests())
+            || self.frames.values().any(|f| match &f.state {
+                FrameState::Loading(_) => true,
+                FrameState::Ready(p) => p.has_pending_requests(),
+                FrameState::Failed => false,
+            })
     }
 
     /// Re-run style + layout for a new viewport size (media queries may change).
     pub fn relayout(&mut self, vw: f32, vh: f32) {
         self.vw = vw;
         self.vh = vh;
+        // Iframes show their documents' latest renderings.
+        for (&n, f) in &self.frames {
+            if let Some(k) = &f.key {
+                self.res.img_src.insert(n, k.clone());
+            }
+        }
         let sheets = sheets_for(&self.doc, &self.base, &mut self.css);
         let (styles, tree, dl) = render(&self.doc, &sheets, &self.base, &mut self.res, vw, vh, &mut self.t);
         self.styles = styles;
@@ -1502,6 +1642,211 @@ impl Page {
         self.layouts += 1;
         self.sync_js_geometry();
         self.fire_link_events();
+        self.update_frames();
+    }
+
+    /// The content box (page coordinates) of an element's box.
+    fn content_box(&self, n: NodeId) -> Option<[f32; 4]> {
+        let r = *self.tree.node_rects().get(&n)?;
+        let b = self.tree.boxes.iter().find(|b| b.node == n && !b.anon)?;
+        Some([r[0] + b.b[3] + b.p[3], r[1] + b.b[0] + b.p[0], b.w, b.h])
+    }
+
+    /// Start loading the documents of new / changed <iframe>s and resize
+    /// the loaded ones to their boxes.
+    fn update_frames(&mut self) {
+        if !frames_enabled() || self.depth >= MAX_FRAME_DEPTH {
+            return;
+        }
+        let iframes: Vec<NodeId> = (0..self.doc.nodes.len() as NodeId).filter(|&n| self.doc.tag(n) == Some(k::iframe) && self.doc.contains(0, n)).collect();
+        let mut seen = Vec::new();
+        for n in iframes {
+            let Some([_, _, w, h]) = self.content_box(n) else { continue };
+            if w < 2.0 || h < 2.0 {
+                continue;
+            }
+            let srcdoc = self.doc.attr(n, crate::atom::intern("srcdoc")).map(str::to_owned);
+            let src = self.doc.attr(n, k::src).map(|s| s.trim().to_owned()).unwrap_or_default();
+            let url = if srcdoc.is_some() {
+                "about:srcdoc".to_owned()
+            } else if src.is_empty() || src == "about:blank" {
+                continue;
+            } else {
+                net::resolve(&self.base, &src)
+            };
+            if !(url.starts_with("http") || url == "about:srcdoc") {
+                continue;
+            }
+            seen.push(n);
+            match self.frames.get_mut(&n) {
+                Some(f) if f.url == url => {
+                    if (f.w - w).abs() > 0.5 || (f.h - h).abs() > 0.5 {
+                        f.w = w;
+                        f.h = h;
+                        f.rendered = u64::MAX;
+                        if let FrameState::Ready(p) = &mut f.state {
+                            p.relayout(w, h);
+                        }
+                    }
+                }
+                _ => {
+                    if js::trace_scripts() {
+                        eprintln!("[frame] load {url} at {w}x{h}");
+                    }
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    let u = url.clone();
+                    std::thread::spawn(move || {
+                        let t = Instant::now();
+                        let r = if u == "about:srcdoc" { load_req(&u, srcdoc.as_deref()) } else { load(&u) };
+                        if js::trace_scripts() {
+                            eprintln!("[frame] fetched in {:.0}ms: {}", ms(t), r.as_ref().map_or_else(|e| e.clone(), |l| format!("{} bytes", l.html.len())));
+                        }
+                        let _ = tx.send(r);
+                    });
+                    let name = self.doc.attr(n, k::name).unwrap_or("").to_owned();
+                    let (img_tx, img_rx) = std::sync::mpsc::channel();
+                    self.frames.insert(n, Frame { url, state: FrameState::Loading(rx), w, h, key: None, rendered: u64::MAX, glyphs: Default::default(), name, img_tx, img_rx });
+                }
+            }
+        }
+        let gone: Vec<NodeId> = self.frames.keys().copied().filter(|n| !seen.contains(n)).collect();
+        for n in gone {
+            if js::trace_scripts() {
+                eprintln!("[frame] removed {n}");
+            }
+            if let Some(f) = self.frames.remove(&n) {
+                if let Some(k) = f.key {
+                    self.res.images.remove(&k);
+                }
+            }
+            self.res.img_src.remove(&n);
+        }
+    }
+
+    /// Advance the iframes' documents (loading, scripts, rendering).
+    /// Returns true if one's rendering changed.
+    fn tick_frames(&mut self, now: f64) -> bool {
+        if self.frames.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        let depth = self.depth;
+        let parent_url = self.url.clone();
+        // Window messages from this page to its frames.
+        let outbox: Vec<js::messaging::FrameMsg> = self.js.as_mut().map(|it| std::mem::take(&mut it.frame_outbox)).unwrap_or_default();
+        let parent_origin = js::messaging::origin_of(&self.url);
+        let mut up: Vec<(NodeId, js::messaging::FrameMsg, String)> = Vec::new();
+        let mut across: Vec<(String, js::messaging::FrameMsg, String)> = Vec::new();
+        for (&n, f) in self.frames.iter_mut() {
+            if let FrameState::Loading(rx) = &f.state {
+                match rx.try_recv() {
+                    Ok(Ok(l)) => {
+                        if js::trace_scripts() {
+                            eprintln!("[frame] ready {}", f.url);
+                        }
+                        let p = Page::new_child(l, f.w, f.h, depth + 1, &parent_url, &f.name);
+                        f.state = FrameState::Ready(Box::new(p));
+                    }
+                    Ok(Err(e)) => {
+                        if js::trace_scripts() {
+                            eprintln!("[frame] failed {}: {e}", f.url);
+                        }
+                        f.state = FrameState::Failed;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        if js::trace_scripts() {
+                            eprintln!("[frame] loader died {}", f.url);
+                        }
+                        f.state = FrameState::Failed;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            let FrameState::Ready(p) = &mut f.state else { continue };
+            for m in outbox.iter().filter(|m| matches!(m.to, js::messaging::MsgTarget::Frame(t) if t == n)) {
+                p.with_js(|it| it.deliver_window_message(m, &parent_origin, None));
+            }
+            // ...and from the frame to this page.
+            if let Some(it) = p.js.as_mut() {
+                let child_origin = js::messaging::origin_of(&p.url);
+                for m in std::mem::take(&mut it.frame_outbox) {
+                    match &m.to {
+                        js::messaging::MsgTarget::Parent => up.push((n, m, child_origin.clone())),
+                        js::messaging::MsgTarget::Sibling(name) => across.push((name.clone(), m.clone(), child_origin.clone())),
+                        js::messaging::MsgTarget::Frame(_) => {}
+                    }
+                }
+            }
+            p.tick(now);
+            // Images: apply arrivals, request newly wanted ones.
+            let mut got = false;
+            while let Ok((u, img)) = f.img_rx.try_recv() {
+                p.res.pending.remove(&u);
+                p.res.images.insert(u, img);
+                got = true;
+            }
+            if got {
+                p.relayout(f.w, f.h);
+                p.fire_image_events();
+            }
+            let urls = p.wanted_images();
+            if !urls.is_empty() {
+                for u in &urls {
+                    p.res.images.insert(u.clone(), None);
+                    p.res.pending.insert(u.clone());
+                }
+                let tx = f.img_tx.clone();
+                std::thread::spawn(move || {
+                    fetch_images(&urls, &|u, img| {
+                        let _ = tx.send((u, img));
+                    });
+                });
+            }
+            if p.layouts == f.rendered {
+                continue;
+            }
+            // Render the child page into the iframe's image.
+            let (w, h) = (f.w.round().max(1.0) as usize, f.h.round().max(1.0) as usize);
+            let mut buf = vec![0u32; w * h];
+            paint::paint(&p.dl, &p.tree.text, &mut f.glyphs, &mut buf, w, h, p.scroll);
+            let img = image::from_pixels(w as u32, h as u32, buf, f.w, f.h);
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let key = format!("frame:{n}:{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            if let Some(old) = f.key.replace(key.clone()) {
+                self.res.images.remove(&old);
+            }
+            self.res.images.insert(key, Some(Arc::new(img)));
+            f.rendered = p.layouts;
+            changed = true;
+        }
+        for (n, m, origin) in up {
+            self.with_js(|it| it.deliver_window_message(&m, &origin, Some(n)));
+        }
+        for (name, m, origin) in across {
+            for f in self.frames.values_mut() {
+                if f.name == name {
+                    if let FrameState::Ready(p) = &mut f.state {
+                        p.with_js(|it| it.deliver_window_message(&m, &origin, None));
+                    }
+                }
+            }
+        }
+        if changed {
+            self.relayout(self.vw, self.vh);
+        }
+        changed
+    }
+
+    /// The loaded frame under a page point, with the point in its
+    /// coordinates.
+    fn frame_at(&self, x: f32, y: f32) -> Option<(NodeId, f32, f32)> {
+        let n = self.tree.node_at(x, y)?;
+        let f = self.frames.get(&n)?;
+        if !matches!(f.state, FrameState::Ready(_)) {
+            return None;
+        }
+        let [cx, cy, _, _] = self.content_box(n)?;
+        Some((n, x - cx, y - cy))
     }
 
     /// Fire `load` at `<link rel=stylesheet>` elements whose sheet has been
@@ -1650,6 +1995,29 @@ mod tests {
         let doc = html::parse(html);
         let l = Loaded { url: "https://example.com/start".into(), html: html.into(), css: FxHashMap::default(), doc, scripts: FxHashMap::default(), fetch_ms: 0.0, parse_ms: 0.0 };
         Page::new(l, 800.0, 600.0)
+    }
+
+    /// An iframe's document loads, renders, and talks to the page with
+    /// postMessage and a transferred MessagePort.
+    #[test]
+    fn iframe_messaging() {
+        let child = "<body style=margin:0;background:rgb(0,128,0)><script>            window.addEventListener('message', function (e) { e.ports[0].postMessage('pong:' + e.data); });            parent.postMessage({ hello: 'from frame' }, '*');</script></body>";
+        let html = format!(
+            "<body><iframe id=f style=width:200px;height:100px srcdoc=\"{}\"></iframe><script>             var log = [];             window.addEventListener('message', function (e) {{               log.push(e.data.hello + ' ' + (e.source === document.getElementById('f').contentWindow));               var ch = new MessageChannel();               ch.port1.onmessage = function (m) {{ log.push(m.data); document.title = log.join(' / '); }};               e.source.postMessage('ping', '*', [ch.port2]);             }});</script></body>",
+            child.replace('"', "&quot;")
+        );
+        let mut p = page_from(&html);
+        let t = Instant::now();
+        let mut now = 0.0;
+        while p.title() != "from frame true / pong:ping" && ms(t) < 10000.0 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            now += 16.0;
+            p.tick(now);
+        }
+        assert_eq!(p.title(), "from frame true / pong:ping");
+        // The frame's rendering (green) shows in the iframe's box.
+        let n = node_by_id(&p, "f");
+        assert!(p.res.img(n).is_some_and(|i| i.px.iter().any(|&c| c & 0xFFFFFF == 0x008000)));
     }
 
     fn node_by_id(p: &Page, id: &str) -> NodeId {

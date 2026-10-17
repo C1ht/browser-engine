@@ -688,12 +688,15 @@
     if (Object.getOwnPropertyDescriptor(NP, 'contentWindow')) return;
     var frameWindow = function (el) {
       if (el.__frameWindow) return el.__frameWindow;
-      var w = {
+      // Built-ins (JSON, Object, ...) come from this window: scripts borrow
+      // a frame's "pristine" globals.
+      var w = Object.assign(Object.create(window), {
         location: { href: 'about:blank', origin: 'null', protocol: 'about:', host: '', hostname: '', pathname: 'blank', search: '', hash: '', replace: function () {}, assign: function () {}, reload: function () {} },
-        postMessage: function () {}, addEventListener: function () {}, removeEventListener: function () {},
+        postMessage: function (data, origin, transfer) { window['@@framePost'](el, data, origin, transfer); },
+        addEventListener: function () {}, removeEventListener: function () {},
         focus: function () {}, blur: function () {}, close: function () {}, closed: false,
         parent: window, top: window, frames: [], length: 0, opener: null
-      };
+      });
       w.window = w; w.self = w;
       el.__frameWindow = w;
       return w;
@@ -947,6 +950,9 @@
     Object.keys(moved).forEach(function (name) { delete NP[name]; });
   })();
 })();
+
+// window.name (a frame's is set by the page that loads it).
+if (typeof window.name !== 'string') window.name = '';
 
 // Every global constructor's prototype points back at it.
 (function () {
@@ -1447,4 +1453,183 @@
   }
   window.Worker = makeWorker('Worker');
   window.SharedWorker = makeWorker('SharedWorker');
+})();
+
+// postMessage / MessageChannel across windows (iframes) and within one:
+// data is structured-serialized, ports have global ids (see messaging.rs).
+(function () {
+  var portNew = window['@@portNew'], portSend = window['@@portSend'], frameSend = window['@@frameSend'];
+  var TA = ['Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array'];
+  function enc(v, seen) {
+    if (v === undefined) return { $u: 1 };
+    if (v === null || typeof v === 'boolean' || typeof v === 'string') return v;
+    if (typeof v === 'number') return isFinite(v) ? v : { $n: String(v) };
+    if (typeof v === 'bigint') return { $b: String(v) };
+    if (typeof v === 'function' || typeof v === 'symbol') throw new DOMException('could not be cloned', 'DataCloneError');
+    if (v instanceof MessagePort) return { $p: v._id };
+    seen = seen || [];
+    if (seen.indexOf(v) >= 0) return null;
+    seen.push(v);
+    if (v instanceof Date) return { $d: v.getTime() };
+    if (v instanceof RegExp) return { $r: [v.source, v.flags] };
+    if (v instanceof ArrayBuffer) return { $ab: Array.prototype.slice.call(new Uint8Array(v)) };
+    for (var i = 0; i < TA.length; i++) if (window[TA[i]] && v instanceof window[TA[i]]) return { $ta: TA[i], v: Array.prototype.slice.call(v) };
+    if (v instanceof Map) { var m = []; v.forEach(function (x, k) { m.push([enc(k, seen), enc(x, seen)]); }); return { $m: m }; }
+    if (v instanceof Set) { var st = []; v.forEach(function (x) { st.push(enc(x, seen)); }); return { $s: st }; }
+    if (Array.isArray(v)) return v.map(function (x) { return enc(x, seen); });
+    if (v instanceof Error) return { $e: [v.name, v.message] };
+    var o = {};
+    Object.keys(v).forEach(function (k) { o[k] = enc(v[k], seen); });
+    return { $o: o };
+  }
+  function dec(v, ports) {
+    if (v === null || typeof v !== 'object') return v;
+    if (Array.isArray(v)) return v.map(function (x) { return dec(x, ports); });
+    if ('$u' in v) return undefined;
+    if ('$n' in v) return Number(v.$n);
+    if ('$b' in v) return BigInt(v.$b);
+    if ('$p' in v) return ports[v.$p] || null;
+    if ('$d' in v) return new Date(v.$d);
+    if ('$r' in v) return new RegExp(v.$r[0], v.$r[1]);
+    if ('$ab' in v) return new Uint8Array(v.$ab).buffer;
+    if ('$ta' in v) return new window[v.$ta](v.v);
+    if ('$m' in v) return new Map(v.$m.map(function (e) { return [dec(e[0], ports), dec(e[1], ports)]; }));
+    if ('$s' in v) return new Set(v.$s.map(function (e) { return dec(e, ports); }));
+    if ('$e' in v) { var E = window[v.$e[0]] || Error; return new E(v.$e[1]); }
+    var o = {};
+    var src = v.$o || {};
+    Object.keys(src).forEach(function (k) { o[k] = dec(src[k], ports); });
+    return o;
+  }
+  // [[id, peer], ...] of the ports in a transfer list (they move away).
+  function transferList(t) {
+    var out = [];
+    if (!t) return out;
+    Array.prototype.forEach.call(t, function (p) {
+      if (p instanceof MessagePort && p._id) { out.push([p._id, p._peer]); delete registry[p._id]; p._closed = true; }
+    });
+    return out;
+  }
+  var registry = {};
+  function adoptPorts(pairs) {
+    var byId = {}, list = [];
+    for (var i = 0; i < pairs.length; i++) {
+      var p = registry[pairs[i][0]] || new MessagePort(pairs[i][0], pairs[i][1]);
+      byId[pairs[i][0]] = p;
+      list.push(p);
+    }
+    return { byId: byId, list: list };
+  }
+
+  function MessagePort(id, peer) {
+    EventTarget.call(this);
+    this._id = id || 0; this._peer = peer || 0;
+    this._queue = []; this._started = false; this._closed = false;
+    this._onmessage = null;
+    if (this._id) registry[this._id] = this;
+  }
+  MessagePort.prototype = Object.create(EventTarget.prototype);
+  MessagePort.prototype.constructor = MessagePort;
+  // Setting onmessage starts the port (as in browsers).
+  Object.defineProperty(MessagePort.prototype, 'onmessage', {
+    get: function () { return this._onmessage; },
+    set: function (f) { this._onmessage = f; this.start(); },
+    configurable: true
+  });
+  MessagePort.prototype.postMessage = function (data, transfer) {
+    if (this._closed || !this._peer) return;
+    if (transfer && !Array.isArray(transfer) && transfer.transfer) transfer = transfer.transfer;
+    var json = JSON.stringify(enc(data));
+    portSend(this._peer, json, transferList(transfer));
+  };
+  MessagePort.prototype.start = function () {
+    if (this._started) return;
+    this._started = true;
+    var q = this._queue; this._queue = [];
+    for (var i = 0; i < q.length; i++) this._dispatch(q[i]);
+  };
+  MessagePort.prototype.close = function () { this._closed = true; delete registry[this._id]; };
+  // (EventTarget's dispatch calls onmessage too.)
+  MessagePort.prototype._dispatch = function (ev) { this.dispatchEvent(ev); };
+  var addL = EventTarget.prototype.addEventListener;
+  MessagePort.prototype.addEventListener = function (t, f, o) { return addL.call(this, t, f, o); };
+  function MessageChannel() {
+    var a = portNew(), b = portNew();
+    this.port1 = new MessagePort(a, b);
+    this.port2 = new MessagePort(b, a);
+  }
+  function makeEvent(data, origin, source, ports) {
+    var ev = new MessageEvent('message');
+    try {
+      Object.defineProperty(ev, 'data', { value: data, configurable: true });
+      Object.defineProperty(ev, 'origin', { value: origin || '', configurable: true });
+      Object.defineProperty(ev, 'source', { value: source || null, configurable: true });
+      Object.defineProperty(ev, 'ports', { value: ports || [], configurable: true });
+      Object.defineProperty(ev, 'lastEventId', { value: '', configurable: true });
+    } catch (e) { ev.data = data; ev.origin = origin; ev.source = source; ev.ports = ports || []; }
+    return ev;
+  }
+  window['@@portDeliver'] = function (id, json, pairs) {
+    var port = registry[id];
+    if (!port || port._closed) return;
+    var adopted = adoptPorts(pairs);
+    var ev = makeEvent(dec(JSON.parse(json), adopted.byId), '', null, adopted.list);
+    if (port._started) port._dispatch(ev); else port._queue.push(ev);
+  };
+  // A message from another frame's window; `sourceEl` is the iframe it came
+  // from (null: from the parent window).
+  window['@@windowDeliver'] = function (json, pairs, origin, sourceEl) {
+    var adopted = adoptPorts(pairs);
+    var source = sourceEl ? sourceEl.contentWindow : window.parent;
+    window.dispatchEvent(makeEvent(dec(JSON.parse(json), adopted.byId), origin, source, adopted.list));
+  };
+  // Messages to this same window.
+  window.postMessage = function (data, targetOrigin, transfer) {
+    if (targetOrigin && typeof targetOrigin === 'object') { transfer = targetOrigin.transfer; }
+    var json = JSON.stringify(enc(data));
+    var pairs = transferList(transfer);
+    setTimeout(function () {
+      var adopted = adoptPorts(pairs);
+      window.dispatchEvent(makeEvent(dec(JSON.parse(json), adopted.byId), location.origin, window, adopted.list));
+    }, 0);
+  };
+  // Posting into an iframe's window.
+  window['@@framePost'] = function (el, data, targetOrigin, transfer) {
+    if (targetOrigin && typeof targetOrigin === 'object') { transfer = targetOrigin.transfer; targetOrigin = targetOrigin.targetOrigin; }
+    frameSend('frame', el, JSON.stringify(enc(data)), transferList(transfer), targetOrigin === undefined ? '/' : String(targetOrigin));
+  };
+  // Inside an iframe: window.parent / window.top post to the containing page.
+  window['@@makeParentProxy'] = function (parentUrl) {
+    var origin = '';
+    try { origin = new URL(parentUrl).origin; } catch (e) {}
+    var p = {
+      postMessage: function (data, targetOrigin, transfer) {
+        if (targetOrigin && typeof targetOrigin === 'object') { transfer = targetOrigin.transfer; targetOrigin = targetOrigin.targetOrigin; }
+        frameSend('parent', null, JSON.stringify(enc(data)), transferList(transfer), targetOrigin === undefined ? '/' : String(targetOrigin));
+      },
+      addEventListener: function () {}, removeEventListener: function () {},
+      focus: function () {}, blur: function () {}, close: function () {}, closed: false,
+      length: 1, opener: null
+    };
+    // parent.frames[name]: the page's other frames (messages only).
+    var siblings = {};
+    p.frames = new Proxy({}, {
+      get: function (t, k) {
+        if (typeof k !== 'string' || k === 'then' || k === 'toJSON') return undefined;
+        if (k === 'length') return 0;
+        return siblings[k] || (siblings[k] = {
+          postMessage: function (data, targetOrigin, transfer) {
+            if (targetOrigin && typeof targetOrigin === 'object') { transfer = targetOrigin.transfer; targetOrigin = targetOrigin.targetOrigin; }
+            frameSend('sibling', k, JSON.stringify(enc(data)), transferList(transfer), targetOrigin === undefined ? '/' : String(targetOrigin));
+          },
+          closed: false
+        });
+      }
+    });
+    p.window = p; p.self = p; p.parent = p; p.top = p;
+    Object.defineProperty(p, 'location', { get: function () { throw new DOMException('Blocked a frame from accessing a cross-origin frame.', 'SecurityError'); } });
+    return p;
+  };
+  window.MessagePort = MessagePort;
+  window.MessageChannel = MessageChannel;
 })();

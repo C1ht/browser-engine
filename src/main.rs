@@ -290,6 +290,25 @@ fn bench(a: &Args) {
 
 // ------------------------------------------------------------ screenshot
 
+/// Wait (in real time, bounded) for iframe documents that are loading,
+/// then let them run briefly.
+fn settle_frames(page: &mut Page, now: &mut f64) {
+    let t = Instant::now();
+    let mut extra = 0;
+    while ms(t) < 10000.0 {
+        let loading = page.frames_loading();
+        if !loading {
+            extra += 1;
+            if extra > 60 {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(if loading { 16 } else { 2 }));
+        *now += 16.0;
+        page.tick(*now);
+    }
+}
+
 fn screenshot(a: &Args, out: &str) {
     let l = match engine::load(&a.url) {
         Ok(l) => l,
@@ -307,9 +326,12 @@ fn screenshot(a: &Args, out: &str) {
     let mut now = 0.0;
     // BOLT_SETTLE_MS: how much page time to simulate (default 3000).
     let settle: f64 = std::env::var("BOLT_SETTLE_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000.0);
-    while now < settle && ms(t_settle) < 8000.0f64.max(settle * 3.0) {
+    while (now < settle || page.frames_loading()) && ms(t_settle) < 8000.0f64.max(settle * 3.0) {
         now += 16.0;
-        if page.has_pending_requests() {
+        // Frames load in real time: keep pace with them.
+        if page.frames_loading() {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        } else if page.has_pending_requests() {
             std::thread::sleep(std::time::Duration::from_millis(4));
         }
         page.tick(now);
@@ -340,6 +362,7 @@ fn screenshot(a: &Args, out: &str) {
     let fonts_ms = ms(t_fonts);
     let t_imgs = Instant::now();
     page.load_images_blocking(w as f32, vh);
+    settle_frames(&mut page, &mut now);
     eprintln!("[bolt] fetch {fetch_ms:.0}ms | page {page_ms:.0}ms (scripts {:.0}ms) | fonts {fonts_ms:.0}ms | images {:.0}ms", page.script_ms, ms(t_imgs));
     for &(x, y) in &a.clicks {
         let r = page.click_full(x, y);
@@ -358,6 +381,7 @@ fn screenshot(a: &Args, out: &str) {
             }
             page.tick(now);
         }
+        settle_frames(&mut page, &mut now);
     }
     for src in &a.eval {
         println!("[eval] {}", page.eval(src).unwrap_or_else(|| "(no script engine)".into()));
