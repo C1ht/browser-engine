@@ -19,6 +19,7 @@ pub mod lexer;
 pub mod parser;
 pub mod regex;
 pub mod web;
+pub mod vm;
 
 use crate::dom::{Document, NodeId};
 use crate::fx::FxHashMap;
@@ -511,6 +512,9 @@ pub struct Interp {
     pub submit_form: Option<NodeId>,
     /// fetch / XMLHttpRequest requests in flight.
     pub requests: Vec<web::Pending>,
+    /// Bytecode for functions run by the VM, by FuncDef address (None:
+    /// the tree-walking interpreter runs it).
+    pub vm_cache: FxHashMap<usize, vm::VmEntry>,
 }
 
 pub const WINDOW: u32 = u32::MAX - 1;
@@ -597,6 +601,7 @@ impl Interp {
             co_stack: Vec::new(),
             script_running: 0,
             terminating: false,
+            vm_cache: FxHashMap::default(),
             images: FxHashMap::default(),
             img_fired: FxHashMap::default(),
             script_queue: Default::default(),
@@ -1229,7 +1234,7 @@ impl Interp {
         self.depth += 1;
         let r = if prof::on() {
             self.call_closure_profiled(def, env, arrow_this, home, this, args, fobj)
-        } else if trace_on() || std::env::var_os("BOLT_TRACE_THROW").is_some() {
+        } else if trace_on() || trace_throw_on() {
             TRACE_STACK.with(|s| s.borrow_mut().push(def.clone()));
             let r = self.call_closure_inner(def, env, arrow_this, home, this, args, fobj);
             TRACE_STACK.with(|s| s.borrow_mut().pop());
@@ -1252,6 +1257,9 @@ impl Interp {
 
     #[allow(clippy::too_many_arguments)]
     fn call_closure_inner(&mut self, def: &Rc<FuncDef>, env: Env, arrow_this: Option<Value>, home: Option<ObjRef>, this: Value, args: &[Value], fobj: Option<ObjRef>) -> R<Value> {
+        if let Some(code) = self.vm_code(def) {
+            return self.vm_call(&code, env, this, args, fobj, home);
+        }
         // Sloppy-mode functions see the global object for a missing `this`.
         let this = if !def.strict && this.is_nullish() { Value::Obj(self.global.clone()) } else { this };
         let scope = if def.arrow {
@@ -1569,7 +1577,11 @@ impl Interp {
     // ---------------------------------------------------------- statements
 
     pub fn run_script(&mut self, src: &str) -> Result<(), String> {
+        let t = std::time::Instant::now();
         let prog = parse_program(src)?;
+        if src.len() > 100_000 && std::env::var_os("BOLT_PROFILE").is_some() {
+            self.log(&format!("[profile] parsed {} bytes in {:.1}ms", src.len(), t.elapsed().as_secs_f64() * 1000.0));
+        }
         let env = self.genv.clone();
         self.script_running += 1;
         let r = (|| -> R<()> {
@@ -2947,6 +2959,11 @@ pub(crate) fn trace_stack() -> String {
 }
 
 /// `BOLT_TRACE_THROW=1`: log the first `throw` statements executed.
+fn trace_throw_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BOLT_TRACE_THROW").is_some())
+}
+
 fn trace_throw() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

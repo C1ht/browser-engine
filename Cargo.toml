@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 fontdue = "0.9"
+mimalloc = { version = "0.1.52", default-features = false }
 minifb = "0.29"
 
 [profile.release]
@@ -12,3 +13,4 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 panic = "abort"
+debug = "line-tables-only"

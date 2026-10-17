@@ -7,6 +7,11 @@
 
 #![allow(non_upper_case_globals)]
 
+mod sampler;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod atom;
 mod av1;
 mod avif;
@@ -133,6 +138,7 @@ fn main() {
     let h = std::thread::Builder::new()
         .stack_size(256 << 20)
         .spawn(|| {
+            sampler::start();
             fonts().prewarm();
             let args = parse_args();
             if let Some(path) = &args.js {
@@ -167,6 +173,7 @@ fn main() {
             } else {
                 Browser::run(&args.url, args.width, if args.height == 0 { 768 } else { args.height });
             }
+            sampler::report();
         })
         .unwrap();
     let _ = h.join();
