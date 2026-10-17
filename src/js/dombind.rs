@@ -380,10 +380,27 @@ fn rect(it: &Interp, id: NodeId) -> [f32; 4] {
 
 // --------------------------------------------------------- get / set hooks
 
+/// DOM accessors present only on some interfaces (see the prelude).
+const PROTO_DECIDED: &[&str] = &[
+    "children", "firstElementChild", "lastElementChild", "childElementCount", "nextElementSibling", "previousElementSibling",
+    "innerHTML", "outerHTML", "id", "className", "classList", "tagName", "localName", "namespaceURI", "attributes",
+    "shadowRoot", "slot", "assignedSlot", "innerText", "hidden", "title", "lang", "dir", "style", "dataset", "host", "value",
+    "checked", "disabled", "href", "src", "name", "type", "data", "tabIndex", "contentEditable", "isContentEditable",
+    "offsetParent", "activeElement", "currentTime", "paused", "ended", "muted", "volume", "playbackRate", "duration",
+    "readyState", "networkState", "buffered", "seekable", "played", "videoWidth", "videoHeight", "currentSrc", "textTracks",
+    "contentWindow", "contentDocument", "action", "method", "target", "rel", "alt", "placeholder", "selected", "multiple",
+    "required", "readOnly", "min", "max", "step", "pattern", "form", "label", "htmlFor", "width", "height",
+];
+
 pub fn has(it: &mut Interp, o: &ObjRef, key: &str) -> bool {
     let Kind::Node(id) = o.borrow().kind else { return false };
-    if matches!(key, "textContent" | "innerHTML" | "id" | "className" | "style" | "children" | "parentNode") || (is_elem(it, id) && get_attr(it, id, key).is_some() && key.starts_with("on")) {
+    if is_elem(it, id) && key.starts_with("on") && get_attr(it, id, key).is_some() {
         return true;
+    }
+    // Properties the prelude installs on their spec interfaces: the
+    // prototype chain decides (`"value" in div` is false).
+    if PROTO_DECIDED.contains(&key) {
+        return false;
     }
     // Geometry: answered without forcing a layout.
     if matches!(key, "offsetWidth" | "offsetHeight" | "offsetLeft" | "offsetTop" | "clientWidth" | "clientHeight" | "scrollWidth" | "scrollHeight" | "clientTop" | "clientLeft") {

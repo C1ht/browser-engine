@@ -63,10 +63,12 @@ struct Args {
     eval: Vec<String>,
     /// Screenshot mode: print what's under these points.
     probe: Vec<(f32, f32)>,
+    /// Screenshot mode: click these points (in order) before the shot.
+    clicks: Vec<(f32, f32)>,
 }
 
 fn parse_args() -> Args {
-    let mut a = Args { url: "about:home".into(), bench: false, js: None, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30, typed: None, eval: Vec::new(), probe: Vec::new() };
+    let mut a = Args { url: "about:home".into(), bench: false, js: None, shot: None, dump: false, boxes: false, width: 1024, height: 0, iters: 30, typed: None, eval: Vec::new(), probe: Vec::new(), clicks: Vec::new() };
     let mut it = std::env::args().skip(1);
     while let Some(s) = it.next() {
         match s.as_str() {
@@ -82,6 +84,11 @@ fn parse_args() -> Args {
             "--probe" => {
                 if let Some((x, y)) = it.next().as_deref().and_then(|v| v.split_once(',')) {
                     a.probe.push((x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0)));
+                }
+            }
+            "--click" => {
+                if let Some((x, y)) = it.next().as_deref().and_then(|v| v.split_once(',')) {
+                    a.clicks.push((x.trim().parse().unwrap_or(0.0), y.trim().parse().unwrap_or(0.0)));
                 }
             }
             "--iters" => a.iters = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.iters),
@@ -334,6 +341,24 @@ fn screenshot(a: &Args, out: &str) {
     let t_imgs = Instant::now();
     page.load_images_blocking(w as f32, vh);
     eprintln!("[bolt] fetch {fetch_ms:.0}ms | page {page_ms:.0}ms (scripts {:.0}ms) | fonts {fonts_ms:.0}ms | images {:.0}ms", page.script_ms, ms(t_imgs));
+    for &(x, y) in &a.clicks {
+        let r = page.click_full(x, y);
+        println!("[click {x},{y}] {}", match &r {
+            Click::Default => "default".to_string(),
+            Click::Handled => "handled".to_string(),
+            Click::Navigate(n) => format!("navigate {}", n.url),
+        });
+        // Let the page react (handlers, requests, animations).
+        let t = Instant::now();
+        let until = now + 3000.0;
+        while now < until && ms(t) < 15000.0 {
+            now += 16.0;
+            if page.has_pending_requests() {
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
+            page.tick(now);
+        }
+    }
     for src in &a.eval {
         println!("[eval] {}", page.eval(src).unwrap_or_else(|| "(no script engine)".into()));
     }
@@ -1061,6 +1086,9 @@ impl Browser {
                 (Some((mx, my)), Some(p)) if my as usize >= BAR => p.tree.node_at(mx, my - BAR as f32 + self.scroll.round()),
                 _ => None,
             };
+            if let (Some(p), Some((mx, my))) = (self.page.as_mut(), mouse) {
+                p.pointer_at = Some((mx, my - BAR as f32 + self.scroll.round()));
+            }
             if self.page.as_mut().is_some_and(|p| p.set_pointer(under, down)) {
                 dirty = true;
             }

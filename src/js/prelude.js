@@ -609,7 +609,8 @@
      'lang', 'dir', 'style', 'dataset', 'host', 'value', 'checked', 'disabled', 'href', 'src', 'name', 'type',
      'data', 'tabIndex', 'contentEditable', 'isContentEditable', 'offsetParent', 'offsetWidth', 'offsetHeight',
      'offsetLeft', 'offsetTop', 'clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight', 'scrollTop',
-     'scrollLeft', 'activeElement'
+     'scrollLeft', 'activeElement', 'action', 'method', 'target', 'rel', 'alt', 'placeholder', 'selected',
+     'multiple', 'required', 'readOnly', 'min', 'max', 'step', 'pattern', 'form', 'label', 'htmlFor', 'width', 'height'
     ].forEach(function (k) {
       if (Object.getOwnPropertyDescriptor(NP, k)) return;
       var g = function () { return nget(this, k); };
@@ -847,6 +848,89 @@
       '+child': ['remove', 'before', 'after', 'replaceWith']
     };
     var mixins = { '+parent': ['Element', 'Document', 'DocumentFragment'], '+child': ['Element', 'CharacterData', 'DocumentType'] };
+    // Accessors too: `'data' in div` must be false (sanitizers such as
+    // polymer_resin and feature tests probe which properties elements have).
+    var acc = {
+      '+parent': ['children', 'firstElementChild', 'lastElementChild', 'childElementCount'],
+      '+elsib': ['nextElementSibling', 'previousElementSibling'],
+      Element: ['innerHTML', 'outerHTML', 'id', 'className', 'classList', 'tagName', 'localName', 'namespaceURI',
+        'attributes', 'shadowRoot', 'slot', 'clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight',
+        'scrollTop', 'scrollLeft'],
+      '+slottable': ['assignedSlot'],
+      HTMLElement: ['innerText', 'hidden', 'offsetParent', 'offsetWidth', 'offsetHeight', 'offsetLeft', 'offsetTop',
+        'contentEditable', 'isContentEditable'],
+      '+htmlsvg': ['style', 'dataset', 'tabIndex'],
+      '+titled': ['title', 'lang', 'dir'],
+      '+docroot': ['activeElement'],
+      '+host': ['host'],
+      '+value': ['value'],
+      '+disabled': ['disabled'],
+      '+href': ['href'],
+      '+src': ['src'],
+      '+name': ['name'],
+      '+type': ['type'],
+      '+data': ['data'],
+      HTMLMediaElement: ['currentTime', 'paused', 'ended', 'muted', 'volume', 'playbackRate', 'duration',
+        'networkState', 'buffered', 'seekable', 'played', 'currentSrc', 'textTracks'],
+      '+ready': ['readyState'],
+      HTMLVideoElement: ['videoWidth', 'videoHeight'],
+      '+frame': ['contentWindow', 'contentDocument'],
+      HTMLFormElement: ['action', 'method'],
+      '+target': ['target'],
+      '+rel': ['rel'],
+      '+alt': ['alt'],
+      '+textlike': ['placeholder', 'readOnly'],
+      HTMLOptionElement: ['selected'],
+      '+multiple': ['multiple'],
+      '+required': ['required'],
+      HTMLInputElement: ['checked', 'min', 'step', 'pattern'],
+      '+max': ['max'],
+      '+form': ['form'],
+      '+label': ['label'],
+      '+for': ['htmlFor'],
+      '+size': ['width', 'height']
+    };
+    var forms = ['HTMLInputElement', 'HTMLButtonElement', 'HTMLSelectElement', 'HTMLTextAreaElement'];
+    var accMixins = {
+      '+parent': mixins['+parent'],
+      '+elsib': ['Element', 'CharacterData'],
+      '+slottable': ['Element', 'Text'],
+      '+htmlsvg': ['HTMLElement', 'SVGElement', 'MathMLElement'],
+      '+titled': ['HTMLElement', 'Document'],
+      '+docroot': ['Document', 'ShadowRoot'],
+      '+host': ['ShadowRoot', 'HTMLAnchorElement', 'HTMLAreaElement'],
+      '+value': forms.concat(['HTMLOptionElement', 'HTMLOutputElement', 'HTMLDataElement', 'HTMLLIElement',
+        'HTMLMeterElement', 'HTMLProgressElement', 'HTMLParamElement', 'Attr']),
+      '+disabled': forms.concat(['HTMLOptionElement', 'HTMLOptGroupElement', 'HTMLFieldSetElement', 'HTMLLinkElement', 'HTMLStyleElement']),
+      '+href': ['HTMLAnchorElement', 'HTMLAreaElement', 'HTMLLinkElement', 'HTMLBaseElement'],
+      '+src': ['HTMLImageElement', 'HTMLScriptElement', 'HTMLIFrameElement', 'HTMLMediaElement', 'HTMLSourceElement',
+        'HTMLEmbedElement', 'HTMLInputElement', 'HTMLTrackElement', 'HTMLFrameElement'],
+      '+name': forms.concat(['HTMLFormElement', 'HTMLIFrameElement', 'HTMLMetaElement', 'HTMLAnchorElement', 'HTMLMapElement',
+        'HTMLObjectElement', 'HTMLParamElement', 'HTMLOutputElement', 'HTMLFieldSetElement', 'HTMLSlotElement',
+        'HTMLEmbedElement', 'HTMLFrameElement', 'HTMLImageElement', 'HTMLDetailsElement', 'DocumentType', 'Attr']),
+      '+type': forms.concat(['HTMLScriptElement', 'HTMLStyleElement', 'HTMLLinkElement', 'HTMLSourceElement', 'HTMLObjectElement',
+        'HTMLEmbedElement', 'HTMLOListElement', 'HTMLAnchorElement', 'HTMLOutputElement', 'HTMLFieldSetElement', 'HTMLLIElement']),
+      '+data': ['CharacterData', 'HTMLObjectElement'],
+      '+ready': ['Document', 'HTMLMediaElement'],
+      '+frame': ['HTMLIFrameElement', 'HTMLFrameElement', 'HTMLObjectElement'],
+      '+target': ['HTMLAnchorElement', 'HTMLAreaElement', 'HTMLFormElement', 'HTMLBaseElement', 'HTMLLinkElement'],
+      '+rel': ['HTMLAnchorElement', 'HTMLAreaElement', 'HTMLLinkElement'],
+      '+alt': ['HTMLImageElement', 'HTMLInputElement', 'HTMLAreaElement'],
+      '+textlike': ['HTMLInputElement', 'HTMLTextAreaElement'],
+      '+multiple': ['HTMLInputElement', 'HTMLSelectElement'],
+      '+required': ['HTMLInputElement', 'HTMLSelectElement', 'HTMLTextAreaElement'],
+      '+max': ['HTMLInputElement', 'HTMLMeterElement', 'HTMLProgressElement'],
+      '+form': forms.concat(['HTMLOptionElement', 'HTMLFieldSetElement', 'HTMLOutputElement', 'HTMLObjectElement',
+        'HTMLLabelElement', 'HTMLLegendElement']),
+      '+label': ['HTMLOptionElement', 'HTMLOptGroupElement', 'HTMLTrackElement'],
+      '+for': ['HTMLLabelElement', 'HTMLOutputElement'],
+      '+size': ['HTMLImageElement', 'HTMLCanvasElement', 'HTMLVideoElement', 'HTMLIFrameElement', 'HTMLEmbedElement',
+        'HTMLObjectElement', 'HTMLInputElement', 'HTMLSourceElement']
+    };
+    Object.keys(acc).forEach(function (k) {
+      homes[k] = (homes[k] || []).concat(acc[k]);
+      if (accMixins[k]) mixins[k] = accMixins[k];
+    });
     var moved = {};
     Object.keys(homes).forEach(function (iface) {
       var targets = mixins[iface] || [iface];

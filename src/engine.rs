@@ -628,6 +628,8 @@ pub fn fetch_images(urls: &[String], done: &(dyn Fn(String, Option<Arc<Image>>) 
 }
 
 pub struct Page {
+    /// Where the pointer is (page coordinates), for mouse event fields.
+    pub pointer_at: Option<(f32, f32)>,
     pub url: String,
     pub base: String,
     pub doc: Document,
@@ -680,6 +682,27 @@ pub enum Edit {
 }
 
 /// What a click on the page did.
+/// Mouse / pointer event fields at page point (x, y).
+fn mouse_fields(it: &mut js::Interp, e: &js::Value, x: f32, y: f32, buttons: f64, pointer: bool) {
+    for (k, v) in [("clientX", x), ("clientY", y), ("pageX", x), ("pageY", y), ("screenX", x), ("screenY", y), ("x", x), ("y", y), ("offsetX", 0.0), ("offsetY", 0.0)] {
+        let _ = it.put(e, k, js::Value::Num(v as f64));
+    }
+    let _ = it.put(e, "button", js::Value::Num(0.0));
+    let _ = it.put(e, "buttons", js::Value::Num(buttons));
+    let _ = it.put(e, "which", js::Value::Num(1.0));
+    let _ = it.put(e, "detail", js::Value::Num(1.0));
+    let _ = it.put(e, "cancelable", js::Value::Bool(true));
+    let _ = it.put(e, "composed", js::Value::Bool(true));
+    if pointer {
+        let _ = it.put(e, "pointerId", js::Value::Num(1.0));
+        let _ = it.put(e, "pointerType", js::Value::str("mouse"));
+        let _ = it.put(e, "isPrimary", js::Value::Bool(true));
+        let _ = it.put(e, "width", js::Value::Num(1.0));
+        let _ = it.put(e, "height", js::Value::Num(1.0));
+        let _ = it.put(e, "pressure", js::Value::Num(if buttons > 0.0 { 0.5 } else { 0.0 }));
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Click {
     /// Nothing special: follow a link under the pointer, if any.
@@ -762,7 +785,7 @@ impl Page {
         doc.target = target_of(&doc, &l.url);
         let sheets = sheets_for(&doc, &base, &mut css);
         let (styles, tree, dl) = render(&doc, &sheets, &base, &mut res, vw, vh, &mut t);
-        let mut page = Page { url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, elem_scroll: FxHashMap::default(), vw, vh };
+        let mut page = Page { pointer_at: None, url: l.url, base, doc, css, styles, tree, dl, res, js, t, script_ms, layouts: 0, caret: 0, nav: None, focus_value: String::new(), url_events: Vec::new(), history_go: None, scroll: 0.0, scroll_changed: false, geo_dirty: true, elem_scroll: FxHashMap::default(), vw, vh };
         page.sync_js_geometry();
         page.script_requests();
         // Initial IntersectionObserver / ResizeObserver callbacks (lazy
@@ -927,15 +950,20 @@ impl Page {
             }
         }
         let restyle = css::hover_rules_seen();
+        let pointer_at = self.pointer_at;
         if let Some(it) = &mut self.js {
             it.dirty |= restyle;
             self.with_js(|it| {
+                let (x, y) = pointer_at.unwrap_or((0.0, 0.0));
                 for (n, ty, bubbles) in evs {
-                    if bubbles {
-                        js::dombind::dispatch(it, n, ty, |_, _| {});
-                    } else {
-                        js::dombind::dispatch_nobubble(it, n, ty);
-                    }
+                    let buttons = if down { 1.0 } else { 0.0 };
+                    let pointer = ty.starts_with("pointer");
+                    js::dombind::dispatch(it, n, ty, |it, e| {
+                        mouse_fields(it, e, x, y, buttons, pointer);
+                        if !bubbles {
+                            let _ = it.put(e, "bubbles", js::Value::Bool(false));
+                        }
+                    });
                 }
             });
         } else if restyle {
@@ -1099,6 +1127,16 @@ impl Page {
 
     /// Dispatch a click on the element at a page point and run its default
     /// action (focus a field, toggle a checkbox, submit a form).
+    /// A complete click without a real pointer (headless runs): pointer /
+    /// mouse down and up, then `click`.
+    pub fn click_full(&mut self, x: f32, y: f32) -> Click {
+        let node = self.tree.node_at(x, y);
+        self.pointer_at = Some((x, y));
+        self.set_pointer(node, true);
+        self.set_pointer(node, false);
+        self.click(x, y)
+    }
+
     pub fn click(&mut self, x: f32, y: f32) -> Click {
         let Some(node) = self.tree.node_at(x, y) else {
             self.set_focus(NONE);
@@ -1117,11 +1155,7 @@ impl Page {
         }
         let prevented = self
             .with_js(|it| {
-                js::dombind::dispatch(it, node, "click", |it, e| {
-                    let _ = it.put(e, "clientX", js::Value::Num(x as f64));
-                    let _ = it.put(e, "clientY", js::Value::Num(y as f64));
-                    let _ = it.put(e, "button", js::Value::Num(0.0));
-                })
+                js::dombind::dispatch(it, node, "click", |it, e| mouse_fields(it, e, x, y, 0.0, false))
             })
             .unwrap_or(false);
         if let Some(n) = self.take_nav() {

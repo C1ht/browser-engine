@@ -1038,7 +1038,14 @@ impl Interp {
         let (m, u) = (method.to_string(), url.to_string());
         let h = with_referer(&self.url, headers);
         std::thread::spawn(move || {
-            let _ = tx.send(crate::net::http(&m, &u, &h, body.as_deref()));
+            let r = crate::net::http(&m, &u, &h, body.as_deref());
+            if trace_net() {
+                match &r {
+                    Ok(resp) => eprintln!("[net] {m} {u} -> {} ({} bytes)", resp.status, resp.body.len()),
+                    Err(e) => eprintln!("[net] {m} {u} -> error {e}"),
+                }
+            }
+            let _ = tx.send(r);
         });
         self.requests.push(Pending { rx, target });
     }
@@ -1555,4 +1562,10 @@ mod live_tests {
         assert!(lines.iter().any(|l| l == "xhr 200 bolt"));
         assert!(lines.iter().any(|l| l == "notfound 404 false"));
     }
+}
+
+/// `BOLT_TRACE_NET=1`: log script-initiated requests.
+pub fn trace_net() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BOLT_TRACE_NET").is_some())
 }

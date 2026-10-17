@@ -62,9 +62,16 @@ pub fn http(method: &str, url: &str, headers: &[(String, String)], body: Option<
     cmd.arg(&hdr_path);
     cmd.args(["-w", "%{stderr}\n@@BOLT %{http_code} %{url_effective}\n"]);
     let m = method.to_ascii_uppercase();
+    // Methods with a body always send one (an empty POST still needs
+    // Content-Length: 0). POST is implied by the data, so redirects switch
+    // to GET as in browsers.
+    let body = match (body, m.as_str()) {
+        (None, "POST" | "PUT" | "PATCH") => Some(&[][..]),
+        (b, _) => b,
+    };
     if m == "HEAD" {
         cmd.arg("--head");
-    } else if m != "GET" {
+    } else if m != "GET" && m != "POST" {
         cmd.args(["-X", &m]);
     }
     if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")) {
@@ -79,6 +86,11 @@ pub fn http(method: &str, url: &str, headers: &[(String, String)], body: Option<
     }
     if body.is_some() {
         cmd.args(["--data-binary", "@-"]);
+        // No content type unless the page gave one (curl would add
+        // application/x-www-form-urlencoded).
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-type")) {
+            cmd.args(["-H", "Content-Type:"]);
+        }
     }
     cmd.arg(url).stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("could not run curl: {e}"))?;
