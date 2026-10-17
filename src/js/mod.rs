@@ -1583,10 +1583,18 @@ impl Interp {
             self.log(&format!("[profile] parsed {} bytes in {:.1}ms", src.len(), t.elapsed().as_secs_f64() * 1000.0));
         }
         let env = self.genv.clone();
+        // Scripts with loops run on the bytecode VM (in the global scope).
+        let def = Rc::new(FuncDef { name: None, params: Vec::new(), rest: None, body: Body::Block(prog), arrow: false, is_async: false, is_gen: false, strict: false, vm: Default::default() });
+        let Body::Block(prog) = &def.body else { unreachable!() };
         self.script_running += 1;
         let r = (|| -> R<()> {
-            self.hoist(&prog, &env)?;
-            for s in &prog {
+            self.hoist(prog, &env)?;
+            if let Some(code) = vm::compile_script(&def) {
+                let code = Rc::new(code);
+                self.vm_script(&code)?;
+                return Ok(());
+            }
+            for s in prog {
                 self.exec(s, &env)?;
             }
             Ok(())
@@ -3116,6 +3124,42 @@ mod tests {
         it.run_microtasks();
         it.run_timers(1e9);
         it.console.clone()
+    }
+
+    /// Hot code runs on the bytecode VM and the JIT: results must match
+    /// the language (loops past the JIT threshold, deopts, caches).
+    #[test]
+    fn vm_and_jit() {
+        let mut it = Interp::new(Document::new(), "https://example.com/", 800.0, 600.0);
+        let scripts = [
+            // Numeric loops, type changes mid-loop (guards), mod / compare.
+            "function sum(n) { let s = 0; for (let i = 0; i < n; i++) { s = (s + i * 3) % 1000003; } return s; }
+             var r1 = sum(5000);
+             function mix(n) { let x = 0; for (let i = 0; i < n; i++) { x = i < n / 2 ? x + 1 : x + '!'; } return x; }
+             var r2 = mix(2000).length;
+             console.log(r1, r2, 7 % -3, -7 % 3, -0 % 5 === 0 && 1 / (-0 % 5));",
+            // Shapes and inline caches: same constructor, then a different shape.
+            "function P(x, y) { this.x = x; this.y = y; }
+             P.prototype.len = function () { return this.x + this.y; };
+             var t = 0; for (var i = 0; i < 3000; i++) { var p = new P(i, 1); t += p.len(); }
+             var q = { y: 5, x: 1, len: P.prototype.len }; t += q.len();
+             var o = new P(1, 2); Object.defineProperty(o, 'x', { get() { return 100; } }); t += o.len();
+             console.log(t);",
+            // Exceptions thrown and caught inside hot loops; finally.
+            "function f(n) { let c = 0; for (let i = 0; i < n; i++) { try { if (i % 7 === 0) throw i; c++; } catch (e) { c += 2; } finally { c += 1; } } return c; }
+             console.log(f(1000));",
+            // A global read in a hot function, then shadowed by a later script.
+            "window.h = 1; function rd() { return h; } var acc = 0; for (var i = 0; i < 2000; i++) acc += rd(); console.log(acc);",
+            "let h = 5; console.log(rd());",
+            // Top-level loop with var / let globals and closures over let.
+            "var fs = []; for (let k = 0; k < 600; k++) fs.push(() => k); let tot = 0; for (var j = 0; j < fs.length; j++) tot += fs[j](); console.log(tot, typeof j, j);",
+        ];
+        for s in scripts {
+            if let Err(e) = it.run_script(s) {
+                panic!("script failed: {e}");
+            }
+        }
+        assert_eq!(it.console, ["492389 1004 1 -1 -Infinity", "4501608", "2143", "2000", "5", "179700 number 600"]);
     }
 
     fn eval1(src: &str) -> String {

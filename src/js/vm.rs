@@ -133,8 +133,9 @@ pub enum Op {
     Move { dst: Reg, src: Reg },
     /// `this` of an arrow function (from the scope chain).
     ThisEnv { dst: Reg },
-    GetName { dst: Reg, name: u32 },
-    SetName { name: u32, src: Reg },
+    /// Variables by name (`ic`: a global-variable cache for free names).
+    GetName { dst: Reg, name: u32, ic: u32 },
+    SetName { name: u32, src: Reg, ic: u32 },
     /// Declare in the current scope object.
     DeclName { name: u32, src: Reg },
     TypeofName { dst: Reg, name: u32 },
@@ -976,6 +977,9 @@ struct Compiler<'a> {
     floor: Reg,
     /// Inline caches allocated.
     nics: u32,
+    /// A top-level script: every variable lives in the global scope (var
+    /// on the global object, let / const in the script scope).
+    script: bool,
 }
 
 type CResult = Result<(), ()>;
@@ -1030,6 +1034,10 @@ impl<'a> Compiler<'a> {
         i
     }
 
+    fn is_env(&self, n: &str) -> bool {
+        self.script || self.env_names.contains(n)
+    }
+
     /// An inline cache for a named property access (none for names with
     /// special semantics).
     fn ic_for(&mut self, name: u32) -> u32 {
@@ -1059,7 +1067,7 @@ impl<'a> Compiler<'a> {
         if let Some(b) = self.scopes.last().unwrap().get(n) {
             return *b;
         }
-        let b = if self.env_names.contains(n) {
+        let b = if self.is_env(n) {
             Binding::Env
         } else {
             self.reg_names.insert(n.clone());
@@ -1074,7 +1082,7 @@ impl<'a> Compiler<'a> {
     /// Bind a name of the function scope to a fixed register (parameters,
     /// the callee, `arguments`), or copy it into the scope object.
     fn bind_fixed(&mut self, n: &Rc<str>, r: Reg) {
-        if self.env_names.contains(n) {
+        if self.is_env(n) {
             self.scopes.last_mut().unwrap().insert(n.clone(), Binding::Env);
             let name = self.name(n);
             self.emit(Op::DeclName { name, src: r });
@@ -1109,9 +1117,19 @@ impl<'a> Compiler<'a> {
             }
             _ => {
                 let name = self.name(n);
-                self.emit(Op::SetName { name, src });
+                let ic = self.global_ic(n);
+                self.emit(Op::SetName { name, src, ic });
             }
         }
+    }
+
+    /// A global-variable cache for a name not declared in this function.
+    fn global_ic(&mut self, n: &str) -> u32 {
+        if self.lookup(n).is_some() {
+            return NO_IC;
+        }
+        self.nics += 1;
+        self.nics - 1
     }
 
     /// The register a variable lives in, if it's a register variable.
@@ -1256,13 +1274,13 @@ impl<'a> Compiler<'a> {
             def.params.iter().for_each(|p| idents_pat(p, &mut ids));
             ids.contains("arguments")
         };
-        if !def.arrow && mentions_arguments {
+        if !def.arrow && mentions_arguments && !self.script {
             self.uses_arguments = true;
             let n: Rc<str> = "arguments".into();
             self.bind_fixed(&n, R_ARGUMENTS);
         }
         // A named function expression can refer to itself.
-        if let Some(name) = &def.name {
+        if let (Some(name), false) = (&def.name, self.script) {
             if !def.arrow {
                 self.bind_fixed(name, R_CALLEE);
             }
@@ -1285,9 +1303,12 @@ impl<'a> Compiler<'a> {
                 self.emit(Op::Return { src: r });
             }
             Body::Block(stmts) => {
-                // var hoisting.
+                // var hoisting (scripts: done by the caller, on the global
+                // object, as are their function declarations).
                 let mut vars = Vec::new();
-                stmts.iter().for_each(|s| var_names(s, &mut vars));
+                if !self.script {
+                    stmts.iter().for_each(|s| var_names(s, &mut vars));
+                }
                 for v in vars {
                     if self.scopes.last().unwrap().contains_key(&v) {
                         continue;
@@ -1299,7 +1320,9 @@ impl<'a> Compiler<'a> {
                         self.init_binding(&v, b, u);
                     }
                 }
-                self.hoist_functions(stmts)?;
+                if !self.script {
+                    self.hoist_functions(stmts)?;
+                }
                 for s in stmts {
                     self.stmt(s)?;
                 }
@@ -1339,7 +1362,7 @@ impl<'a> Compiler<'a> {
                 _ => {}
             }
             for n in names {
-                if self.env_names.contains(&n) {
+                if self.is_env(&n) {
                     any_env = true;
                 }
             }
@@ -1645,7 +1668,7 @@ impl<'a> Compiler<'a> {
             if let Some(Stmt::Var(_, ds)) = init {
                 ds.iter().for_each(|(p, _)| pat_names(p, &mut names));
             }
-            per_iter = names.iter().any(|n| self.env_names.contains(n));
+            per_iter = names.iter().any(|n| self.is_env(n));
             if per_iter {
                 self.emit(Op::PushScope);
                 self.envs += 1;
@@ -1703,7 +1726,7 @@ impl<'a> Compiler<'a> {
         let mut names = Vec::new();
         pat_names(pat, &mut names);
         let lexical = matches!(kind, Some(VarKind::Let | VarKind::Const));
-        let scoped = lexical && names.iter().any(|n| self.env_names.contains(n));
+        let scoped = lexical && names.iter().any(|n| self.is_env(n));
         self.scopes.push(FxHashMap::default());
         if scoped {
             self.emit(Op::PushScope);
@@ -1819,7 +1842,7 @@ impl<'a> Compiler<'a> {
                 Stmt::Func(f) => names.extend(f.name.clone()),
                 _ => {}
             }
-            names.iter().any(|n| self.env_names.contains(n))
+            names.iter().any(|n| self.is_env(n))
         });
         self.scopes.push(FxHashMap::default());
         if push {
@@ -1895,6 +1918,7 @@ impl<'a> Compiler<'a> {
         match p {
             Pattern::Ident(n) => {
                 match kind {
+                    Some(VarKind::Var) if self.script && self.lookup(n).is_none() => self.assign_name(n, src),
                     Some(_) => {
                         let b = match self.lookup_local_decl(n, kind) {
                             Some(b) => b,
@@ -2061,7 +2085,8 @@ impl<'a> Compiler<'a> {
                     }
                     _ => {
                         let name = self.name(n);
-                        self.emit(Op::GetName { dst, name });
+                        let ic = self.global_ic(n);
+                        self.emit(Op::GetName { dst, name, ic });
                     }
                 }
             }
@@ -2520,7 +2545,8 @@ impl<'a> Compiler<'a> {
                 }
                 _ => {
                     let name = c.name(n);
-                    c.emit(Op::GetName { dst: into, name });
+                    let ic = c.global_ic(n);
+                    c.emit(Op::GetName { dst: into, name, ic });
                 }
             },
             T::Prop(ob, name) => {
@@ -2593,18 +2619,33 @@ fn chain_has_super(e: &Expr) -> bool {
 /// Compile a function, or None if the VM can't run it (the tree-walking
 /// interpreter does).
 pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
+    compile_as(def, false)
+}
+
+/// A top-level script's body (wrapped in a FuncDef), run in the global
+/// scope: worth it when it loops.
+pub fn compile_script(def: &Rc<FuncDef>) -> Option<Code> {
+    if !vm_enabled() || !has_loop(def) {
+        return None;
+    }
+    compile_as(def, true)
+}
+
+fn compile_as(def: &Rc<FuncDef>, script: bool) -> Option<Code> {
     if (def.is_gen || def.is_async) && !coro::supported() {
         return None;
     }
     // Names captured by nested functions / classes live in scope objects.
     let mut env_names = FxHashSet::default();
     let mut nested = false;
-    match &def.body {
-        Body::Expr(e) => captured_expr(e, &mut env_names, &mut nested),
-        Body::Block(b) => b.iter().for_each(|s| captured_stmt(s, &mut env_names, &mut nested)),
-    }
-    for p in &def.params {
-        captured_pat(p, &mut env_names, &mut nested);
+    if !script {
+        match &def.body {
+            Body::Expr(e) => captured_expr(e, &mut env_names, &mut nested),
+            Body::Block(b) => b.iter().for_each(|s| captured_stmt(s, &mut env_names, &mut nested)),
+        }
+        for p in &def.params {
+            captured_pat(p, &mut env_names, &mut nested);
+        }
     }
     // Islands referencing register variables force those into scope objects:
     // recompile until stable.
@@ -2639,6 +2680,7 @@ pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
             scope_pushed: Vec::new(),
             floor: 0,
             nics: 0,
+            script,
         };
         if c.function(def).is_err() || c.failed {
             return None;
@@ -2646,7 +2688,7 @@ pub fn compile(def: &Rc<FuncDef>) -> Option<Code> {
         let conflicts: Vec<Rc<str>> = c.island_names.iter().filter(|n| c.reg_names.contains(*n)).cloned().collect();
         let islands = !c.exprs.is_empty() || !c.stmts.is_empty() || !c.pats.is_empty();
         if conflicts.is_empty() {
-            let needs_env = nested || islands || env_names.iter().any(|n| c.reg_names.contains(n)) || !env_names.is_empty() || (!def.arrow && uses_this_or_super(def) && nested);
+            let needs_env = !script && (nested || islands || env_names.iter().any(|n| c.reg_names.contains(n)) || !env_names.is_empty() || (!def.arrow && uses_this_or_super(def) && nested));
             return Some(Code {
                 arrow: def.arrow,
                 strict: def.strict,
@@ -2719,6 +2761,13 @@ impl Interp {
         }
         *def.vm.borrow_mut() = VmEntry::Code(code.clone());
         code
+    }
+
+    /// Run a compiled top-level script in the global scope.
+    pub(crate) fn vm_script(&mut self, code: &Rc<Code>) -> R<Value> {
+        let genv = self.genv.clone();
+        let g = Value::Obj(self.global.clone());
+        self.vm_call(code, genv, g, &[], None, None)
     }
 
     /// Run a compiled function.
@@ -2855,15 +2904,8 @@ impl Interp {
                     f.regs[dst as usize] = v;
                 }
                 Op::ThisEnv { dst } => f.regs[dst as usize] = Self::this_val(Self::vm_env(f)),
-                Op::GetName { dst, name } => {
-                    let env = Self::vm_env(f).clone();
-                    f.regs[dst as usize] = self.lookup(&code.names[name as usize], &env)?;
-                }
-                Op::SetName { name, src } => {
-                    let env = Self::vm_env(f).clone();
-                    let v = f.regs[src as usize].clone();
-                    self.assign_var(&code.names[name as usize], v, &env)?;
-                }
+                Op::GetName { dst, name, ic } => self.op_get_name(code, f, dst, name, ic)?,
+                Op::SetName { name, src, ic } => self.op_set_name(code, f, name, src, ic)?,
                 Op::DeclName { name, src } => {
                     let v = f.regs[src as usize].clone();
                     Self::vm_env(f).vars.borrow_mut().insert(code.names[name as usize].clone(), v);
@@ -3753,6 +3795,81 @@ unsafe extern "win64" fn jit_step(ctx: *mut super::jit::Ctx, ip: u64) -> u64 {
 }
 
 impl Interp {
+    /// Global variables: the global object's slot, while its shape and the
+    /// global scope's size are unchanged (see `global_ic_fill`).
+    #[inline(always)]
+    fn op_get_name(&mut self, code: &Code, f: &mut Frame, dst: Reg, name: u32, ic: u32) -> R<()> {
+        if ic != NO_IC {
+            let icr = &code.ics[ic as usize];
+            let hit = {
+                let g = self.global.borrow();
+                if g.props.shape_id() == icr.ids[0].get() && self.genv.vars.borrow().len() as u64 == icr.ids[1].get() {
+                    let p = g.props.slot(icr.slot.get() as usize);
+                    if p.get.is_none() && p.set.is_none() { Some(p.v.clone()) } else { None }
+                } else {
+                    None
+                }
+            };
+            if let Some(v) = hit {
+                f.regs[dst as usize] = v;
+                return Ok(());
+            }
+        }
+        let env = Self::vm_env(f).clone();
+        let key = &code.names[name as usize];
+        f.regs[dst as usize] = self.lookup(key, &env)?;
+        if ic != NO_IC {
+            self.global_ic_fill(&env, key, &code.ics[ic as usize]);
+        }
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn op_set_name(&mut self, code: &Code, f: &mut Frame, name: u32, src: Reg, ic: u32) -> R<()> {
+        if ic != NO_IC {
+            let icr = &code.ics[ic as usize];
+            let genv_len = self.genv.vars.borrow().len() as u64;
+            let mut g = self.global.borrow_mut();
+            if g.props.shape_id() == icr.ids[0].get() && genv_len == icr.ids[1].get() {
+                let p = g.props.slot_mut(icr.slot.get() as usize);
+                if p.get.is_none() && p.set.is_none() {
+                    p.v = f.regs[src as usize].clone();
+                    return Ok(());
+                }
+            }
+        }
+        let env = Self::vm_env(f).clone();
+        let key = &code.names[name as usize];
+        let v = f.regs[src as usize].clone();
+        self.assign_var(key, v, &env)?;
+        if ic != NO_IC {
+            self.global_ic_fill(&env, key, &code.ics[ic as usize]);
+        }
+        Ok(())
+    }
+
+    /// Cache a name that resolves to a data property of the global object
+    /// (no scope on the chain has it). Scopes of enclosing functions declare
+    /// fixed names, and new global-scope declarations change its size.
+    fn global_ic_fill(&self, env: &Env, key: &str, ic: &Ic) {
+        let mut cur = Some(env);
+        while let Some(s) = cur {
+            if s.vars.borrow().contains_key(key) {
+                return;
+            }
+            cur = s.parent.as_ref();
+        }
+        let g = self.global.borrow();
+        if let Some(i) = g.props.find(key) {
+            let p = g.props.slot(i);
+            if p.get.is_none() && p.set.is_none() {
+                ic.ids[0].set(g.props.shape_id());
+                ic.ids[1].set(self.genv.vars.borrow().len() as u64);
+                ic.slot.set(i as u32);
+            }
+        }
+    }
+
     #[inline(always)]
     fn op_get_prop(&mut self, code: &Code, f: &mut Frame, dst: Reg, obj: Reg, name: u32, ic: u32) -> R<()> {
         if ic != NO_IC {
@@ -3909,6 +4026,14 @@ jit_helper!(jit_call, |it, code, f, op| match op {
     Op::Call { dst, f: fr, this, args, argc } => it.op_call(f, dst, fr, this, args, argc),
     _ => unreachable!(),
 });
+jit_helper!(jit_get_name, |it, code, f, op| match op {
+    Op::GetName { dst, name, ic } => it.op_get_name(code, f, dst, name, ic),
+    _ => unreachable!(),
+});
+jit_helper!(jit_set_name, |it, code, f, op| match op {
+    Op::SetName { name, src, ic } => it.op_set_name(code, f, name, src, ic),
+    _ => unreachable!(),
+});
 jit_helper!(jit_move, |it, code, f, op| {
     let _ = it;
     match op {
@@ -3937,6 +4062,8 @@ pub(crate) fn jit_helper_for(op: &Op) -> usize {
         Op::GetIndex { .. } => jit_get_index as *const () as usize,
         Op::SetIndex { .. } => jit_set_index as *const () as usize,
         Op::Call { .. } => jit_call as *const () as usize,
+        Op::GetName { .. } => jit_get_name as *const () as usize,
+        Op::SetName { .. } => jit_set_name as *const () as usize,
         Op::Move { .. } | Op::Const { .. } => jit_move as *const () as usize,
         _ => jit_step as *const () as usize,
     }
