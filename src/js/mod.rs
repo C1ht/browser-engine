@@ -1090,6 +1090,48 @@ impl Interp {
         }
     }
 
+    /// All own string-keyed property names (getOwnPropertyNames), or the
+    /// symbol keys (getOwnPropertySymbols). Engine-internal `@@` keys are
+    /// in neither.
+    pub fn own_property_keys(&mut self, v: &Value, symbols: bool) -> Vec<Rc<str>> {
+        const WELL_KNOWN: &[&str] = &[
+            "@@iterator", "@@asyncIterator", "@@toStringTag", "@@hasInstance", "@@toPrimitive", "@@species",
+            "@@isConcatSpreadable", "@@unscopables", "@@match", "@@matchAll", "@@replace", "@@search", "@@split",
+        ];
+        let is_symbol = |k: &str| k.starts_with("@@sym:") || WELL_KNOWN.contains(&k);
+        match v {
+            Value::Str(s) if !symbols => {
+                let mut out: Vec<Rc<str>> = (0..utf16_len(s)).map(|i| Rc::from(i.to_string())).collect();
+                out.push("length".into());
+                out
+            }
+            Value::Obj(o) if matches!(o.borrow().kind, Kind::Proxy(_)) => if symbols { Vec::new() } else { proxy::own_keys(self, o) },
+            Value::Obj(o) => {
+                let ob = o.borrow();
+                let mut out: Vec<Rc<str>> = Vec::new();
+                if !symbols {
+                    match &ob.kind {
+                        Kind::Array(a) => {
+                            out.extend((0..a.len()).filter(|&i| !matches!(a[i], Value::Hole)).map(|i| Rc::from(i.to_string())));
+                            out.push("length".into());
+                        }
+                        Kind::Typed(t) => out.extend((0..t.len).map(|i| Rc::from(i.to_string()))),
+                        _ => {}
+                    }
+                }
+                out.extend(
+                    ob.props
+                        .list
+                        .iter()
+                        .filter(|(k, _)| if symbols { is_symbol(k) } else { !k.starts_with("@@") })
+                        .map(|(k, _)| k.clone()),
+                );
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
     // --------------------------------------------------------------- calls
 
     pub fn call(&mut self, f: &Value, this: Value, args: &[Value]) -> R<Value> {

@@ -818,4 +818,48 @@
   fonts.ready = Promise.resolve(fonts);
   fonts[Symbol.iterator] = fonts.values;
   document.fonts = fonts;
+
+  // Put each DOM method on the interface the spec defines it on (polyfills
+  // such as Shady DOM copy e.g. Element.prototype.setAttribute). The
+  // natives are installed on Node.prototype; move them out.
+  (function () {
+    var NP = Node.prototype;
+    var homes = {
+      Element: ['getAttribute', 'setAttribute', 'setAttributeNS', 'removeAttribute', 'hasAttribute', 'hasAttributes',
+        'getAttributeNode', 'toggleAttribute', 'getAttributeNames', 'closest', 'matches', 'insertAdjacentHTML',
+        'getBoundingClientRect', 'scrollIntoView', 'scrollTo', 'scrollBy', 'setPointerCapture', 'releasePointerCapture',
+        'attachShadow', 'getElementsByClassName', 'getElementsByTagName'],
+      HTMLElement: ['click', 'focus', 'blur'],
+      SVGElement: ['focus', 'blur'],
+      HTMLCanvasElement: ['getContext', 'toDataURL'],
+      HTMLFormElement: ['submit', 'requestSubmit'],
+      HTMLInputElement: ['select', 'setSelectionRange'],
+      HTMLTextAreaElement: ['select', 'setSelectionRange'],
+      HTMLSlotElement: ['assignedNodes', 'assignedElements'],
+      HTMLMediaElement: ['load', 'play', 'pause', 'canPlayType', 'addTextTrack', 'fastSeek', 'captureStream'],
+      HTMLVideoElement: ['requestPictureInPicture'],
+      Document: ['getElementById', 'createElement', 'createElementNS', 'createTextNode', 'createComment',
+        'createDocumentFragment', 'write', 'writeln', 'hasFocus', 'importNode', 'adoptNode', 'createRange',
+        'getElementsByClassName', 'getElementsByTagName', 'getElementsByName'],
+      DocumentFragment: ['getElementById'],
+      // ParentNode / ChildNode mixins.
+      '+parent': ['append', 'prepend', 'querySelector', 'querySelectorAll'],
+      '+child': ['remove', 'before', 'after', 'replaceWith']
+    };
+    var mixins = { '+parent': ['Element', 'Document', 'DocumentFragment'], '+child': ['Element', 'CharacterData', 'DocumentType'] };
+    var moved = {};
+    Object.keys(homes).forEach(function (iface) {
+      var targets = mixins[iface] || [iface];
+      homes[iface].forEach(function (name) {
+        var d = Object.getOwnPropertyDescriptor(NP, name);
+        if (!d) return;
+        targets.forEach(function (t) {
+          var C = window[t];
+          if (C && C.prototype && !Object.prototype.hasOwnProperty.call(C.prototype, name)) Object.defineProperty(C.prototype, name, d);
+        });
+        moved[name] = true;
+      });
+    });
+    Object.keys(moved).forEach(function (name) { delete NP[name]; });
+  })();
 })();

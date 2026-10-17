@@ -135,7 +135,7 @@ pub fn install(it: &mut Interp) {
         ("setPrototypeOf", obj_set_proto),
         ("defineProperty", obj_define_property),
         ("defineProperties", obj_define_properties),
-        ("getOwnPropertyNames", obj_keys),
+        ("getOwnPropertyNames", obj_own_names),
         ("getOwnPropertyDescriptor", obj_get_own_desc),
         ("freeze", identity),
         ("seal", identity),
@@ -145,7 +145,7 @@ pub fn install(it: &mut Interp) {
         ("isExtensible", ret_true),
         ("fromEntries", obj_from_entries),
         ("is", obj_is),
-        ("getOwnPropertySymbols", empty_array),
+        ("getOwnPropertySymbols", obj_own_symbols),
     ] {
         it.def_method(&oc, n, f);
     }
@@ -473,9 +473,6 @@ fn ret_false(_: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
 fn ret_true(_: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
     Ok(Value::Bool(true))
 }
-fn empty_array(it: &mut Interp, _: Value, _: &[Value]) -> R<Value> {
-    Ok(it.array(Vec::new()))
-}
 
 // ----------------------------------------------------------------- Object
 
@@ -500,6 +497,14 @@ impl Interp {
 
 fn obj_keys(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
     let ks = it.own_keys(&arg(a, 0)).into_iter().map(Value::Str).collect();
+    Ok(it.array(ks))
+}
+fn obj_own_names(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let ks = it.own_property_keys(&arg(a, 0), false).into_iter().map(Value::Str).collect();
+    Ok(it.array(ks))
+}
+fn obj_own_symbols(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
+    let ks = it.own_property_keys(&arg(a, 0), true).into_iter().map(Value::Str).collect();
     Ok(it.array(ks))
 }
 fn obj_values(it: &mut Interp, _: Value, a: &[Value]) -> R<Value> {
