@@ -1633,3 +1633,159 @@ if (typeof window.name !== 'string') window.name = '';
   window.MessagePort = MessagePort;
   window.MessageChannel = MessageChannel;
 })();
+
+// WebAssembly (natives in src/js/wasm/api.rs).
+(function () {
+  var W = window['@@wasm'];
+  function hidden(o, k, v) { Object.defineProperty(o, k, { value: v, enumerable: false, configurable: true, writable: true }); }
+  function makeErr(name) {
+    var C = function (message) {
+      var e = new Error(message);
+      Object.setPrototypeOf(e, C.prototype);
+      return e;
+    };
+    C.prototype = Object.create(Error.prototype);
+    hidden(C.prototype, 'constructor', C);
+    hidden(C.prototype, 'name', name);
+    Object.defineProperty(C, 'name', { value: name });
+    return C;
+  }
+  var CompileError = makeErr('CompileError'), LinkError = makeErr('LinkError'), RuntimeError = makeErr('RuntimeError');
+  hidden(window, '@@wasmError', function (kind, msg) { return kind === 'LinkError' ? new LinkError(msg) : kind === 'CompileError' ? new CompileError(msg) : new RuntimeError(msg); });
+  function bytesOf(src) {
+    if (src instanceof ArrayBuffer) return new Uint8Array(src);
+    if (ArrayBuffer.isView(src)) return new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+    throw new TypeError('WebAssembly: Argument 0 must be a buffer source');
+  }
+  function H(o, C, what) {
+    if (!(o instanceof C) || !o['@@h']) throw new TypeError('Receiver is not a ' + what);
+    return o['@@h'];
+  }
+  function wrap(h, C) {
+    if (h == null) return h;
+    if (h['@@w']) return h['@@w'];
+    var o = Object.create(C.prototype);
+    hidden(o, '@@h', h);
+    hidden(h, '@@w', o);
+    return o;
+  }
+
+  function Module(bytes) {
+    if (!(this instanceof Module)) throw new TypeError("WebAssembly.Module must be invoked with 'new'");
+    var h = W.compile(bytesOf(bytes));
+    if (typeof h === 'string') throw new CompileError(h);
+    hidden(this, '@@h', h);
+  }
+  Module.exports = function (m) { return W.exports(H(m, Module, 'WebAssembly.Module')).map(function (e) { return { name: e[0], kind: e[1] }; }); };
+  Module.imports = function (m) { return W.imports(H(m, Module, 'WebAssembly.Module')).map(function (e) { return { module: e[0], name: e[1], kind: e[2] }; }); };
+  Module.customSections = function (m, name) { return W.customSections(H(m, Module, 'WebAssembly.Module'), String(name)); };
+  Object.defineProperty(Module.prototype, Symbol.toStringTag, { value: 'WebAssembly.Module' });
+
+  function Memory(desc) {
+    if (!(this instanceof Memory)) throw new TypeError("WebAssembly.Memory must be invoked with 'new'");
+    if (!desc || typeof desc !== 'object') throw new TypeError('WebAssembly.Memory(): Argument 0 must be a memory descriptor');
+    if (desc.initial === undefined && desc.minimum === undefined) throw new TypeError("WebAssembly.Memory(): Property 'initial' is required");
+    var h = W.memNew(desc.initial !== undefined ? desc.initial : desc.minimum, desc.maximum);
+    hidden(this, '@@h', h);
+    hidden(h, '@@w', this);
+  }
+  Object.defineProperty(Memory.prototype, 'buffer', { get: function () { return W.memBuffer(H(this, Memory, 'WebAssembly.Memory')); }, configurable: true });
+  hidden(Memory.prototype, 'grow', function (delta) { return W.memGrow(H(this, Memory, 'WebAssembly.Memory'), delta); });
+  Object.defineProperty(Memory.prototype, Symbol.toStringTag, { value: 'WebAssembly.Memory' });
+
+  function Table(desc, value) {
+    if (!(this instanceof Table)) throw new TypeError("WebAssembly.Table must be invoked with 'new'");
+    if (!desc || typeof desc !== 'object') throw new TypeError('WebAssembly.Table(): Argument 0 must be a table descriptor');
+    var h = W.tableNew(desc.element, desc.initial !== undefined ? desc.initial : desc.minimum, desc.maximum, value);
+    hidden(this, '@@h', h);
+    hidden(h, '@@w', this);
+  }
+  Object.defineProperty(Table.prototype, 'length', { get: function () { return W.tableLen(H(this, Table, 'WebAssembly.Table')); }, configurable: true });
+  hidden(Table.prototype, 'get', function (i) { return W.tableGet(H(this, Table, 'WebAssembly.Table'), i); });
+  hidden(Table.prototype, 'set', function (i, v) { W.tableSet(H(this, Table, 'WebAssembly.Table'), i, v); });
+  hidden(Table.prototype, 'grow', function (n, v) { return W.tableGrow(H(this, Table, 'WebAssembly.Table'), n, v); });
+  Object.defineProperty(Table.prototype, Symbol.toStringTag, { value: 'WebAssembly.Table' });
+
+  function Global(desc, v) {
+    if (!(this instanceof Global)) throw new TypeError("WebAssembly.Global must be invoked with 'new'");
+    if (!desc || typeof desc !== 'object') throw new TypeError('WebAssembly.Global(): Argument 0 must be a global descriptor');
+    var h = W.globalNew(desc.value, !!desc.mutable, v);
+    hidden(this, '@@h', h);
+    hidden(h, '@@w', this);
+  }
+  Object.defineProperty(Global.prototype, 'value', {
+    get: function () { return W.globalGet(H(this, Global, 'WebAssembly.Global')); },
+    set: function (v) { W.globalSet(H(this, Global, 'WebAssembly.Global'), v); },
+    configurable: true
+  });
+  hidden(Global.prototype, 'valueOf', function () { return W.globalGet(H(this, Global, 'WebAssembly.Global')); });
+  Object.defineProperty(Global.prototype, Symbol.toStringTag, { value: 'WebAssembly.Global' });
+
+  var classes = { memory: Memory, table: Table, global: Global };
+  function Instance(module, importObject) {
+    if (!(this instanceof Instance)) throw new TypeError("WebAssembly.Instance must be invoked with 'new'");
+    var h = H(module, Module, 'WebAssembly.Module');
+    var imps = W.imports(h);
+    if (imps.length && (importObject === undefined || importObject === null || typeof importObject !== 'object' && typeof importObject !== 'function'))
+      throw new TypeError('WebAssembly.Instance(): Imports argument must be present and must be an object');
+    var vals = imps.map(function (imp, i) {
+      var ns = importObject[imp[0]];
+      if (ns === undefined || ns === null || typeof ns !== 'object' && typeof ns !== 'function')
+        throw new TypeError('WebAssembly.Instance(): Import #' + i + ' "' + imp[0] + '": module is not an object or function');
+      var v = ns[imp[1]];
+      if (v && typeof v === 'object' && v['@@h']) return v['@@h'];
+      return v;
+    });
+    var r = W.instantiate(h, vals);
+    if (typeof r === 'string') {
+      if (r.indexOf('LinkError:') === 0) throw new LinkError(r.slice(10));
+      throw new RuntimeError(r);
+    }
+    var ex = Object.create(null);
+    r.forEach(function (e) {
+      ex[e[0]] = e[1] === 'function' || e[1] === 'tag' ? e[2] : wrap(e[2], classes[e[1]]);
+    });
+    Object.freeze(ex);
+    Object.defineProperty(this, 'exports', { value: ex, enumerable: true, configurable: true });
+  }
+  Object.defineProperty(Instance.prototype, Symbol.toStringTag, { value: 'WebAssembly.Instance' });
+
+  function later(f) {
+    return new Promise(function (resolve, reject) {
+      setTimeout(function () { try { resolve(f()); } catch (e) { reject(e); } }, 0);
+    });
+  }
+  function compile(bytes) {
+    var b;
+    try { b = new Uint8Array(bytesOf(bytes)); } catch (e) { return Promise.reject(e); }
+    return later(function () { return new Module(b); });
+  }
+  function instantiate(src, importObject) {
+    if (src instanceof Module) return later(function () { return new Instance(src, importObject); });
+    return compile(src).then(function (module) {
+      return { module: module, instance: new Instance(module, importObject) };
+    });
+  }
+  function fromResponse(source) {
+    return Promise.resolve(source).then(function (r) {
+      if (!r || typeof r.arrayBuffer !== 'function') throw new TypeError('WebAssembly: Argument 0 must be a Response or a Promise of a Response');
+      if (r.ok === false) throw new TypeError('WebAssembly: HTTP status code is not ok');
+      return r.arrayBuffer();
+    });
+  }
+  function Tag() { throw new TypeError('WebAssembly.Tag is not supported'); }
+  function Exception() { throw new TypeError('WebAssembly.Exception is not supported'); }
+
+  var WA = {
+    Module: Module, Instance: Instance, Memory: Memory, Table: Table, Global: Global,
+    CompileError: CompileError, LinkError: LinkError, RuntimeError: RuntimeError, Tag: Tag, Exception: Exception,
+    validate: function (bytes) { return W.validate(bytesOf(bytes)); },
+    compile: compile,
+    instantiate: instantiate,
+    compileStreaming: function (source) { return fromResponse(source).then(compile); },
+    instantiateStreaming: function (source, importObject) { return fromResponse(source).then(function (b) { return instantiate(b, importObject); }); }
+  };
+  Object.keys(WA).forEach(function (k) { Object.defineProperty(WA, k, { enumerable: false }); });
+  Object.defineProperty(WA, Symbol.toStringTag, { value: 'WebAssembly' });
+  Object.defineProperty(window, 'WebAssembly', { value: WA, writable: true, configurable: true, enumerable: false });
+})();

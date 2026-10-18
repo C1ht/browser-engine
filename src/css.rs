@@ -3484,40 +3484,44 @@ fn parse_style_rule(prelude: &str, body: &str, sheet: &mut Stylesheet, media: &M
         emit(sheet, prelude, body);
         return;
     }
-    // Declarations first, then nested rules (in order).
+    // Declarations and nested rules apply in source order: declarations
+    // after a nested rule form their own rule (CSSNestedDeclarations).
+    let parents: Vec<&str> = split_top(prelude, b',').into_iter().map(str::trim).filter(|p| !p.is_empty()).collect();
     let mut decls = String::new();
-    let mut nested: Vec<(&str, &str)> = Vec::new();
     let mut i = 0;
     while i < bb.len() {
         let end = find_top(bb, i, b";{").unwrap_or(bb.len());
         if end < bb.len() && bb[end] == b'{' {
             let close = match_brace(bb, end);
-            nested.push((body[i..end].trim(), &body[end + 1..close.min(bb.len())]));
+            let pre = body[i..end].trim();
+            let inner = &body[end + 1..close.min(bb.len())];
             i = close + 1;
+            if !decls.trim().is_empty() {
+                emit(sheet, prelude, &decls);
+                decls.clear();
+            }
+            if let Some(at) = pre.strip_prefix('@') {
+                let name_len = at.find(|c: char| c.is_whitespace() || c == '(').unwrap_or(at.len());
+                let (name, cond) = (at[..name_len].to_ascii_lowercase(), at[name_len..].trim());
+                match name.as_str() {
+                    "media" if eval_media(cond, media) => parse_style_rule(prelude, inner, sheet, media, ctx),
+                    "supports" if supports(cond) => parse_style_rule(prelude, inner, sheet, media, ctx),
+                    "container" | "scope" => parse_style_rule(prelude, inner, sheet, media, ctx),
+                    "layer" => parse_style_rule(prelude, inner, sheet, media, &ctx.sub_layer(cond)),
+                    _ => {}
+                }
+                continue;
+            }
+            let sel: Vec<String> = split_top(pre, b',').into_iter().flat_map(|c| parents.iter().map(move |p| nest_selector(p, c.trim()))).collect();
+            parse_style_rule(&sel.join(", "), inner, sheet, media, ctx);
         } else {
             decls.push_str(&body[i..end.min(bb.len())]);
             decls.push(';');
             i = end + 1;
         }
     }
-    emit(sheet, prelude, &decls);
-    let parents: Vec<&str> = split_top(prelude, b',').into_iter().map(str::trim).filter(|p| !p.is_empty()).collect();
-    for (pre, inner) in nested {
-        if let Some(at) = pre.strip_prefix('@') {
-            let (name, cond) = at.split_once(|c: char| c.is_whitespace() || c == '(').map_or((at, ""), |(a, _)| (a, &at[a.len()..]));
-            let ok = match name.to_ascii_lowercase().as_str() {
-                "media" => eval_media(cond.trim(), media),
-                "supports" => supports(cond.trim()),
-                "container" | "layer" | "scope" => true,
-                _ => false,
-            };
-            if ok {
-                parse_style_rule(prelude, inner, sheet, media, ctx);
-            }
-            continue;
-        }
-        let sel: Vec<String> = split_top(pre, b',').into_iter().flat_map(|c| parents.iter().map(move |p| nest_selector(p, c.trim()))).collect();
-        parse_style_rule(&sel.join(", "), inner, sheet, media, ctx);
+    if !decls.trim().is_empty() {
+        emit(sheet, prelude, &decls);
     }
 }
 

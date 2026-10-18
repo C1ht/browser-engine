@@ -23,6 +23,7 @@ pub mod vm;
 pub mod shape;
 pub mod jit;
 pub mod messaging;
+pub mod wasm;
 
 use crate::dom::{Document, NodeId};
 use crate::fx::FxHashMap;
@@ -103,7 +104,22 @@ pub fn num_to_str(n: f64) -> String {
         return "0".into();
     }
     if n.fract() == 0.0 && n.abs() < 1e21 {
-        return format!("{n:.0}");
+        if n.abs() < 9007199254740992.0 {
+            return format!("{n:.0}");
+        }
+        // Shortest round-trip digits, padded with zeros (not the exact
+        // binary value).
+        let s = format!("{:e}", n.abs());
+        if let Some((m, e)) = s.split_once('e') {
+            let digits: String = m.chars().filter(|c| c.is_ascii_digit()).collect();
+            let exp: usize = e.parse().unwrap_or(0);
+            let mut out = String::from(if n < 0.0 { "-" } else { "" });
+            out.push_str(&digits);
+            for _ in digits.len()..exp + 1 {
+                out.push('0');
+            }
+            return out;
+        }
     }
     if n.abs() >= 1e21 || n.abs() < 1e-6 {
         let s = format!("{n:e}");
@@ -221,6 +237,9 @@ pub enum Kind {
     DataView(binary::View),
     /// Headers / URLSearchParams / FormData entries.
     Pairs(web::PairKind, Vec<(Rc<str>, Rc<str>)>),
+    /// Native data behind a host object (WebAssembly modules, instances,
+    /// memories, tables, globals).
+    Host(Rc<dyn std::any::Any>),
 }
 
 /// A generator (or the hidden state of an async function call).
@@ -423,6 +442,7 @@ pub struct Interp {
     /// The DOM was modified (restyle + relayout needed).
     pub dirty: bool,
     pub steps: u64,
+    /// Steps a task may run (the time limit normally stops it first).
     pub budget: u64,
     pub timers: Vec<Timer>,
     pub next_timer: u32,
@@ -573,7 +593,7 @@ impl Interp {
             doc,
             dirty: false,
             steps: 0,
-            budget: 50_000_000,
+            budget: 5_000_000_000,
             timers: Vec::new(),
             next_timer: 1,
             micro: VecDeque::new(),
@@ -653,6 +673,7 @@ impl Interp {
         custom::install(&mut it);
         web::install(&mut it);
         messaging::install(&mut it);
+        wasm::api::install(&mut it);
         if let Err(e) = it.run_script(include_str!("prelude.js")) {
             eprintln!("js prelude: {e}");
         }
@@ -716,6 +737,9 @@ impl Interp {
         if self.steps & 0xFFFF == 0 && (self.steps > self.budget || self.deadline.is_some_and(|d| std::time::Instant::now() > d)) {
             // Stop the whole task: scripts can't catch this.
             self.terminating = true;
+            if trace_scripts() {
+                eprintln!("[script] task stopped after {} steps ({})", self.steps, self.url);
+            }
             if trace_on() {
                 self.log(&format!("[trace] task stopped (time limit){}", trace_stack()));
             }

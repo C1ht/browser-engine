@@ -373,6 +373,32 @@ fn classes_str(it: &Interp, id: NodeId) -> String {
     it.doc.attr(id, k::class).unwrap_or("").to_owned()
 }
 
+/// An element's offsetParent: its nearest positioned ancestor (or table
+/// cell / table, for unpositioned elements), else <body>; none for the
+/// root, <body>, fixed elements and elements without a box.
+fn offset_parent(it: &mut Interp, id: NodeId) -> Option<NodeId> {
+    if id == it.doc.html || id == it.doc.body || !it.rects.contains_key(&id) || !it.doc.connected(id) {
+        return None;
+    }
+    let styles = it.computed_styles()?;
+    let pos = |n: NodeId| styles.get(n as usize).map_or(crate::style::Pos::Static, |s| s.position);
+    if pos(id) == crate::style::Pos::Fixed {
+        return None;
+    }
+    let positioned = pos(id) != crate::style::Pos::Static;
+    let mut n = it.doc.parent(id);
+    while n != NONE {
+        if n == it.doc.body || pos(n) != crate::style::Pos::Static {
+            return Some(n);
+        }
+        if !positioned && matches!(it.doc.tag(n), Some(k::td | k::th | k::table)) {
+            return Some(n);
+        }
+        n = it.doc.parent(n);
+    }
+    None
+}
+
 /// Rect of an element from the last layout: (x, y, w, h).
 fn rect(it: &Interp, id: NodeId) -> [f32; 4] {
     it.rects.get(&id).copied().unwrap_or([0.0; 4])
@@ -645,17 +671,34 @@ pub fn get(it: &mut Interp, o: &ObjRef, key: &str) -> R<Option<Value>> {
                 _ => m[3],
             } as f64)
         }
-        "offsetWidth" | "clientWidth" | "scrollWidth" => Value::Num(rect(it, id)[2] as f64),
-        "offsetHeight" | "clientHeight" | "scrollHeight" => Value::Num(rect(it, id)[3] as f64),
+        "offsetWidth" | "clientWidth" | "scrollWidth" => Value::Num(rect(it, id)[2].round() as f64),
+        "offsetHeight" | "clientHeight" | "scrollHeight" => Value::Num(rect(it, id)[3].round() as f64),
         "scrollTop" | "scrollLeft" if it.elem_scroll.contains_key(&id) => {
             let (x, y) = it.elem_scroll[&id];
             Value::Num(if key == "scrollTop" { y } else { x } as f64)
         }
-        "offsetLeft" => Value::Num(rect(it, id)[0] as f64),
-        "offsetTop" => Value::Num(rect(it, id)[1] as f64),
+        "offsetLeft" | "offsetTop" => {
+            let i = if key == "offsetLeft" { 0 } else { 1 };
+            if id == it.doc.body {
+                return Ok(Some(Value::Num(0.0)));
+            }
+            let own = rect(it, id)[i];
+            // Relative to the offsetParent's padding edge.
+            let v = match offset_parent(it, id) {
+                Some(p) if p != it.doc.body => {
+                    let border = it.computed_styles().and_then(|s| s.get(p as usize).map(|st| st.bw[if i == 0 { 3 } else { 0 }])).unwrap_or(0.0);
+                    own - rect(it, p)[i] - border
+                }
+                _ => own,
+            };
+            Value::Num(v.round() as f64)
+        }
         "scrollTop" if id == it.doc.html || id == it.doc.body || doc_node => Value::Num(it.scroll_y as f64),
         "scrollTop" | "scrollLeft" | "clientTop" | "clientLeft" => Value::Num(0.0),
-        "offsetParent" => node_obj(it, it.doc.body),
+        "offsetParent" => match offset_parent(it, id) {
+            Some(p) => node_obj(it, p),
+            None => Value::Null,
+        },
         // document-only
         "body" | "head" | "documentElement" | "scrollingElement" if doc_node && id != 0 => {
             // A document from document.implementation.

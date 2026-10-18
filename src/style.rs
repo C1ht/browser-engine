@@ -2718,6 +2718,36 @@ mod tests {
     }
 
     #[test]
+    fn nesting() {
+        let doc = html::parse(
+            r#"<!doctype html><style>
+            .a { color: red; .zz { color: red } color: rgb(0, 0, 1) }
+            .b { .c & { color: rgb(0, 0, 2) } }
+            .d { @media (min-width: 100px) { color: rgb(0, 0, 3) } }
+            .e { > .f { color: rgb(0, 0, 4) } &.g { color: rgb(0, 0, 5) } }
+            .h { .i { .j { color: rgb(0, 0, 6) } } }
+            </style>
+            <p class=a id=a>a</p><div class=c><p class=b id=b>b</p></div><p class=d id=d>d</p>
+            <div class=e><p class=f id=f>f</p></div><p class="e g" id=g>g</p>
+            <div class=h><div class=i><p class=j id=j>j</p></div></div>"#,
+        );
+        let m = Media { vw: 800.0, vh: 600.0 };
+        let sheets = crate::engine::sheets_for(&doc, "", &mut Default::default());
+        let cas = build_cascade(&sheets, &m, doc.quirks);
+        let st = compute(&doc, &cas, 800.0, 600.0);
+        let rgb = |id: &str| {
+            let a = crate::atom::lookup(id).unwrap();
+            st[(0..doc.nodes.len() as u32).find(|&n| doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap() as usize].color & 0xFFFFFF
+        };
+        assert_eq!(rgb("a"), 1, "declarations after a nested rule apply in order");
+        assert_eq!(rgb("b"), 2);
+        assert_eq!(rgb("d"), 3);
+        assert_eq!(rgb("f"), 4);
+        assert_eq!(rgb("g"), 5);
+        assert_eq!(rgb("j"), 6);
+    }
+
+    #[test]
     fn modern_css() {
         let doc = html::parse(
             r#"<!doctype html><style>

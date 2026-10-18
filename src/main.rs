@@ -373,9 +373,11 @@ fn screenshot(a: &Args, out: &str) {
             Click::Navigate(n) => format!("navigate {}", n.url),
         });
         // Let the page react (handlers, requests, animations).
+        // BOLT_CLICK_MS: page time to simulate after each click (default 3000).
+        let click_ms: f64 = std::env::var("BOLT_CLICK_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000.0);
         let t = Instant::now();
-        let until = now + 3000.0;
-        while now < until && ms(t) < 15000.0 {
+        let until = now + click_ms;
+        while now < until && ms(t) < 15000.0f64.max(click_ms * 3.0) {
             now += 16.0;
             if page.has_pending_requests() {
                 std::thread::sleep(std::time::Duration::from_millis(4));

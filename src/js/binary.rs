@@ -559,6 +559,9 @@ fn dv_access(it: &mut Interp, t: &Value, a: &[Value], ty: Ta, set: bool) -> R<Va
     let mut buf = v.buffer.borrow_mut();
     let Kind::Buffer(d) = &mut buf.kind else { return Ok(Value::Undef) };
     let pos = v.off + at;
+    if pos + ty.size() > d.len() {
+        return Err(type_error("Cannot perform DataView access on a detached ArrayBuffer"));
+    }
     if set {
         let x = drop_and_num(it, &arg(a, 1));
         let mut tmp = [0u8; 8];
