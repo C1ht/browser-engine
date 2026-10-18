@@ -362,7 +362,7 @@ fn set_sat(c: [f32; 3], s: f32) -> [f32; 3] {
 
 /// Composite premultiplied `s` over `d` with operator `op`.
 #[inline]
-fn composite(d: [f32; 4], s: [f32; 4], op: u8) -> [f32; 4] {
+pub(crate) fn composite(d: [f32; 4], s: [f32; 4], op: u8) -> [f32; 4] {
     let (sa, da) = (s[3], d[3]);
     let pd = |fa: f32, fb: f32| [0, 1, 2, 3].map(|k| s[k] * fa + d[k] * fb);
     match op {

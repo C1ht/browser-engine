@@ -1925,7 +1925,7 @@ impl Page {
                     out.push(u.clone());
                 }
             }
-            if let Some(bi) = st.bg_image {
+            for bi in st.image_ids() {
                 if let css::BgImage::Url(u) = css::bg_image(bi) {
                     if !self.res.images.contains_key(&*u) && seen.insert(u.to_string()) {
                         out.push(u.to_string());

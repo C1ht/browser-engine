@@ -46,6 +46,12 @@ pub enum Value {
     Areas(u32),
     /// filter / backdrop-filter: index into the filter table.
     Filter(u32),
+    /// box-shadow / text-shadow lists: index into the shadow table.
+    Shadows(u32),
+    /// A per-layer background (or mask) list: index into the list table.
+    BgList(u32),
+    /// clip-path: index into the shape table.
+    Shape(u32),
     /// An identifier (interned), e.g. a grid area name.
     Name(u32),
     /// font-family list: index into the family table.
@@ -104,6 +110,14 @@ pub enum Kw {
     Collapse,
     Separate,
     Solid,
+    // border styles beyond solid
+    BDashed,
+    BDotted,
+    BDouble,
+    BGroove,
+    BRidge,
+    BInset,
+    BOutset,
     // text-decoration bit sets
     Underline,
     LineThrough,
@@ -133,10 +147,6 @@ pub enum Kw {
     Stretch,
     Cover,
     Contain,
-    Repeat,
-    NoRepeat,
-    RepeatX,
-    RepeatY,
     Fill,
     ScaleDown,
     // intrinsic sizes (width / min-width / max-width)
@@ -249,13 +259,30 @@ pub enum Prop {
     TextOverflow,
     LineClamp,
     BgSizeX,
-    BgSizeY,
     BgPosX,
     BgPosY,
     BgRepeat,
     ObjectFit,
     FilterP,
     BackdropFilterP,
+    BgOrigin,
+    BgClip,
+    BgAttachment,
+    MaskImage,
+    MaskSize,
+    MaskPosX,
+    MaskPosY,
+    MaskRepeat,
+    MaskOrigin,
+    MaskClip,
+    MaskMode,
+    ClipPath,
+    MixBlend,
+    TextShadow,
+    OutlineWidth,
+    OutlineColor,
+    OutlineStyle,
+    OutlineOffset,
     Custom,
     Unresolved,
 }
@@ -889,9 +916,14 @@ fn color_value(t: &str) -> Option<Value> {
 fn is_border_style(t: &str) -> Option<Kw> {
     Some(match t {
         "none" | "hidden" => Kw::None,
-        "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => {
-            Kw::Solid
-        }
+        "solid" => Kw::Solid,
+        "dashed" => Kw::BDashed,
+        "dotted" => Kw::BDotted,
+        "double" => Kw::BDouble,
+        "groove" => Kw::BGroove,
+        "ridge" => Kw::BRidge,
+        "inset" => Kw::BInset,
+        "outset" => Kw::BOutset,
         _ => return None,
     })
 }
@@ -1154,6 +1186,7 @@ fn inherited(p: Prop) -> bool {
     matches!(
         p,
         Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | PointerEvents | BorderCollapse | WordBreak | OverflowWrap
+            | TextShadow
     )
 }
 
@@ -1306,6 +1339,7 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             "border-left" | "border-inline-start" => &[BorderLeftWidth, BorderLeftColor, BorderLeftStyle],
             "border-block" => &[BorderTopWidth, BorderTopColor, BorderTopStyle, BorderBottomWidth, BorderBottomColor, BorderBottomStyle],
             "border-inline" => &[BorderLeftWidth, BorderLeftColor, BorderLeftStyle, BorderRightWidth, BorderRightColor, BorderRightStyle],
+            "outline" => &[OutlineWidth, OutlineColor, OutlineStyle],
             "border-radius" | "-webkit-border-radius" | "-moz-border-radius" => &[RadiusTL, RadiusTR, RadiusBR, RadiusBL],
             "border-top-left-radius" | "border-start-start-radius" => &[RadiusTL],
             "border-top-right-radius" | "border-start-end-radius" => &[RadiusTR],
@@ -1344,9 +1378,22 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             "grid-row-end" => &[GridRowEnd],
             "grid-column-start" => &[GridColumnStart],
             "grid-column-end" => &[GridColumnEnd],
-            "background" => &[Background, BackgroundImage, BgSizeX, BgSizeY, BgPosX, BgPosY, BgRepeat],
+            "background" => &[Background, BackgroundImage, BgSizeX, BgPosX, BgPosY, BgRepeat, BgOrigin, BgClip, BgAttachment],
             "background-color" => &[Background],
-            "background-size" => &[BgSizeX, BgSizeY],
+            "background-size" => &[BgSizeX],
+            "background-origin" => &[BgOrigin],
+            "mask" | "-webkit-mask" => &[MaskImage, MaskSize, MaskPosX, MaskPosY, MaskRepeat, MaskOrigin, MaskClip, MaskMode],
+            "mask-image" | "-webkit-mask-image" => &[MaskImage],
+            "mask-size" | "-webkit-mask-size" => &[MaskSize],
+            "mask-position" | "-webkit-mask-position" => &[MaskPosX, MaskPosY],
+            "mask-repeat" | "-webkit-mask-repeat" => &[MaskRepeat],
+            "mask-origin" | "-webkit-mask-origin" => &[MaskOrigin],
+            "mask-clip" | "-webkit-mask-clip" => &[MaskClip],
+            "mask-mode" => &[MaskMode],
+            "clip-path" | "-webkit-clip-path" => &[ClipPath],
+            "mix-blend-mode" => &[MixBlend],
+            "background-clip" | "-webkit-background-clip" => &[BgClip],
+            "background-attachment" => &[BgAttachment],
             "background-position" => &[BgPosX, BgPosY],
             "background-position-x" => &[BgPosX],
             "background-position-y" => &[BgPosY],
@@ -1559,6 +1606,26 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             }
             return;
         }
+        "outline" => {
+            let (mut w, mut c, mut st) = (Value::Px(3.0), Value::Color(CURRENT_COLOR), Kw::None);
+            for t in tokens(v) {
+                if t == "auto" {
+                    st = Kw::Solid;
+                } else if let Some(x) = is_border_style(t) {
+                    st = x;
+                } else if let Some(bw) = border_width(t) {
+                    w = bw;
+                } else if t == "invert" {
+                    c = Value::Color(CURRENT_COLOR);
+                } else if let Some(cv) = color_value(t) {
+                    c = cv;
+                }
+            }
+            out.push(Decl { prop: OutlineWidth, value: w, important });
+            out.push(Decl { prop: OutlineColor, value: c, important });
+            out.push(Decl { prop: OutlineStyle, value: Value::Kw(st), important });
+            return;
+        }
         "border" | "border-top" | "border-right" | "border-bottom" | "border-left" => {
             let sides: &[usize] = match name {
                 "border-top" => &[0],
@@ -1601,6 +1668,10 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
                     BorderTopStyle | BorderRightStyle | BorderBottomStyle | BorderLeftStyle => {
                         is_border_style(v).map(Value::Kw)
                     }
+                    OutlineWidth => border_width(v),
+                    OutlineColor => if v == "invert" { Some(Value::Color(CURRENT_COLOR)) } else { color_value(v) },
+                    OutlineStyle => if v == "auto" { Some(Value::Kw(Kw::Solid)) } else { is_border_style(v).map(Value::Kw) },
+                    OutlineOffset => length(v),
                     _ => None,
                 };
                 if let Some(val) = val {
@@ -1625,6 +1696,11 @@ fn line_height(v: &str) -> Option<Value> {
 fn simple_prop(name: &str) -> Option<Prop> {
     Some(match name {
         "filter" | "-webkit-filter" => FilterP,
+        "text-shadow" => TextShadow,
+        "outline-width" => OutlineWidth,
+        "outline-color" => OutlineColor,
+        "outline-style" => OutlineStyle,
+        "outline-offset" => OutlineOffset,
         "backdrop-filter" | "-webkit-backdrop-filter" => BackdropFilterP,
         "display" => Display,
         "position" => Position,
@@ -1708,6 +1784,11 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "grid-template-rows" => GridTemplateRows,
         "grid-auto-rows" => GridAutoRows,
         "background-image" => BackgroundImage,
+        "background-origin" => BgOrigin,
+        "clip-path" | "-webkit-clip-path" => ClipPath,
+        "mix-blend-mode" => MixBlend,
+        "background-clip" | "-webkit-background-clip" => BgClip,
+        "background-attachment" => BgAttachment,
         "content" => Content,
         "transform" => TransformP,
         "translate" => TranslateP,
@@ -2211,6 +2292,36 @@ fn grid_line(t: &str) -> Value {
     }
 }
 
+thread_local! {
+    static SHADOWS: RefCell<Vec<Rc<[Shadow]>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn shadows(i: u32) -> Rc<[Shadow]> {
+    SHADOWS.with(|t| t.borrow()[i as usize].clone())
+}
+
+/// A comma-separated shadow list (`none` is the keyword).
+fn shadow_list(v: &str) -> Option<Value> {
+    if v == "none" {
+        return Some(Value::Kw(Kw::None));
+    }
+    let mut list = Vec::new();
+    for part in split_top(v, b',') {
+        match shadow(part.trim())? {
+            Value::Shadow(sh) => list.push(sh),
+            _ => return None,
+        }
+    }
+    if list.is_empty() {
+        return None;
+    }
+    SHADOWS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push(list.into());
+        Some(Value::Shadows(t.len() as u32 - 1))
+    })
+}
+
 fn shadow(v: &str) -> Option<Value> {
     if v == "none" {
         return Some(Value::Kw(Kw::None));
@@ -2369,9 +2480,9 @@ fn parse_more(name: &str, v: &str, orig: &str, important: bool, out: &mut Vec<De
                 push!(RADIUS[i], l);
             }
         }
-        "box-shadow" => {
-            if let Some(s) = shadow(v) {
-                push!(BoxShadow, s);
+        "box-shadow" | "-webkit-box-shadow" | "text-shadow" => {
+            if let Some(s) = shadow_list(v) {
+                push!(if name == "text-shadow" { TextShadow } else { BoxShadow }, s);
             }
         }
         "opacity" => {
@@ -2494,23 +2605,110 @@ fn parse_more(name: &str, v: &str, orig: &str, important: bool, out: &mut Vec<De
             push!(ps, s);
             push!(pe, e);
         }
-        "background" => background(orig, important, out),
+        "background" => background(orig, important, out, false),
+        "mask" | "-webkit-mask" => background(orig, important, out, true),
+        "clip-path" | "-webkit-clip-path" => {
+            if let Some(sh) = clip_shape(orig.trim()) {
+                push!(ClipPath, sh);
+            }
+        }
+        "mix-blend-mode" => {
+            let i = match v {
+                "normal" => 0,
+                "plus-lighter" | "plus-darker" => 8,
+                _ => match ["multiply", "screen", "overlay", "darken", "lighten", "color-dodge", "color-burn", "hard-light", "soft-light", "difference", "exclusion", "hue", "saturation", "color", "luminosity"].iter().position(|m| *m == v) {
+                    Some(k) => 11 + k as i32,
+                    None => return true,
+                },
+            };
+            push!(MixBlend, Value::Num(i as f32));
+        }
+        "mask-mode" => {
+            let l: Option<Vec<u8>> = split_top(v, b',').iter().map(|t| match t.trim() { "alpha" => Some(0), "luminance" => Some(1), "match-source" => Some(2), _ => None }).collect();
+            if let Some(l) = l {
+                push!(MaskMode, store_bg(BgList::Keys(l)));
+            }
+        }
+        "mask-image" | "-webkit-mask-image" | "mask-size" | "-webkit-mask-size" | "mask-position" | "-webkit-mask-position" | "mask-repeat" | "-webkit-mask-repeat"
+        | "mask-origin" | "-webkit-mask-origin" | "mask-clip" | "-webkit-mask-clip" | "mask-position-x" | "-webkit-mask-position-x" | "mask-position-y" | "-webkit-mask-position-y" => {
+            // Parsed like the background longhand, then moved to the mask
+            // property.
+            let bg = name.trim_start_matches("-webkit-").replacen("mask", "background", 1);
+            let mut tmp = Vec::new();
+            parse_more(&bg, v, orig, important, &mut tmp);
+            for d in tmp {
+                let p = match d.prop {
+                    BackgroundImage => MaskImage,
+                    BgSizeX => MaskSize,
+                    BgPosX => MaskPosX,
+                    BgPosY => MaskPosY,
+                    BgRepeat => MaskRepeat,
+                    BgOrigin => MaskOrigin,
+                    BgClip => MaskClip,
+                    _ => continue,
+                };
+                out.push(Decl { prop: p, ..d });
+            }
+        }
         "background-image" => {
-            let first = split_top(orig, b',').into_iter().next().unwrap_or("").trim();
-            push!(BackgroundImage, if first.eq_ignore_ascii_case("none") { Value::Kw(Kw::None) } else { image_value(first).unwrap_or(Value::Kw(Kw::None)) });
+            let mut ids = Vec::new();
+            for l in split_top(orig, b',') {
+                let l = l.trim();
+                if l.eq_ignore_ascii_case("none") {
+                    ids.push(u32::MAX);
+                } else {
+                    match image_value(l) {
+                        Some(Value::Image(i)) => ids.push(i),
+                        _ => return true,
+                    }
+                }
+            }
+            push!(BackgroundImage, store_bg(BgList::Images(ids)));
         }
         "background-size" => {
-            let first = split_top(v, b',').into_iter().next().unwrap_or("");
-            bg_size(first, important, out);
+            let l: Option<Vec<[Value; 2]>> = split_top(v, b',').iter().map(|l| layer_size(l)).collect();
+            if let Some(l) = l {
+                push!(BgSizeX, store_bg(BgList::Sizes(l)));
+            }
         }
         "background-position" => {
-            let first = split_top(v, b',').into_iter().next().unwrap_or("");
-            bg_position(&tokens_ws(first), important, out);
+            let l: Option<Vec<(Value, Value)>> = split_top(v, b',').iter().map(|l| bg_pos_values(&tokens_ws(l))).collect();
+            if let Some(l) = l {
+                push!(BgPosX, store_bg(BgList::Pos(l.iter().map(|p| p.0).collect())));
+                push!(BgPosY, store_bg(BgList::Pos(l.iter().map(|p| p.1).collect())));
+            }
+        }
+        "background-position-x" | "background-position-y" => {
+            let horiz = name.ends_with('x');
+            let l: Option<Vec<Value>> = split_top(v, b',')
+                .iter()
+                .map(|l| {
+                    let toks = tokens_ws(l);
+                    let (x, y) = bg_pos_values(&toks)?;
+                    // A lone keyword is on its own axis.
+                    Some(if horiz { x } else if toks.len() == 1 && bg_pos_kw(toks[0]).is_some_and(|k| k.1.is_none()) { x } else { y })
+                })
+                .collect();
+            if let Some(l) = l {
+                push!(if horiz { BgPosX } else { BgPosY }, store_bg(BgList::Pos(l)));
+            }
         }
         "background-repeat" => {
-            let first = split_top(v, b',').into_iter().next().unwrap_or("");
-            if let Some(r) = bg_repeat(&tokens_ws(first)) {
-                push!(BgRepeat, r);
+            let l: Option<Vec<(u8, u8)>> = split_top(v, b',').iter().map(|l| layer_repeat(&tokens_ws(l))).collect();
+            if let Some(l) = l {
+                push!(BgRepeat, store_bg(BgList::Repeat(l)));
+            }
+        }
+        "background-origin" | "background-clip" | "-webkit-background-clip" | "background-attachment" => {
+            let attach = name == "background-attachment";
+            let l: Option<Vec<u8>> = split_top(v, b',').iter().map(|l| if attach { attachment_code(l.trim()) } else { box_code(l.trim()) }).collect();
+            if let Some(l) = l {
+                let p = match name {
+                    "background-origin" => BgOrigin,
+                    "background-attachment" => BgAttachment,
+                    _ => BgClip,
+                };
+                push!(p, store_bg(BgList::Keys(l)));
             }
         }
         "object-fit" => {
@@ -2639,10 +2837,20 @@ pub struct Stop {
 #[derive(Clone, Debug)]
 pub struct Gradient {
     pub radial: bool,
+    pub conic: bool,
     pub repeating: bool,
-    /// CSS angle in degrees (0 = towards the top, 90 = towards the right).
+    /// CSS angle in degrees (0 = towards the top, 90 = towards the right);
+    /// for conic gradients the `from` angle.
     pub angle: f32,
     pub stops: Vec<Stop>,
+    /// Radial: a circle (else an ellipse); size: 0 farthest-corner,
+    /// 1 farthest-side, 2 closest-corner, 3 closest-side, 4 explicit
+    /// `radii`.
+    pub circle: bool,
+    pub size: u8,
+    pub radii: [Value; 2],
+    /// Radial / conic center.
+    pub pos: [Value; 2],
 }
 
 #[derive(Clone, Debug)]
@@ -3037,12 +3245,14 @@ fn image_value(t: &str) -> Option<Value> {
         "repeating-linear-gradient" => (false, true),
         "radial-gradient" => (true, false),
         "repeating-radial-gradient" => (true, true),
+        "conic-gradient" | "repeating-conic-gradient" => (false, name.starts_with("repeating")),
         _ => return None,
     };
+    let conic = name.ends_with("conic-gradient");
     let legacy = lower.starts_with("-webkit-") || lower.starts_with("-moz-");
     let inner = lower[name_end + 1..].strip_suffix(')')?;
     let args = split_top(inner, b',');
-    let mut angle = 180.0;
+    let mut angle = if conic { 0.0 } else { 180.0 };
     let mut first = 0;
     if let Some(a) = args.first().map(|a| a.trim()) {
         let side = |s: &str| -> Option<f32> {
@@ -3081,16 +3291,73 @@ fn image_value(t: &str) -> Option<Value> {
                 angle = d.to_degrees();
                 first = 1;
             }
-        } else if radial && tokens_ws(a).first().and_then(|t| color_value(t)).is_none() {
-            first = 1; // shape / size / position: ignored
         }
+    }
+    // Radial / conic preludes: shape, size, `from <angle>`, `at <position>`.
+    let (mut circle, mut size, mut radii, mut pos) = (false, 0u8, [Value::Auto, Value::Auto], [Value::Pct(50.0), Value::Pct(50.0)]);
+    if (radial || conic) && first == 0 {
+        if let Some(a) = args.first().map(|a| a.trim()) {
+            let toks = tokens_ws(a);
+            if toks.first().and_then(|t| color_value(t)).is_none() {
+                first = 1;
+                let mut i = 0;
+                let mut lens = Vec::new();
+                while i < toks.len() {
+                    match toks[i] {
+                        "circle" => circle = true,
+                        "ellipse" => {}
+                        "farthest-corner" | "cover" => size = 0,
+                        "farthest-side" => size = 1,
+                        "closest-corner" => size = 2,
+                        "closest-side" | "contain" => size = 3,
+                        "from" if conic => {
+                            if let Some(d) = toks.get(i + 1).and_then(|t| angle_deg(t)) {
+                                angle = d;
+                            }
+                            i += 1;
+                        }
+                        "at" => {
+                            if let Some(p) = bg_pos_values(&toks[i + 1..]) {
+                                pos = [p.0, p.1];
+                            }
+                            break;
+                        }
+                        t => {
+                            if let Some(l) = length(t) {
+                                lens.push(l);
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                match lens.as_slice() {
+                    [r] => {
+                        size = 4;
+                        radii = [*r, *r];
+                        circle = true;
+                    }
+                    [rx, ry, ..] => {
+                        size = 4;
+                        radii = [*rx, *ry];
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else if radial && first == 0 && args.first().is_some_and(|a| tokens_ws(a.trim()).first().and_then(|t| color_value(t)).is_none()) {
+        first = 1;
+    }
+    // Legacy -webkit-radial-gradient(center, shape, ...) forms.
+    if radial && legacy && first == 1 && args.get(1).is_some_and(|a| tokens_ws(a.trim()).first().and_then(|t| color_value(t)).is_none()) {
+        first = 2;
     }
     let mut stops = Vec::new();
     for a in &args[first..] {
         let toks = tokens_ws(a.trim());
         let Some(Value::Color(c)) = toks.iter().find_map(|t| color_value(t)) else { continue };
         let color = if c == CURRENT_COLOR { 0xFF00_0000 } else { c };
-        let mut positions = toks.iter().filter_map(|t| length(t));
+        // (Conic stop positions are angles: a fraction of a turn.)
+        let mut positions = toks.iter().filter_map(|t| if conic { angle_deg(t).filter(|_| *t != "0").map(|d| Value::Pct(d / 3.6)).or_else(|| length(t)) } else { length(t) });
         let pos = |v: Option<Value>| match v {
             Some(Value::Pct(p)) => (Some(p / 100.0), None),
             Some(Value::Px(p)) => (None, Some(p)),
@@ -3108,7 +3375,7 @@ fn image_value(t: &str) -> Option<Value> {
     if stops.is_empty() {
         return None;
     }
-    Some(store_image(format!("g{lower}"), BgImage::Gradient(Rc::new(Gradient { radial, repeating, angle, stops }))))
+    Some(store_image(format!("g{lower}"), BgImage::Gradient(Rc::new(Gradient { radial, conic, repeating, angle, stops, circle, size, radii, pos }))))
 }
 
 fn bg_pos_kw(t: &str) -> Option<(Value, Option<bool>)> {
@@ -3124,6 +3391,14 @@ fn bg_pos_kw(t: &str) -> Option<(Value, Option<bool>)> {
 }
 
 fn bg_position(toks: &[&str], important: bool, out: &mut Vec<Decl>) {
+    if let Some((x, y)) = bg_pos_values(toks) {
+        out.push(Decl { prop: BgPosX, value: x, important });
+        out.push(Decl { prop: BgPosY, value: y, important });
+    }
+}
+
+/// A <bg-position>: (x, y).
+fn bg_pos_values(toks: &[&str]) -> Option<(Value, Value)> {
     // Four-value syntax: `right 10px bottom 20px`.
     if toks.len() >= 3 {
         let (mut x, mut y) = (Value::Pct(50.0), Value::Pct(50.0));
@@ -3149,12 +3424,10 @@ fn bg_position(toks: &[&str], important: bool, out: &mut Vec<Decl>) {
             }
             i += if off.is_some() { 2 } else { 1 };
         }
-        out.push(Decl { prop: BgPosX, value: x, important });
-        out.push(Decl { prop: BgPosY, value: y, important });
-        return;
+        return Some((x, y));
     }
     let vals: Vec<(Value, Option<bool>)> = toks.iter().filter_map(|t| bg_pos_kw(t)).take(2).collect();
-    let (x, y) = match vals.as_slice() {
+    Some(match vals.as_slice() {
         [(v, Some(false))] => (Value::Pct(50.0), *v),
         [(v, _)] => (*v, Value::Pct(50.0)),
         [(a, sa), (b, sb)] => {
@@ -3164,56 +3437,244 @@ fn bg_position(toks: &[&str], important: bool, out: &mut Vec<Decl>) {
                 (*a, *b)
             }
         }
-        _ => return,
-    };
-    out.push(Decl { prop: BgPosX, value: x, important });
-    out.push(Decl { prop: BgPosY, value: y, important });
-}
-
-fn bg_size(v: &str, important: bool, out: &mut Vec<Decl>) {
-    let toks = tokens_ws(v);
-    let (x, y) = match toks.as_slice() {
-        ["cover"] => (Value::Kw(Kw::Cover), Value::Auto),
-        ["contain"] => (Value::Kw(Kw::Contain), Value::Auto),
-        [a] => (length(a).unwrap_or(Value::Auto), Value::Auto),
-        [a, b, ..] => (length(a).unwrap_or(Value::Auto), length(b).unwrap_or(Value::Auto)),
-        _ => return,
-    };
-    out.push(Decl { prop: BgSizeX, value: x, important });
-    out.push(Decl { prop: BgSizeY, value: y, important });
-}
-
-fn bg_repeat(toks: &[&str]) -> Option<Value> {
-    let k = |t: &str| -> Option<bool> {
-        match t {
-            "repeat" | "space" | "round" => Some(true),
-            "no-repeat" => Some(false),
-            _ => None,
-        }
-    };
-    Some(Value::Kw(match toks {
-        ["repeat-x"] => Kw::RepeatX,
-        ["repeat-y"] => Kw::RepeatY,
-        [a] => {
-            if k(a)? { Kw::Repeat } else { Kw::NoRepeat }
-        }
-        [a, b, ..] => match (k(a)?, k(b)?) {
-            (true, true) => Kw::Repeat,
-            (false, false) => Kw::NoRepeat,
-            (true, false) => Kw::RepeatX,
-            (false, true) => Kw::RepeatY,
-        },
         _ => return None,
-    }))
+    })
 }
 
-/// The `background` shorthand: first layer's image, last layer's colour.
-fn background(orig: &str, important: bool, out: &mut Vec<Decl>) {
+/// A per-layer list (background / mask longhands).
+#[derive(Clone, Debug)]
+pub enum BgList {
+    /// Image indices (u32::MAX: none).
+    Images(Vec<u32>),
+    /// [x, y]; `cover` / `contain` as Value::Kw in x.
+    Sizes(Vec<[Value; 2]>),
+    Pos(Vec<Value>),
+    /// Per axis: 0 no-repeat, 1 repeat, 2 space, 3 round.
+    Repeat(Vec<(u8, u8)>),
+    /// origin / clip (box codes) or attachment codes.
+    Keys(Vec<u8>),
+}
+
+thread_local! {
+    static BG_LISTS: RefCell<Vec<Rc<BgList>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn bg_list(i: u32) -> Rc<BgList> {
+    BG_LISTS.with(|t| t.borrow()[i as usize].clone())
+}
+
+fn store_bg(l: BgList) -> Value {
+    BG_LISTS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push(Rc::new(l));
+        Value::BgList(t.len() as u32 - 1)
+    })
+}
+
+/// A clip-path basic shape (lengths unresolved).
+#[derive(Clone, Debug)]
+pub enum ClipShape {
+    /// insets (t, r, b, l) and corner radii.
+    Inset([Value; 4], [Value; 4]),
+    /// radius (None: closest-side; Some(Kw) for farthest-side), center.
+    Circle(Value, [Value; 2]),
+    Ellipse([Value; 2], [Value; 2]),
+    Polygon(bool, Vec<[Value; 2]>),
+    /// SVG path data in px (evenodd?).
+    Path(bool, Rc<str>),
+}
+
+thread_local! {
+    static SHAPES: RefCell<Vec<(Rc<ClipShape>, u8)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A clip-path shape and its reference box (box code).
+pub fn clip_shape_of(i: u32) -> (Rc<ClipShape>, u8) {
+    SHAPES.with(|t| t.borrow()[i as usize].clone())
+}
+
+fn clip_shape(v: &str) -> Option<Value> {
+    if v.eq_ignore_ascii_case("none") {
+        return Some(Value::Kw(Kw::None));
+    }
+    let lower = v.to_ascii_lowercase();
+    // A reference box keyword, before or after the shape.
+    let mut bx = 0u8;
+    let mut shape_src = lower.as_str();
+    for kw in ["margin-box", "border-box", "padding-box", "content-box", "fill-box", "stroke-box", "view-box"] {
+        if let Some(r) = shape_src.strip_prefix(kw) {
+            bx = box_code(kw).unwrap_or(0);
+            shape_src = r.trim();
+        } else if let Some(r) = shape_src.strip_suffix(kw) {
+            bx = box_code(kw).unwrap_or(0);
+            shape_src = r.trim();
+        }
+    }
+    if shape_src.is_empty() {
+        // Just a box: clip to it.
+        let z = Value::Px(0.0);
+        return store_shape(ClipShape::Inset([z; 4], [z; 4]), bx);
+    }
+    let open = shape_src.find('(')?;
+    let name = shape_src[..open].trim();
+    let inner_l = shape_src[open + 1..].strip_suffix(')')?;
+    // (path() strings keep their case.)
+    let inner_o = v.trim()[v.trim().find('(')? + 1..].trim_end().strip_suffix(')').unwrap_or("");
+    let len = |t: &str| length(t).or_else(|| (t == "0").then_some(Value::Px(0.0)));
+    let at_pos = |s: &str| -> Option<[Value; 2]> {
+        match s.split_once(" at ").or_else(|| s.strip_prefix("at ").map(|r| ("", r))) {
+            Some((_, p)) => bg_pos_values(&tokens_ws(p)).map(|(x, y)| [x, y]),
+            None => Some([Value::Pct(50.0), Value::Pct(50.0)]),
+        }
+    };
+    let before_at = |s: &str| s.split(" at ").next().unwrap_or("").trim().to_string();
+    let shape = match name {
+        "inset" => {
+            let (lens, round) = match inner_l.split_once(" round ") {
+                Some((a, b)) => (a.to_string(), Some(b.to_string())),
+                None => (inner_l.to_string(), None),
+            };
+            let v: Vec<Value> = tokens_ws(&lens).iter().filter_map(|t| len(t)).collect();
+            let four = match v.as_slice() {
+                [a] => [*a; 4],
+                [a, b] => [*a, *b, *a, *b],
+                [a, b, c] => [*a, *b, *c, *b],
+                [a, b, c, d, ..] => [*a, *b, *c, *d],
+                _ => return None,
+            };
+            let r: Vec<Value> = round.map(|r| tokens_ws(r.split('/').next().unwrap_or("")).iter().filter_map(|t| len(t)).collect()).unwrap_or_default();
+            let z = Value::Px(0.0);
+            let radii = match r.as_slice() {
+                [] => [z; 4],
+                [a] => [*a; 4],
+                [a, b] => [*a, *b, *a, *b],
+                [a, b, c] => [*a, *b, *c, *b],
+                [a, b, c, d, ..] => [*a, *b, *c, *d],
+            };
+            ClipShape::Inset(four, radii)
+        }
+        "circle" => {
+            let r = before_at(inner_l);
+            let rv = match r.as_str() {
+                "" | "closest-side" => Value::Auto,
+                "farthest-side" => Value::Kw(Kw::Cover),
+                t => len(t)?,
+            };
+            ClipShape::Circle(rv, at_pos(inner_l)?)
+        }
+        "ellipse" => {
+            let r = before_at(inner_l);
+            let toks = tokens_ws(&r);
+            let rv = |t: Option<&&str>| match t.copied() {
+                None | Some("closest-side") => Some(Value::Auto),
+                Some("farthest-side") => Some(Value::Kw(Kw::Cover)),
+                Some(t) => len(t),
+            };
+            ClipShape::Ellipse([rv(toks.first())?, rv(toks.get(1))?], at_pos(inner_l)?)
+        }
+        "polygon" => {
+            let mut parts = split_top(inner_l, b',');
+            let mut evenodd = false;
+            if let Some(f) = parts.first().map(|p| p.trim()) {
+                if f == "evenodd" || f == "nonzero" {
+                    evenodd = f == "evenodd";
+                    parts.remove(0);
+                }
+            }
+            let mut pts = Vec::new();
+            for p in parts {
+                let t = tokens_ws(p.trim());
+                if t.len() < 2 {
+                    return None;
+                }
+                pts.push([len(t[0])?, len(t[1])?]);
+            }
+            ClipShape::Polygon(evenodd, pts)
+        }
+        "path" => {
+            let mut parts = split_top(inner_o, b',');
+            let mut evenodd = false;
+            if parts.len() > 1 {
+                evenodd = parts[0].trim().eq_ignore_ascii_case("evenodd");
+                parts.remove(0);
+            }
+            let d = parts.first()?.trim().trim_matches(|c| c == '"' || c == '\'');
+            ClipShape::Path(evenodd, Rc::from(d))
+        }
+        _ => return None,
+    };
+    store_shape(shape, bx)
+}
+
+fn store_shape(s: ClipShape, bx: u8) -> Option<Value> {
+    SHAPES.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push((Rc::new(s), bx));
+        Some(Value::Shape(t.len() as u32 - 1))
+    })
+}
+
+/// Box keywords: 0 border-box, 1 padding-box, 2 content-box, 3 text.
+fn box_code(t: &str) -> Option<u8> {
+    Some(match t {
+        "border-box" | "border" => 0,
+        "padding-box" | "padding" => 1,
+        "content-box" | "content" => 2,
+        "text" => 3,
+        "fill-box" => 2,
+        "stroke-box" | "view-box" => 0,
+        "no-clip" => 0,
+        _ => return None,
+    })
+}
+
+/// background-attachment: 0 scroll, 1 fixed, 2 local.
+fn attachment_code(t: &str) -> Option<u8> {
+    Some(match t {
+        "scroll" => 0,
+        "fixed" => 1,
+        "local" => 2,
+        _ => return None,
+    })
+}
+
+fn layer_size(v: &str) -> Option<[Value; 2]> {
+    let toks = tokens_ws(v.trim());
+    let len = |t: &str| if t == "auto" { Some(Value::Auto) } else { length(t) };
+    Some(match toks.as_slice() {
+        ["cover"] => [Value::Kw(Kw::Cover), Value::Auto],
+        ["contain"] => [Value::Kw(Kw::Contain), Value::Auto],
+        [a] => [len(a)?, Value::Auto],
+        [a, b] => [len(a)?, len(b)?],
+        _ => return None,
+    })
+}
+
+fn layer_repeat(toks: &[&str]) -> Option<(u8, u8)> {
+    let k = |t: &str| -> Option<u8> {
+        Some(match t {
+            "no-repeat" => 0,
+            "repeat" => 1,
+            "space" => 2,
+            "round" => 3,
+            _ => return None,
+        })
+    };
+    Some(match toks {
+        ["repeat-x"] => (1, 0),
+        ["repeat-y"] => (0, 1),
+        [a] => (k(a)?, k(a)?),
+        [a, b] => (k(a)?, k(b)?),
+        _ => return None,
+    })
+}
+
+/// The `background` shorthand: every layer, and the final layer's color.
+fn background(orig: &str, important: bool, out: &mut Vec<Decl>, mask: bool) {
     let layers = split_top(orig, b',');
     let mut color = Value::Color(0);
-    let mut image = Value::Kw(Kw::None);
-    let mut repeat = Value::Kw(Kw::Repeat);
-    let (mut pos, mut size): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+    let (mut images, mut sizes, mut px, mut py, mut reps, mut origins, mut clips, mut atts) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut modes, mut explicit_box) = (Vec::new(), Vec::new());
     for (li, layer) in layers.iter().enumerate() {
         // Space out a '/' between position and size.
         let mut spaced = String::new();
@@ -3231,30 +3692,47 @@ fn background(orig: &str, important: bool, out: &mut Vec<Decl>) {
             }
         }
         let mut after_slash = false;
-        let mut reps = Vec::new();
+        let (mut image, mut rep, mut att, mut mode) = (u32::MAX, Vec::new(), 0u8, 2u8);
+        let (mut pos, mut size): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        let mut boxes: Vec<u8> = Vec::new();
         for t in tokens_ws(&spaced) {
             let lt = t.to_ascii_lowercase();
-            if li == 0 {
-                if lt == "/" {
-                    after_slash = true;
-                    continue;
+            if lt == "/" {
+                after_slash = true;
+                continue;
+            }
+            if lt == "none" {
+                continue;
+            }
+            if let Some(Value::Image(i)) = image_value(t) {
+                image = i;
+                continue;
+            }
+            if matches!(lt.as_str(), "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round") {
+                rep.push(lt);
+                continue;
+            }
+            if let Some(a) = attachment_code(&lt) {
+                att = a;
+                continue;
+            }
+            if mask && matches!(lt.as_str(), "alpha" | "luminance" | "match-source" | "add" | "subtract" | "intersect" | "exclude") {
+                if let Some(m) = ["alpha", "luminance", "match-source"].iter().position(|m| *m == lt) {
+                    mode = m as u8;
                 }
-                if let Some(img) = image_value(t) {
-                    image = img;
-                    continue;
-                }
-                if matches!(lt.as_str(), "repeat" | "no-repeat" | "repeat-x" | "repeat-y" | "space" | "round") {
-                    reps.push(lt);
-                    continue;
-                }
-                if after_slash && (length(&lt).is_some() || lt == "auto" || lt == "cover" || lt == "contain") {
-                    size.push(lt);
-                    continue;
-                }
-                if bg_pos_kw(&lt).is_some() {
-                    pos.push(lt);
-                    continue;
-                }
+                continue;
+            }
+            if let Some(bx) = box_code(&lt) {
+                boxes.push(bx);
+                continue;
+            }
+            if after_slash && (length(&lt).is_some() || lt == "auto" || lt == "cover" || lt == "contain") {
+                size.push(lt);
+                continue;
+            }
+            if bg_pos_kw(&lt).is_some() {
+                pos.push(lt);
+                continue;
             }
             if li == layers.len() - 1 {
                 if let Some(c) = color_value(&lt) {
@@ -3262,27 +3740,49 @@ fn background(orig: &str, important: bool, out: &mut Vec<Decl>) {
                 }
             }
         }
-        if li == 0 && !reps.is_empty() {
-            let r: Vec<&str> = reps.iter().map(|s| s.as_str()).collect();
-            repeat = bg_repeat(&r).unwrap_or(repeat);
-        }
+        images.push(image);
+        let r: Vec<&str> = rep.iter().map(|s| s.as_str()).collect();
+        reps.push(if r.is_empty() { (1, 1) } else { layer_repeat(&r).unwrap_or((1, 1)) });
+        let p: Vec<&str> = pos.iter().map(|s| s.as_str()).collect();
+        let (x, y) = if p.is_empty() { (Value::Pct(0.0), Value::Pct(0.0)) } else { bg_pos_values(&p).unwrap_or((Value::Pct(0.0), Value::Pct(0.0))) };
+        px.push(x);
+        py.push(y);
+        sizes.push(if size.is_empty() { [Value::Auto, Value::Auto] } else { layer_size(&size.join(" ")).unwrap_or([Value::Auto, Value::Auto]) });
+        // One box keyword sets origin and clip; two set them in order.
+        let (o, c) = match boxes.as_slice() {
+            [b] => (*b, *b),
+            [a, b, ..] => (*a, *b),
+            _ => (1, 0),
+        };
+        origins.push(o);
+        clips.push(c);
+        atts.push(att);
+        modes.push(mode);
+        explicit_box.push(!boxes.is_empty());
+    }
+    if mask {
+        // (A mask's default origin is the border box; mode keywords are
+        // given per layer.)
+        let origins: Vec<u8> = origins.iter().zip(&explicit_box).map(|(&o, &e)| if e { o } else { 0 }).collect();
+        out.push(Decl { prop: MaskImage, value: store_bg(BgList::Images(images)), important });
+        out.push(Decl { prop: MaskSize, value: store_bg(BgList::Sizes(sizes)), important });
+        out.push(Decl { prop: MaskPosX, value: store_bg(BgList::Pos(px)), important });
+        out.push(Decl { prop: MaskPosY, value: store_bg(BgList::Pos(py)), important });
+        out.push(Decl { prop: MaskRepeat, value: store_bg(BgList::Repeat(reps)), important });
+        out.push(Decl { prop: MaskOrigin, value: store_bg(BgList::Keys(origins)), important });
+        out.push(Decl { prop: MaskClip, value: store_bg(BgList::Keys(clips)), important });
+        out.push(Decl { prop: MaskMode, value: store_bg(BgList::Keys(modes)), important });
+        return;
     }
     out.push(Decl { prop: Background, value: color, important });
-    out.push(Decl { prop: BackgroundImage, value: image, important });
-    out.push(Decl { prop: BgRepeat, value: repeat, important });
-    let p: Vec<&str> = pos.iter().map(|s| s.as_str()).collect();
-    if p.is_empty() {
-        out.push(Decl { prop: BgPosX, value: Value::Pct(0.0), important });
-        out.push(Decl { prop: BgPosY, value: Value::Pct(0.0), important });
-    } else {
-        bg_position(&p, important, out);
-    }
-    if size.is_empty() {
-        out.push(Decl { prop: BgSizeX, value: Value::Auto, important });
-        out.push(Decl { prop: BgSizeY, value: Value::Auto, important });
-    } else {
-        bg_size(&size.join(" "), important, out);
-    }
+    out.push(Decl { prop: BackgroundImage, value: store_bg(BgList::Images(images)), important });
+    out.push(Decl { prop: BgSizeX, value: store_bg(BgList::Sizes(sizes)), important });
+    out.push(Decl { prop: BgPosX, value: store_bg(BgList::Pos(px)), important });
+    out.push(Decl { prop: BgPosY, value: store_bg(BgList::Pos(py)), important });
+    out.push(Decl { prop: BgRepeat, value: store_bg(BgList::Repeat(reps)), important });
+    out.push(Decl { prop: BgOrigin, value: store_bg(BgList::Keys(origins)), important });
+    out.push(Decl { prop: BgClip, value: store_bg(BgList::Keys(clips)), important });
+    out.push(Decl { prop: BgAttachment, value: store_bg(BgList::Keys(atts)), important });
 }
 
 thread_local! {

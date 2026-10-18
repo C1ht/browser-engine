@@ -261,7 +261,9 @@ pub struct Style {
     pub flow_root: bool,
     /// top-left, top-right, bottom-right, bottom-left
     pub radius: [Len; 4],
-    pub shadow: Option<css::Shadow>,
+    pub shadow: Option<Rc<[css::Shadow]>>,
+    /// text-shadow (inherited).
+    pub text_shadow: Option<Rc<[css::Shadow]>>,
     pub opacity: f32,
     pub flex_dir: FlexDir,
     pub wrap: bool,
@@ -325,15 +327,45 @@ pub struct Style {
     pub padding: [Len; 4],
     pub bw: [f32; 4],
     pub bc: [u32; 4],
-    pub bs: [bool; 4],
+    /// Border styles: 0 none, 1 solid, 2 dashed, 3 dotted, 4 double,
+    /// 5 groove, 6 ridge, 7 inset, 8 outset.
+    pub bs: [u8; 4],
+    /// outline: width, style (as border styles), color, offset.
+    pub ow: f32,
+    pub os: u8,
+    pub oc: u32,
+    pub oo: f32,
     pub vars: Option<Rc<Vars>>,
+    /// The first background image (images of all layers: `bg_images`).
     pub bg_image: Option<u32>,
-    /// background-size: lengths, or Ex-free markers for cover/contain via `bg_fit`.
-    pub bg_size: [Len; 2],
-    /// 0 = explicit/auto, 1 = cover, 2 = contain
-    pub bg_fit: u8,
-    pub bg_pos: [Len; 2],
-    pub bg_repeat: (bool, bool),
+    /// Background layers (top first): image indices (u32::MAX: none) and
+    /// per-layer lists that repeat to the number of images. None = the
+    /// initial value.
+    pub bg_images: Option<Rc<[u32]>>,
+    pub bg_sizes: Option<Rc<[BgSize]>>,
+    pub bg_pos_x: Option<Rc<[Len]>>,
+    pub bg_pos_y: Option<Rc<[Len]>>,
+    /// Per axis: 0 no-repeat, 1 repeat, 2 space, 3 round.
+    pub bg_reps: Option<Rc<[(u8, u8)]>>,
+    /// Box codes: 0 border, 1 padding, 2 content, 3 text.
+    pub bg_origin: Option<Rc<[u8]>>,
+    pub bg_clip: Option<Rc<[u8]>>,
+    /// 0 scroll, 1 fixed, 2 local.
+    pub bg_attach: Option<Rc<[u8]>>,
+    /// Mask layers (like the background lists; mode 0 alpha, 1 luminance,
+    /// 2 match-source).
+    pub mask_images: Option<Rc<[u32]>>,
+    pub mask_sizes: Option<Rc<[BgSize]>>,
+    pub mask_pos_x: Option<Rc<[Len]>>,
+    pub mask_pos_y: Option<Rc<[Len]>>,
+    pub mask_reps: Option<Rc<[(u8, u8)]>>,
+    pub mask_origin: Option<Rc<[u8]>>,
+    pub mask_clip: Option<Rc<[u8]>>,
+    pub mask_mode: Option<Rc<[u8]>>,
+    /// clip-path: a shape (css shape table index), or None.
+    pub clip_path: Option<u32>,
+    /// mix-blend-mode as a canvas composite operation (0 = normal).
+    pub blend: u8,
     /// object-fit: 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down
     pub object_fit: u8,
     /// `content` (None = normal / none).
@@ -365,6 +397,86 @@ pub struct Style {
     /// filter and backdrop-filter (None if none).
     pub filter: Option<Rc<[FilterOp]>>,
     pub backdrop: Option<Rc<[FilterOp]>>,
+}
+
+fn bg_size_of(c: &Ctx, xy: &[Value; 2], fs: f32) -> BgSize {
+    match xy[0] {
+        Value::Kw(Kw::Cover) => BgSize { x: Len::Auto, y: Len::Auto, fit: 1 },
+        Value::Kw(Kw::Contain) => BgSize { x: Len::Auto, y: Len::Auto, fit: 2 },
+        _ => BgSize { x: c.len(xy[0], fs).unwrap_or(Len::Auto), y: c.len(xy[1], fs).unwrap_or(Len::Auto), fit: 0 },
+    }
+}
+
+/// background-size of one layer: lengths, or cover (fit 1) / contain
+/// (fit 2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BgSize {
+    pub x: Len,
+    pub y: Len,
+    pub fit: u8,
+}
+
+/// One background layer's properties (lists repeat to the layer count).
+#[derive(Clone, Copy, Debug)]
+pub struct BgLayer {
+    pub image: u32,
+    pub size: BgSize,
+    pub pos: [Len; 2],
+    pub rep: (u8, u8),
+    pub origin: u8,
+    pub clip: u8,
+    pub attach: u8,
+}
+
+impl Style {
+    /// The background layers, top first.
+    pub fn bg_layers(&self) -> Vec<BgLayer> {
+        let Some(imgs) = &self.bg_images else { return Vec::new() };
+        fn pick<T: Copy>(l: &Option<Rc<[T]>>, i: usize, d: T) -> T {
+            match l {
+                Some(l) if !l.is_empty() => l[i % l.len()],
+                _ => d,
+            }
+        }
+        (0..imgs.len())
+            .map(|i| BgLayer {
+                image: imgs[i],
+                size: pick(&self.bg_sizes, i, BgSize { x: Len::Auto, y: Len::Auto, fit: 0 }),
+                pos: [pick(&self.bg_pos_x, i, Len::Pct(0.0)), pick(&self.bg_pos_y, i, Len::Pct(0.0))],
+                rep: pick(&self.bg_reps, i, (1, 1)),
+                origin: pick(&self.bg_origin, i, 1),
+                clip: pick(&self.bg_clip, i, 0),
+                attach: pick(&self.bg_attach, i, 0),
+            })
+            .collect()
+    }
+
+    /// The mask layers, top first (`attach` holds the mask mode).
+    pub fn mask_layers(&self) -> Vec<BgLayer> {
+        let Some(imgs) = &self.mask_images else { return Vec::new() };
+        fn pick<T: Copy>(l: &Option<Rc<[T]>>, i: usize, d: T) -> T {
+            match l {
+                Some(l) if !l.is_empty() => l[i % l.len()],
+                _ => d,
+            }
+        }
+        (0..imgs.len())
+            .map(|i| BgLayer {
+                image: imgs[i],
+                size: pick(&self.mask_sizes, i, BgSize { x: Len::Auto, y: Len::Auto, fit: 0 }),
+                pos: [pick(&self.mask_pos_x, i, Len::Pct(0.0)), pick(&self.mask_pos_y, i, Len::Pct(0.0))],
+                rep: pick(&self.mask_reps, i, (1, 1)),
+                origin: pick(&self.mask_origin, i, 0),
+                clip: pick(&self.mask_clip, i, 0),
+                attach: pick(&self.mask_mode, i, 2),
+            })
+            .collect()
+    }
+
+    /// Every image this style paints (backgrounds, masks), for fetching.
+    pub fn image_ids(&self) -> Vec<u32> {
+        self.bg_images.iter().chain(self.mask_images.iter()).flat_map(|l| l.iter().copied()).filter(|&i| i != u32::MAX).collect()
+    }
 }
 
 /// A resolved transform step: a translation (percentages of the border box)
@@ -417,6 +529,7 @@ pub const INITIAL: Style = Style {
     flow_root: false,
     radius: [Len::Px(0.0); 4],
     shadow: None,
+    text_shadow: None,
     opacity: 1.0,
     flex_dir: FlexDir::Row,
     wrap: false,
@@ -472,13 +585,31 @@ pub const INITIAL: Style = Style {
     padding: [Len::Px(0.0); 4],
     bw: [3.0; 4],
     bc: [CURRENT_COLOR; 4],
-    bs: [false; 4],
+    bs: [0; 4],
+    ow: 3.0,
+    os: 0,
+    oc: CURRENT_COLOR,
+    oo: 0.0,
     vars: None,
     bg_image: None,
-    bg_size: [Len::Auto; 2],
-    bg_fit: 0,
-    bg_pos: [Len::Pct(0.0); 2],
-    bg_repeat: (true, true),
+    bg_images: None,
+    bg_sizes: None,
+    bg_pos_x: None,
+    bg_pos_y: None,
+    bg_reps: None,
+    bg_origin: None,
+    bg_clip: None,
+    bg_attach: None,
+    mask_images: None,
+    mask_sizes: None,
+    mask_pos_x: None,
+    mask_pos_y: None,
+    mask_reps: None,
+    mask_origin: None,
+    mask_clip: None,
+    mask_mode: None,
+    clip_path: None,
+    blend: 0,
     object_fit: 0,
     content: None,
     before: 0,
@@ -525,6 +656,7 @@ impl Style {
             spacing: p.spacing,
             word_break: p.word_break,
             wrap_anywhere: p.wrap_anywhere,
+            text_shadow: p.text_shadow.clone(),
             vars: p.vars.clone(),
             ..INITIAL
         }
@@ -562,7 +694,8 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         Overflow => d.overflow = s.overflow,
         OverflowX => d.ovf_x = s.ovf_x,
         OverflowY => d.ovf_y = s.ovf_y,
-        BoxShadow => d.shadow = s.shadow,
+        BoxShadow => d.shadow = s.shadow.clone(),
+        TextShadow => d.text_shadow = s.text_shadow.clone(),
         Opacity => d.opacity = s.opacity,
         FlexDirection => d.flex_dir = s.flex_dir,
         FlexWrap => d.wrap = s.wrap,
@@ -587,7 +720,23 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         GridRowEnd => d.grow_[1] = s.grow_[1],
         GridTemplateAreas => d.grid_areas = s.grid_areas.clone(),
         GridArea => d.garea = s.garea,
-        BackgroundImage => d.bg_image = s.bg_image,
+        BackgroundImage => {
+            d.bg_image = s.bg_image;
+            d.bg_images = s.bg_images.clone();
+        }
+        BgOrigin => d.bg_origin = s.bg_origin.clone(),
+        MaskImage => d.mask_images = s.mask_images.clone(),
+        MaskSize => d.mask_sizes = s.mask_sizes.clone(),
+        MaskPosX => d.mask_pos_x = s.mask_pos_x.clone(),
+        MaskPosY => d.mask_pos_y = s.mask_pos_y.clone(),
+        MaskRepeat => d.mask_reps = s.mask_reps.clone(),
+        MaskOrigin => d.mask_origin = s.mask_origin.clone(),
+        MaskClip => d.mask_clip = s.mask_clip.clone(),
+        MaskMode => d.mask_mode = s.mask_mode.clone(),
+        ClipPath => d.clip_path = s.clip_path,
+        MixBlend => d.blend = s.blend,
+        BgClip => d.bg_clip = s.bg_clip.clone(),
+        BgAttachment => d.bg_attach = s.bg_attach.clone(),
         Content => d.content = s.content.clone(),
         TransformP => d.xform = s.xform.clone(),
         FilterP => d.filter = s.filter.clone(),
@@ -597,13 +746,10 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         ScaleP => d.x_scale = s.x_scale.clone(),
         TransformOriginX => d.tf_origin[0] = s.tf_origin[0],
         TransformOriginY => d.tf_origin[1] = s.tf_origin[1],
-        BgSizeX | BgSizeY => {
-            d.bg_size = s.bg_size;
-            d.bg_fit = s.bg_fit
-        }
-        BgPosX => d.bg_pos[0] = s.bg_pos[0],
-        BgPosY => d.bg_pos[1] = s.bg_pos[1],
-        BgRepeat => d.bg_repeat = s.bg_repeat,
+        BgSizeX => d.bg_sizes = s.bg_sizes.clone(),
+        BgPosX => d.bg_pos_x = s.bg_pos_x.clone(),
+        BgPosY => d.bg_pos_y = s.bg_pos_y.clone(),
+        BgRepeat => d.bg_reps = s.bg_reps.clone(),
         ObjectFit => d.object_fit = s.object_fit,
         Color => d.color = s.color,
         Background => d.bg = s.bg,
@@ -671,6 +817,10 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
             let i = p as usize - BorderTopStyle as usize;
             d.bs[i] = s.bs[i]
         }
+        OutlineWidth => d.ow = s.ow,
+        OutlineColor => d.oc = s.oc,
+        OutlineStyle => d.os = s.os,
+        OutlineOffset => d.oo = s.oo,
         Custom | Unresolved => {}
     }
 }
@@ -853,15 +1003,22 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                 _ => Ovf::Scroll,
             };
         }
-        BoxShadow => {
-            s.shadow = match v {
-                Value::Shadow(mut sh) => {
-                    if sh.color == CURRENT_COLOR {
-                        sh.color = s.color;
-                    }
-                    Some(sh)
+        BoxShadow | TextShadow => {
+            let list = match v {
+                Value::Shadows(i) => {
+                    let color = s.color;
+                    let l: Vec<css::Shadow> = css::shadows(i)
+                        .iter()
+                        .map(|&sh| if sh.color == CURRENT_COLOR { css::Shadow { color, ..sh } } else { sh })
+                        .collect();
+                    Some(Rc::from(l))
                 }
                 _ => None,
+            };
+            if d.prop == BoxShadow {
+                s.shadow = list;
+            } else {
+                s.text_shadow = list;
             }
         }
         FilterP | BackdropFilterP => {
@@ -973,9 +1130,79 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
             }
         }
         BackgroundImage => {
-            s.bg_image = match v {
-                Value::Image(i) => Some(i),
+            let ids: Option<Rc<[u32]>> = match v {
+                Value::Image(i) => Some(Rc::from(vec![i])),
+                Value::BgList(i) => match &*css::bg_list(i) {
+                    css::BgList::Images(l) if l.iter().any(|&x| x != u32::MAX) => Some(Rc::from(l.clone())),
+                    _ => None,
+                },
                 _ => None,
+            };
+            s.bg_image = ids.as_ref().and_then(|l| l.iter().copied().find(|&x| x != u32::MAX));
+            s.bg_images = ids;
+        }
+        BgOrigin | BgClip | BgAttachment | MaskOrigin | MaskClip | MaskMode => {
+            let l = match v {
+                Value::BgList(i) => match &*css::bg_list(i) {
+                    css::BgList::Keys(k) => Some(Rc::from(k.clone())),
+                    _ => None,
+                },
+                _ => None,
+            };
+            match d.prop {
+                BgOrigin => s.bg_origin = l,
+                BgClip => s.bg_clip = l,
+                BgAttachment => s.bg_attach = l,
+                MaskOrigin => s.mask_origin = l,
+                MaskClip => s.mask_clip = l,
+                _ => s.mask_mode = l,
+            }
+        }
+        MaskImage => {
+            s.mask_images = match v {
+                Value::BgList(i) => match &*css::bg_list(i) {
+                    css::BgList::Images(l) if l.iter().any(|&x| x != u32::MAX) => Some(Rc::from(l.clone())),
+                    _ => None,
+                },
+                _ => None,
+            };
+        }
+        MaskSize => {
+            if let Value::BgList(i) = v {
+                if let css::BgList::Sizes(l) = &*css::bg_list(i) {
+                    s.mask_sizes = Some(Rc::from(l.iter().map(|xy| bg_size_of(c, xy, fs)).collect::<Vec<_>>()));
+                }
+            }
+        }
+        MaskPosX | MaskPosY => {
+            if let Value::BgList(i) = v {
+                if let css::BgList::Pos(l) = &*css::bg_list(i) {
+                    let p: Rc<[Len]> = l.iter().map(|x| c.len(*x, fs).unwrap_or(Len::Pct(0.0))).collect::<Vec<_>>().into();
+                    if d.prop == MaskPosX {
+                        s.mask_pos_x = Some(p);
+                    } else {
+                        s.mask_pos_y = Some(p);
+                    }
+                }
+            }
+        }
+        MaskRepeat => {
+            if let Value::BgList(i) = v {
+                if let css::BgList::Repeat(l) = &*css::bg_list(i) {
+                    s.mask_reps = Some(Rc::from(l.clone()));
+                }
+            }
+        }
+        ClipPath => {
+            s.clip_path = match v {
+                Value::Shape(i) => Some(i),
+                _ => None,
+            }
+        }
+        MixBlend => {
+            s.blend = match v {
+                Value::Num(n) => n as u8,
+                _ => 0,
             }
         }
         TransformP | TranslateP | RotateP | ScaleP => {
@@ -1034,32 +1261,33 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                 _ => None,
             }
         }
-        BgSizeX | BgSizeY => {
-            let i = (d.prop == BgSizeY) as usize;
-            match v {
-                Value::Kw(Kw::Cover) => s.bg_fit = 1,
-                Value::Kw(Kw::Contain) => s.bg_fit = 2,
-                _ => {
-                    if let Some(l) = c.len(v, fs) {
-                        s.bg_size[i] = l;
-                        if i == 0 {
-                            s.bg_fit = 0;
-                        }
+        BgSizeX => {
+            if let Value::BgList(i) = v {
+                if let css::BgList::Sizes(l) = &*css::bg_list(i) {
+                    let sizes: Vec<BgSize> = l.iter().map(|xy| bg_size_of(c, xy, fs)).collect();
+                    s.bg_sizes = Some(Rc::from(sizes));
+                }
+            } else if matches!(v, Value::Initial) {
+                s.bg_sizes = None;
+            }
+        }
+        BgPosX | BgPosY => {
+            if let Value::BgList(i) = v {
+                if let css::BgList::Pos(l) = &*css::bg_list(i) {
+                    let p: Vec<Len> = l.iter().map(|x| c.len(*x, fs).unwrap_or(Len::Pct(0.0))).collect();
+                    if d.prop == BgPosX {
+                        s.bg_pos_x = Some(Rc::from(p));
+                    } else {
+                        s.bg_pos_y = Some(Rc::from(p));
                     }
                 }
             }
         }
-        BgPosX | BgPosY => {
-            if let Some(l) = c.len(v, fs) {
-                s.bg_pos[(d.prop == BgPosY) as usize] = l
-            }
-        }
         BgRepeat => {
-            s.bg_repeat = match kw {
-                Some(Kw::NoRepeat) => (false, false),
-                Some(Kw::RepeatX) => (true, false),
-                Some(Kw::RepeatY) => (false, true),
-                _ => (true, true),
+            if let Value::BgList(i) = v {
+                if let css::BgList::Repeat(l) = &*css::bg_list(i) {
+                    s.bg_reps = Some(Rc::from(l.clone()));
+                }
             }
         }
         ObjectFit => {
@@ -1247,11 +1475,44 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
             }
         }
         BorderTopStyle | BorderRightStyle | BorderBottomStyle | BorderLeftStyle => {
-            s.bs[d.prop as usize - BorderTopStyle as usize] = kw == Some(Kw::Solid)
+            s.bs[d.prop as usize - BorderTopStyle as usize] = border_style_code(kw)
+        }
+        OutlineWidth => {
+            if let Some(p) = c.px(v, fs) {
+                s.ow = p.max(0.0)
+            }
+        }
+        OutlineColor => {
+            if let Value::Color(col) = v {
+                s.oc = col
+            }
+        }
+        OutlineStyle => s.os = border_style_code(kw),
+        OutlineOffset => {
+            if let Some(p) = c.px(v, fs) {
+                s.oo = p
+            }
         }
         Custom | Unresolved => {}
     }
 }
+
+/// A border-style keyword as a style code (see `Style::bs`).
+pub fn border_style_code(kw: Option<Kw>) -> u8 {
+    match kw {
+        Some(Kw::Solid) => 1,
+        Some(Kw::BDashed) => 2,
+        Some(Kw::BDotted) => 3,
+        Some(Kw::BDouble) => 4,
+        Some(Kw::BGroove) => 5,
+        Some(Kw::BRidge) => 6,
+        Some(Kw::BInset) => 7,
+        Some(Kw::BOutset) => 8,
+        _ => 0,
+    }
+}
+
+pub const BORDER_STYLES: [&str; 9] = ["none", "solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset"];
 
 #[derive(Clone, Copy, PartialEq)]
 enum Pass {
@@ -1939,12 +2200,18 @@ fn apply_matched(s: &mut Style, ps: &Style, cas: &Cascade, matched: &[u32], ctx:
         }
     }
     for i in 0..4 {
-        if !s.bs[i] {
+        if s.bs[i] == 0 {
             s.bw[i] = 0.0;
         }
         if s.bc[i] == CURRENT_COLOR {
             s.bc[i] = s.color;
         }
+    }
+    if s.os == 0 {
+        s.ow = 0.0;
+    }
+    if s.oc == CURRENT_COLOR {
+        s.oc = s.color;
     }
     if s.bg == CURRENT_COLOR {
         s.bg = s.color;
@@ -2126,12 +2393,18 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
 
         // Fix-ups.
         for i in 0..4 {
-            if !s.bs[i] {
+            if s.bs[i] == 0 {
                 s.bw[i] = 0.0;
             }
             if s.bc[i] == CURRENT_COLOR {
                 s.bc[i] = s.color;
             }
+        }
+        if s.os == 0 {
+            s.ow = 0.0;
+        }
+        if s.oc == CURRENT_COLOR {
+            s.oc = s.color;
         }
         if s.bg == CURRENT_COLOR {
             s.bg = s.color;
@@ -2262,7 +2535,7 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         put(&format!("padding-{side}"), css_px(pad[i]));
         put(&format!("border-{side}-width"), css_px(st.bw[i]));
         put(&format!("border-{side}-color"), css_color(st.bc[i]));
-        put(&format!("border-{side}-style"), if st.bs[i] { "solid" } else { "none" }.into());
+        put(&format!("border-{side}-style"), BORDER_STYLES[st.bs[i] as usize].into());
         put(side, css_len(st.inset[i], if i % 2 == 0 { bh } else { bw }));
     }
     put("margin", ["top", "right", "bottom", "left"].iter().enumerate().map(|(i, _)| css_len(st.margin[i], bw)).collect::<Vec<_>>().join(" "));
@@ -2383,7 +2656,7 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         put(&format!("border-{corner}-radius"), rad[i].clone());
     }
     put("border-radius", if rad.iter().all(|r| *r == rad[0]) { rad[0].clone() } else { rad.join(" ") });
-    let side_border = |i: usize| format!("{} {} {}", css_px(st.bw[i]), if st.bs[i] { "solid" } else { "none" }, css_color(st.bc[i]));
+    let side_border = |i: usize| format!("{} {} {}", css_px(st.bw[i]), BORDER_STYLES[st.bs[i] as usize], css_color(st.bc[i]));
     for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
         put(&format!("border-{side}"), side_border(i));
     }
@@ -2392,46 +2665,76 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         if v.iter().all(|x| *x == v[0]) { v[0].clone() } else { v.join(" ") }
     };
     put("border-width", same(&|i| css_px(st.bw[i])));
-    put("border-style", same(&|i| if st.bs[i] { "solid" } else { "none" }.into()));
+    put("border-style", same(&|i| BORDER_STYLES[st.bs[i] as usize].into()));
+    put("outline-style", BORDER_STYLES[st.os as usize].into());
+    put("outline-width", css_px(st.ow));
+    put("outline-color", css_color(st.oc));
+    put("outline-offset", css_px(st.oo));
+    put("outline", format!("{} {} {}", css_color(st.oc), BORDER_STYLES[st.os as usize], css_px(st.ow)));
     put("border-color", same(&|i| css_color(st.bc[i])));
     put("border", if (0..4).all(|i| side_border(i) == side_border(0)) { side_border(0) } else { String::new() });
     put("border-collapse", if st.collapse { "collapse" } else { "separate" }.into());
     put("border-spacing", css_px(st.spacing));
     put(
         "box-shadow",
-        match st.shadow {
-            Some(sh) => format!(
-                "{} {} {} {} {}{}",
-                css_color(sh.color),
-                css_px(sh.x),
-                css_px(sh.y),
-                css_px(sh.blur),
-                css_px(sh.spread),
-                if sh.inset { " inset" } else { "" }
-            ),
+        match &st.shadow {
+            Some(list) => list
+                .iter()
+                .map(|sh| format!("{} {} {} {} {}{}", css_color(sh.color), css_px(sh.x), css_px(sh.y), css_px(sh.blur), css_px(sh.spread), if sh.inset { " inset" } else { "" }))
+                .collect::<Vec<_>>()
+                .join(", "),
             None => "none".into(),
         },
     );
-    put("background-image", if st.bg_image.is_some() { "url(\"\")".into() } else { "none".into() });
     put(
-        "background-size",
-        match st.bg_fit {
-            1 => "cover".into(),
-            2 => "contain".into(),
-            _ => format!("{} {}", size(st.bg_size[0], bw), size(st.bg_size[1], bh)).replace("auto auto", "auto"),
+        "text-shadow",
+        match &st.text_shadow {
+            Some(list) => list.iter().map(|sh| format!("{} {} {} {}", css_color(sh.color), css_px(sh.x), css_px(sh.y), css_px(sh.blur))).collect::<Vec<_>>().join(", "),
+            None => "none".into(),
         },
     );
-    put("background-position", format!("{} {}", size(st.bg_pos[0], bw), size(st.bg_pos[1], bh)).replace("auto", "0%"));
+    let layers = st.bg_layers();
+    let list = |f: &dyn Fn(&BgLayer) -> String, none: &str| if layers.is_empty() { none.to_string() } else { layers.iter().map(f).collect::<Vec<_>>().join(", ") };
+    put(
+        "background-image",
+        list(
+            &|l| match (l.image != u32::MAX).then(|| css::bg_image(l.image)) {
+                Some(css::BgImage::Url(u)) => format!("url(\"{u}\")"),
+                Some(css::BgImage::Gradient(_)) => "linear-gradient(rgba(0, 0, 0, 0), rgba(0, 0, 0, 0))".into(),
+                None => "none".into(),
+            },
+            "none",
+        ),
+    );
+    put(
+        "background-size",
+        list(
+            &|l| match l.size.fit {
+                1 => "cover".into(),
+                2 => "contain".into(),
+                _ => format!("{} {}", size(l.size.x, bw), size(l.size.y, bh)).replace("auto auto", "auto"),
+            },
+            "auto",
+        ),
+    );
+    put("background-position", list(&|l| format!("{} {}", size(l.pos[0], bw), size(l.pos[1], bh)), "0% 0%"));
+    let rep_name = |r: u8| ["no-repeat", "repeat", "space", "round"][r.min(3) as usize];
     put(
         "background-repeat",
-        match st.bg_repeat {
-            (true, true) => "repeat",
-            (true, false) => "repeat-x",
-            (false, true) => "repeat-y",
-            _ => "no-repeat",
-        }
-        .into(),
+        list(
+            &|l| match l.rep {
+                (1, 0) => "repeat-x".into(),
+                (0, 1) => "repeat-y".into(),
+                (a, b) if a == b => rep_name(a).into(),
+                (a, b) => format!("{} {}", rep_name(a), rep_name(b)),
+            },
+            "repeat",
+        ),
     );
+    let box_name = |b: u8| ["border-box", "padding-box", "content-box", "text"][b.min(3) as usize];
+    put("background-origin", list(&|l| box_name(l.origin).into(), "padding-box"));
+    put("background-clip", list(&|l| box_name(l.clip).into(), "border-box"));
+    put("background-attachment", list(&|l| ["scroll", "fixed", "local"][l.attach.min(2) as usize].into(), "scroll"));
     put(
         "vertical-align",
         match st.valign {
@@ -2548,13 +2851,8 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         ("letter-spacing", "normal"),
         ("word-spacing", "0px"),
         ("text-indent", "0px"),
-        ("text-shadow", "none"),
         ("direction", "ltr"),
         ("writing-mode", "horizontal-tb"),
-        ("outline-style", "none"),
-        ("outline-width", "0px"),
-        ("outline", "none"),
-        ("outline-offset", "0px"),
         ("transition", "all 0s ease 0s"),
         ("transition-duration", "0s"),
         ("transition-property", "all"),
@@ -2572,9 +2870,6 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         ("clip-path", "none"),
         ("mask-image", "none"),
         ("object-position", "50% 50%"),
-        ("background-attachment", "scroll"),
-        ("background-clip", "border-box"),
-        ("background-origin", "padding-box"),
         ("scroll-behavior", "auto"),
         ("touch-action", "auto"),
         ("contain", "none"),

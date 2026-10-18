@@ -34,8 +34,10 @@ pub struct ShadowData {
     pub blur: f32,
     pub c: u32,
     /// The element's border box: outer shadows are not drawn under it.
+    /// (Inset shadows: the padding box they are drawn inside.)
     pub hole: [f32; 4],
     pub hr: [f32; 4],
+    pub inset: bool,
 }
 
 pub struct ImgData {
@@ -54,7 +56,11 @@ pub struct ImgData {
 pub struct GradData {
     pub rect: [f32; 4],
     pub clip: [f32; 4],
-    pub radial: bool,
+    /// 0 linear, 1 radial, 2 conic.
+    pub kind: u8,
+    /// Radial / conic center (relative to the rect) and radial radii.
+    pub center: [f32; 2],
+    pub radii: [f32; 2],
     pub angle: f32,
     /// repeating-*-gradient: the pattern repeats every this fraction of the line.
     pub period: Option<f32>,
@@ -84,6 +90,22 @@ pub enum DItem {
     /// backdrop-filter: filter what is already painted under a rounded
     /// rect.
     Backdrop(Box<BackdropData>),
+    /// A border (or outline) with per-side styles and colors.
+    Border(Box<BorderData>),
+    /// A filled vector shape.
+    Path(Box<PathData>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct BorderData {
+    /// Outer rect and corner radii.
+    pub o: [f32; 4],
+    pub r: [f32; 4],
+    /// Widths, style codes (see `Style::bs`) and colors per side
+    /// (top, right, bottom, left).
+    pub w: [f32; 4],
+    pub s: [u8; 4],
+    pub c: [u32; 4],
 }
 
 pub struct BackdropData {
@@ -104,6 +126,20 @@ pub struct LayerData {
     pub alpha: f32,
     /// CSS filters, applied to the rasterized layer.
     pub filters: Option<Arc<[FilterOp]>>,
+    /// Masks (mask-image layers, clip-path, background-clip text): each
+    /// is rasterized and multiplies the layer's alpha.
+    pub masks: Vec<Vec<DItem>>,
+    /// Masks use luminance (else alpha).
+    pub mask_lum: bool,
+    /// mix-blend-mode as a canvas composite operation (0 = normal).
+    pub blend: u8,
+}
+
+/// A filled vector shape (page coordinates).
+pub struct PathData {
+    pub polys: Vec<Vec<(f32, f32)>>,
+    pub evenodd: bool,
+    pub color: u32,
 }
 
 /// a · b (apply b first).
@@ -295,22 +331,35 @@ impl Builder<'_> {
         let (bw, bh) = (b.border_w(), b.border_h());
         let r = radii(st, bw, bh);
         let rounded = r.iter().any(|&v| v > 0.0);
-        if let Some(sh) = st.shadow {
-            if !sh.inset && sh.color >> 24 != 0 {
-                let s = [bx + sh.x - sh.spread, by + sh.y - sh.spread, bw + 2.0 * sh.spread, bh + 2.0 * sh.spread];
-                let sr = r.map(|v| if v > 0.0 { (v + sh.spread).max(0.0) } else { 0.0 });
-                let c = self.fade(sh.color);
-                self.push(DItem::Shadow(Box::new(ShadowData { s, r: sr, blur: sh.blur, c, hole: [bx, by, bw, bh], hr: r })));
+        // Outer shadows, the first one on top.
+        if let Some(list) = st.shadow.clone() {
+            for sh in list.iter().rev() {
+                if !sh.inset && sh.color >> 24 != 0 {
+                    let s = [bx + sh.x - sh.spread, by + sh.y - sh.spread, bw + 2.0 * sh.spread, bh + 2.0 * sh.spread];
+                    let sr = r.map(|v| if v > 0.0 { (v + sh.spread).max(0.0) } else { 0.0 });
+                    let c = self.fade(sh.color);
+                    self.push(DItem::Shadow(Box::new(ShadowData { s, r: sr, blur: sh.blur, c, hole: [bx, by, bw, bh], hr: r, inset: false })));
+                }
             }
         }
-        if rounded {
-            let c = self.fade(st.bg);
-            if c >> 24 != 0 {
-                self.push(DItem::RRect(Box::new(([bx, by, bw, bh], r, c))));
-            }
+        // Borders other than uniformly solid ones (styles, per-side colors
+        // on rounded corners) go through the general border painter.
+        let has_border = b.b.iter().any(|&v| v > 0.0);
+        let plain = st.bs.iter().zip(&b.b).all(|(&s, &w)| s <= 1 || w <= 0.0) && (!rounded || (0..4).all(|i| b.b[i] <= 0.0 || st.bc[i] == st.bc[0]));
+        if has_border && !plain {
+            self.bg_color(b, st, bx, by, r);
             if b.node != self.canvas_img {
                 self.background_image(b, st, bx, by, None);
             }
+            self.inset_shadows(b, st, bx, by, r);
+            let colors = st.bc.map(|c| self.fade(c));
+            self.push(DItem::Border(Box::new(BorderData { o: [bx, by, bw, bh], r, w: b.b, s: st.bs, c: colors })));
+        } else if rounded {
+            self.bg_color(b, st, bx, by, r);
+            if b.node != self.canvas_img {
+                self.background_image(b, st, bx, by, None);
+            }
+            self.inset_shadows(b, st, bx, by, r);
             let bc = self.fade(st.bc[0]);
             if b.b.iter().any(|&v| v > 0.0) && bc >> 24 != 0 {
                 let i = [bx + b.b[3], by + b.b[0], bw - b.b[1] - b.b[3], bh - b.b[0] - b.b[2]];
@@ -323,14 +372,27 @@ impl Builder<'_> {
                 self.push(DItem::Ring(Box::new(RingData { o: [bx, by, bw, bh], or: r, i, ir, c: bc })));
             }
         } else {
-            self.rect(bx, by, bw, bh, st.bg);
+            self.bg_color(b, st, bx, by, r);
             if b.node != self.canvas_img {
                 self.background_image(b, st, bx, by, None);
             }
+            self.inset_shadows(b, st, bx, by, r);
             self.rect(bx, by, bw, b.b[0], st.bc[0]);
             self.rect(bx, by + bh - b.b[2], bw, b.b[2], st.bc[2]);
             self.rect(bx, by, b.b[3], bh, st.bc[3]);
             self.rect(bx + bw - b.b[1], by, b.b[1], bh, st.bc[1]);
+        }
+        if st.ow > 0.0 && st.os != 0 && st.oc >> 24 != 0 {
+            // The outline follows the border box (and its corners), outside
+            // it by outline-offset.
+            let (ow, off) = (st.ow, st.oo);
+            let grow = ow + off;
+            let o = [bx - grow, by - grow, bw + 2.0 * grow, bh + 2.0 * grow];
+            if o[2] > 0.0 && o[3] > 0.0 {
+                let rr = r.map(|v| if v > 0.0 { (v + grow).max(0.0) } else { 0.0 });
+                let c = self.fade(st.oc);
+                self.push(DItem::Border(Box::new(BorderData { o, r: rr, w: [ow; 4], s: [st.os; 4], c: [c; 4] })));
+            }
         }
         if let Some(img) = &b.image {
             // <img> content, honouring object-fit.
@@ -354,66 +416,279 @@ impl Builder<'_> {
         }
     }
 
-    /// Paint `st`'s background image for box `b`; `canvas` paints a root
-    /// background over the whole canvas instead of the border box.
-    fn background_image(&mut self, b: &LBox, st: &Style, bx: f32, by: f32, canvas: Option<[f32; 4]>) {
-        let Some(bi) = st.bg_image else { return };
-        let (bw, bh) = (b.border_w(), b.border_h());
-        let clip = canvas.unwrap_or([bx, by, bw, bh]);
-        let radius = if canvas.is_some() { [0.0; 4] } else { radii(st, bw, bh) };
-        let (px, py) = (bx + b.b[3], by + b.b[0]);
-        let (pw, mut ph) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
-        if let Some(c) = canvas {
-            // (An auto-sized gradient covers the canvas rather than tiling.)
-            ph = ph.max(c[3] - py);
-        }
-        if pw <= 0.0 || ph <= 0.0 {
+    /// The background color, in the bottom layer's clip box.
+    fn bg_color(&mut self, b: &LBox, st: &Style, bx: f32, by: f32, r: [f32; 4]) {
+        let c = self.fade(st.bg);
+        if c >> 24 == 0 {
             return;
         }
-        let sized = |iw: f32, ih: f32| -> (f32, f32) {
-            match st.bg_fit {
-                1 => {
-                    let s = (pw / iw).max(ph / ih);
-                    (iw * s, ih * s)
+        let layers = st.bg_images.as_ref().map_or(1, |l| l.len().max(1));
+        let clip = st.bg_clip.as_ref().map_or(0, |l| l[(layers - 1) % l.len()]);
+        let (bw, bh) = (b.border_w(), b.border_h());
+        let shrink = |r: [f32; 4], e: [f32; 4]| [(r[0] - e[3].max(e[0])).max(0.0), (r[1] - e[1].max(e[0])).max(0.0), (r[2] - e[1].max(e[2])).max(0.0), (r[3] - e[3].max(e[2])).max(0.0)];
+        let (rect, rr) = match clip {
+            1 | 2 => {
+                let pad = [bx + b.b[3], by + b.b[0], b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]];
+                let pr = shrink(r, b.b);
+                if clip == 1 {
+                    (pad, pr)
+                } else {
+                    ([pad[0] + b.p[3], pad[1] + b.p[0], b.w, b.h], shrink(pr, b.p))
                 }
-                2 => {
-                    let s = (pw / iw).min(ph / ih);
-                    (iw * s, ih * s)
-                }
-                _ => match (st.bg_size[0], st.bg_size[1]) {
-                    (Len::Auto, Len::Auto) => (iw, ih),
-                    (x, Len::Auto) => {
-                        let w = x.px(pw);
-                        (w, w * ih / iw)
-                    }
-                    (Len::Auto, y) => {
-                        let h = y.px(ph);
-                        (h * iw / ih, h)
-                    }
-                    (x, y) => (x.px(pw), y.px(ph)),
-                },
             }
+            3 => return,
+            _ => ([bx, by, bw, bh], r),
         };
-        match css::bg_image(bi) {
-            css::BgImage::Url(u) => {
-                let Some(img) = self.res.url(&u) else { return };
-                let (w, h) = sized(img.iw, img.ih);
-                if w < 0.5 || h < 0.5 {
-                    return;
+        if rr.iter().any(|&v| v > 0.0) {
+            self.push(DItem::RRect(Box::new((rect, rr, c))));
+        } else {
+            self.rect(rect[0], rect[1], rect[2], rect[3], st.bg);
+        }
+    }
+
+    /// text-shadow for a text run at (x, baseline y), the first shadow on
+    /// top: sharp ones are offset copies, blurred ones a blurred layer.
+    #[allow(clippy::too_many_arguments)]
+    fn text_shadows(&mut self, list: &[css::Shadow], x: f32, y: f32, w: f32, start: u32, end: u32, face: u8, fs: f32, line: f32) {
+        for sh in list.iter().rev() {
+            if sh.color >> 24 == 0 {
+                continue;
+            }
+            let color = self.fade(sh.color);
+            let item = DItem::Text { x: x + sh.x, y: y + sh.y, start, end, src: 0, face, size: fs, color };
+            if sh.blur < 0.5 {
+                self.push(item);
+                continue;
+            }
+            let pad = (sh.blur * 1.5).ceil() + 2.0;
+            let bounds = [x + sh.x - pad, y + sh.y - line * fs - pad, w + 2.0 * pad, line * fs * 1.6 + 2.0 * pad];
+            let filters: Arc<[FilterOp]> = Arc::from(vec![FilterOp::Blur(sh.blur / 2.0)]);
+            self.push(DItem::Layer(Box::new(LayerData { items: vec![item], bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: Some(filters), masks: Vec::new(), mask_lum: false, blend: 0 })));
+        }
+    }
+
+    /// Inset box shadows, inside the padding box (the last one first).
+    fn inset_shadows(&mut self, b: &LBox, st: &Style, bx: f32, by: f32, r: [f32; 4]) {
+        let Some(list) = st.shadow.clone() else { return };
+        let pad = [bx + b.b[3], by + b.b[0], b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]];
+        if pad[2] <= 0.0 || pad[3] <= 0.0 {
+            return;
+        }
+        let pr = [
+            (r[0] - b.b[3].max(b.b[0])).max(0.0),
+            (r[1] - b.b[1].max(b.b[0])).max(0.0),
+            (r[2] - b.b[1].max(b.b[2])).max(0.0),
+            (r[3] - b.b[3].max(b.b[2])).max(0.0),
+        ];
+        for sh in list.iter().rev() {
+            if !sh.inset || sh.color >> 24 == 0 {
+                continue;
+            }
+            let s = [pad[0] + sh.x + sh.spread, pad[1] + sh.y + sh.spread, (pad[2] - 2.0 * sh.spread).max(0.0), (pad[3] - 2.0 * sh.spread).max(0.0)];
+            let sr = pr.map(|v| if v > 0.0 { (v - sh.spread).max(0.0) } else { 0.0 });
+            let c = self.fade(sh.color);
+            self.push(DItem::Shadow(Box::new(ShadowData { s, r: sr, blur: sh.blur, c, hole: pad, hr: pr, inset: true })));
+        }
+    }
+
+    /// Paint `st`'s background layers for box `b` (the last layer first);
+    /// `canvas` paints a root background over the whole canvas instead of
+    /// the border box.
+    fn background_image(&mut self, b: &LBox, st: &Style, bx: f32, by: f32, canvas: Option<[f32; 4]>) {
+        let layers = st.bg_layers();
+        if layers.is_empty() {
+            return;
+        }
+        let (bw, bh) = (b.border_w(), b.border_h());
+        let border = [bx, by, bw, bh];
+        let pad = [bx + b.b[3], by + b.b[0], b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]];
+        let content = [pad[0] + b.p[3], pad[1] + b.p[0], b.w, b.h];
+        let r = radii(st, bw, bh);
+        let shrink = |r: [f32; 4], e: [f32; 4]| [(r[0] - e[3].max(e[0])).max(0.0), (r[1] - e[1].max(e[0])).max(0.0), (r[2] - e[1].max(e[2])).max(0.0), (r[3] - e[3].max(e[2])).max(0.0)];
+        let pad_r = shrink(r, b.b);
+        let content_r = shrink(pad_r, b.p);
+        for l in layers.iter().rev() {
+            if l.image == u32::MAX || l.clip == 3 {
+                // (background-clip: text is painted with the text.)
+                continue;
+            }
+            let mut area = match l.origin {
+                0 => border,
+                2 => content,
+                _ => pad,
+            };
+            let (mut paint, mut radius) = match l.clip {
+                1 => (pad, pad_r),
+                2 => (content, content_r),
+                _ => (border, r),
+            };
+            if let Some(c) = canvas {
+                // (An auto-sized gradient covers the canvas rather than tiling.)
+                paint = c;
+                radius = [0.0; 4];
+                area[3] = area[3].max(c[3] - area[1]);
+            }
+            self.bg_layer(l, area, paint, radius);
+        }
+    }
+
+    /// One background layer: positioned in `area`, painted in `paint`.
+    fn bg_layer(&mut self, l: &BgLayer, area: [f32; 4], paint: [f32; 4], radius: [f32; 4]) {
+        let [ax, ay, aw, ah] = area;
+        if aw <= 0.0 || ah <= 0.0 || paint[2] <= 0.0 || paint[3] <= 0.0 {
+            return;
+        }
+        let img = css::bg_image(l.image);
+        let intrinsic = match &img {
+            css::BgImage::Url(u) => match self.res.url(u) {
+                Some(i) => Some((i.iw, i.ih, i.clone())),
+                None => return,
+            },
+            css::BgImage::Gradient(_) => None,
+        };
+        // An image with only an aspect ratio (an SVG with just a viewBox)
+        // is sized like `contain` when its size is auto.
+        let fluid = intrinsic.as_ref().is_some_and(|i| i.2.fluid);
+        let l = &BgLayer { size: if fluid && l.size.fit == 0 && l.size.x == Len::Auto && l.size.y == Len::Auto { BgSize { x: Len::Auto, y: Len::Auto, fit: 2 } } else { l.size }, ..*l };
+        // Tile size.
+        let (mut w, mut h) = match (intrinsic.as_ref().map(|i| (i.0, i.1)), l.size.fit) {
+            (Some((iw, ih)), 1) => {
+                let s = (aw / iw).max(ah / ih);
+                (iw * s, ih * s)
+            }
+            (Some((iw, ih)), 2) => {
+                let s = (aw / iw).min(ah / ih);
+                (iw * s, ih * s)
+            }
+            (None, 1 | 2) => (aw, ah),
+            (i, _) => match (l.size.x, l.size.y, i) {
+                (Len::Auto, Len::Auto, Some((iw, ih))) => (iw, ih),
+                (Len::Auto, Len::Auto, None) => (aw, ah),
+                (x, Len::Auto, Some((iw, ih))) => {
+                    let w = x.px(aw);
+                    (w, if iw > 0.0 { w * ih / iw } else { ah })
                 }
-                let x = px + st.bg_pos[0].px(pw - w);
-                let y = py + st.bg_pos[1].px(ph - h);
-                let alpha = (255.0 * self.opacity) as u32;
-                self.push(DItem::Image(Box::new(ImgData { img: img.clone(), dst: [x, y, w, h], clip, tile: st.bg_repeat, alpha, radius })));
+                (Len::Auto, y, Some((iw, ih))) => {
+                    let h = y.px(ah);
+                    (if ih > 0.0 { h * iw / ih } else { aw }, h)
+                }
+                (x, Len::Auto, None) => (x.px(aw), ah),
+                (Len::Auto, y, None) => (aw, y.px(ah)),
+                (x, y, _) => (x.px(aw), y.px(ah)),
+            },
+        };
+        // `round`: scale so a whole number of tiles fits.
+        if l.rep.0 == 3 && w > 0.0 {
+            let n = (aw / w).round().max(1.0);
+            let nw = aw / n;
+            if l.rep.1 != 3 && l.size.y == Len::Auto {
+                h *= nw / w;
+            }
+            w = nw;
+        }
+        if l.rep.1 == 3 && h > 0.0 {
+            let n = (ah / h).round().max(1.0);
+            h = ah / n;
+        }
+        if w < 0.5 || h < 0.5 {
+            return;
+        }
+        let mut x = ax + l.pos[0].px(aw - w);
+        let mut y = ay + l.pos[1].px(ah - h);
+        // `space`: whole tiles spread across the area.
+        let (mut gap_x, mut gap_y) = (0.0, 0.0);
+        let mut tile = (l.rep.0 != 0, l.rep.1 != 0);
+        if l.rep.0 == 2 {
+            let n = (aw / w).floor();
+            if n >= 2.0 {
+                gap_x = (aw - n * w) / (n - 1.0);
+                x = ax;
+            } else {
+                tile.0 = false;
+            }
+        }
+        if l.rep.1 == 2 {
+            let n = (ah / h).floor();
+            if n >= 2.0 {
+                gap_y = (ah - n * h) / (n - 1.0);
+                y = ay;
+            } else {
+                tile.1 = false;
+            }
+        }
+        let alpha = (255.0 * self.opacity) as u32;
+        // The painted region: the clip box, cut to the tile on axes that
+        // don't repeat.
+        let mut clip = paint;
+        if !tile.0 {
+            let (x0, x1) = (clip[0].max(x), (clip[0] + clip[2]).min(x + w));
+            clip[0] = x0;
+            clip[2] = (x1 - x0).max(0.0);
+        }
+        if !tile.1 {
+            let (y0, y1) = (clip[1].max(y), (clip[1] + clip[3]).min(y + h));
+            clip[1] = y0;
+            clip[3] = (y1 - y0).max(0.0);
+        }
+        if clip[2] <= 0.0 || clip[3] <= 0.0 {
+            return;
+        }
+        if gap_x > 0.0 || gap_y > 0.0 {
+            // Spaced tiles: one item each.
+            let (sx, sy) = (w + gap_x, h + gap_y);
+            let first_x = if tile.0 { x - ((x - paint[0]) / sx).ceil() * sx } else { x };
+            let first_y = if tile.1 { y - ((y - paint[1]) / sy).ceil() * sy } else { y };
+            let mut items = 0;
+            let mut ty = first_y;
+            while ty < paint[1] + paint[3] && items < 4000 {
+                let mut tx = first_x;
+                while tx < paint[0] + paint[2] && items < 4000 {
+                    self.tile_item(&img, intrinsic.as_ref().map(|i| &i.2), [tx, ty, w, h], paint, (false, false), alpha, radius);
+                    items += 1;
+                    if !tile.0 {
+                        break;
+                    }
+                    tx += sx;
+                }
+                if !tile.1 {
+                    break;
+                }
+                ty += sy;
+            }
+            return;
+        }
+        self.tile_item(&img, intrinsic.as_ref().map(|i| &i.2), [x, y, w, h], clip, tile, alpha, radius);
+    }
+
+    /// An image or gradient tile at `dst`, repeated on the `tile` axes
+    /// within `clip`.
+    #[allow(clippy::too_many_arguments)]
+    fn tile_item(&mut self, img: &css::BgImage, decoded: Option<&Arc<Image>>, dst: [f32; 4], clip: [f32; 4], tile: (bool, bool), alpha: u32, radius: [f32; 4]) {
+        match img {
+            css::BgImage::Url(_) => {
+                if let Some(i) = decoded {
+                    self.push(DItem::Image(Box::new(ImgData { img: i.clone(), dst, clip, tile, alpha, radius })));
+                }
             }
             css::BgImage::Gradient(g) => {
-                let (w, h) = if st.bg_fit == 0 && st.bg_size[0] == Len::Auto && st.bg_size[1] == Len::Auto { (pw, ph) } else { sized(pw, ph) };
-                let x = px + st.bg_pos[0].px(pw - w);
-                let y = py + st.bg_pos[1].px(ph - h);
-                let a = g.angle.to_radians();
-                let len = if g.radial { (w * w + h * h).sqrt() / 2.0 } else { (w * a.sin()).abs() + (h * a.cos()).abs() };
-                let (lut, period) = gradient_lut(&g, len.max(1.0), self.opacity);
-                self.push(DItem::Gradient(Box::new(GradData { rect: [x, y, w, h], clip, radial: g.radial, angle: g.angle, period, lut, radius })));
+                let covers = (!tile.0 || (dst[0] <= clip[0] && dst[0] + dst[2] >= clip[0] + clip[2])) && (!tile.1 || (dst[1] <= clip[1] && dst[1] + dst[3] >= clip[1] + clip[3]));
+                let gd = grad_data(g, dst, clip, radius, self.opacity);
+                if covers {
+                    self.push(DItem::Gradient(Box::new(gd)));
+                } else {
+                    // A repeated gradient: render one tile as an image.
+                    let (tw, th) = (dst[2].round().clamp(1.0, 2048.0) as u32, dst[3].round().clamp(1.0, 2048.0) as u32);
+                    let mut px = Vec::with_capacity((tw * th) as usize);
+                    let sx = dst[2] / tw as f32;
+                    let sy = dst[3] / th as f32;
+                    for y in 0..th {
+                        for x in 0..tw {
+                            px.push(grad_pixel(&gd, (x as f32 + 0.5) * sx, (y as f32 + 0.5) * sy));
+                        }
+                    }
+                    let img = Arc::new(crate::image::from_pixels(tw, th, px, dst[2], dst[3]));
+                    self.push(DItem::Image(Box::new(ImgData { img, dst, clip, tile, alpha: 255, radius })));
+                }
             }
         }
     }
@@ -437,6 +712,8 @@ impl Builder<'_> {
             }
             DItem::Layer(l) => l.tbounds,
             DItem::Backdrop(d) => d.r,
+            DItem::Border(d) => d.o,
+            DItem::Path(d) => poly_bbox(&d.polys)?,
             DItem::Clip { .. } | DItem::Unclip | DItem::FixedOn | DItem::FixedOff => return None,
         })
     }
@@ -469,8 +746,16 @@ impl Builder<'_> {
                 self.push(DItem::Backdrop(Box::new(BackdropData { r, radii, filters: Arc::from(&f[..]) })));
             }
         }
-        if m.is_none() && !group_alpha && (st.filter.is_none() || st.hidden) {
-            return self.paint_context_or_box(id, ox, oy);
+        let (masks, mask_lum) = if st.hidden { (Vec::new(), false) } else { self.masks_for(b, st, bx, by) };
+        let blend = if st.hidden { 0 } else { st.blend };
+        let text_bg = !st.hidden && st.bg_clip.as_ref().is_some_and(|c| c.contains(&3));
+        let start = self.target().len();
+        if m.is_none() && !group_alpha && (st.filter.is_none() || st.hidden) && masks.is_empty() && blend == 0 {
+            self.paint_context_or_box(id, ox, oy);
+            if text_bg {
+                self.text_background(b, st, bx, by, start);
+            }
+            return;
         }
         let saved = std::mem::take(self.target());
         let saved_opacity = self.opacity;
@@ -479,6 +764,9 @@ impl Builder<'_> {
             self.group_opacity = Some(id);
         }
         self.paint_context_or_box(id, ox, oy);
+        if text_bg {
+            self.text_background(b, st, bx, by, 0);
+        }
         self.opacity = saved_opacity;
         let items = std::mem::replace(self.target(), saved);
         let mut bb: Option<[f32; 4]> = None;
@@ -507,7 +795,88 @@ impl Builder<'_> {
             None => bounds,
         };
         let tbounds = transform_rect(m, bounds);
-        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds, alpha, filters })));
+        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds, alpha, filters, masks, mask_lum, blend })));
+    }
+
+    /// Mask lists for an element: its mask-image layers and clip-path.
+    fn masks_for(&mut self, b: &LBox, st: &Style, bx: f32, by: f32) -> (Vec<Vec<DItem>>, bool) {
+        let mut masks = Vec::new();
+        let mut lum = false;
+        let (bw, bh) = (b.border_w(), b.border_h());
+        let border = [bx, by, bw, bh];
+        let pad = [bx + b.b[3], by + b.b[0], b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]];
+        let content = [pad[0] + b.p[3], pad[1] + b.p[0], b.w, b.h];
+        let boxes = |code: u8| match code {
+            1 => pad,
+            2 => content,
+            _ => border,
+        };
+        let layers = st.mask_layers();
+        if !layers.is_empty() {
+            let saved = std::mem::take(self.target());
+            let saved_op = std::mem::replace(&mut self.opacity, 1.0);
+            for l in layers.iter().rev() {
+                if l.image == u32::MAX {
+                    continue;
+                }
+                if l.attach == 1 {
+                    lum = true;
+                }
+                self.bg_layer(l, boxes(l.origin), boxes(l.clip), [0.0; 4]);
+            }
+            self.opacity = saved_op;
+            let items = std::mem::replace(self.target(), saved);
+            masks.push(items);
+        }
+        if let Some(i) = st.clip_path {
+            let (shape, bx_code) = css::clip_shape_of(i);
+            let r = boxes(bx_code);
+            let polys = clip_polys(&shape, r, radii(st, bw, bh));
+            let evenodd = matches!(&*shape, css::ClipShape::Polygon(true, _) | css::ClipShape::Path(true, _));
+            masks.push(vec![DItem::Path(Box::new(PathData { polys, evenodd, color: 0xFF00_0000 }))]);
+        }
+        (masks, lum)
+    }
+
+    /// background-clip: text — the text-clipped background layers, masked
+    /// by the glyphs painted for the element since `start`, inserted there.
+    fn text_background(&mut self, b: &LBox, st: &Style, bx: f32, by: f32, start: usize) {
+        let mut mask = Vec::new();
+        let items = self.target();
+        let from = start.min(items.len());
+        collect_text(&items[from..], &mut mask);
+        if mask.is_empty() {
+            return;
+        }
+        let (bw, bh) = (b.border_w(), b.border_h());
+        let border = [bx, by, bw, bh];
+        let pad = [bx + b.b[3], by + b.b[0], b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]];
+        let content = [pad[0] + b.p[3], pad[1] + b.p[0], b.w, b.h];
+        let saved = std::mem::take(self.target());
+        let c = self.fade(st.bg);
+        let layers = st.bg_layers();
+        if c >> 24 != 0 && layers.last().is_some_and(|l| l.clip == 3) {
+            self.push(DItem::Rect { x: bx, y: by, w: bw, h: bh, c });
+        }
+        for l in layers.iter().rev() {
+            if l.clip != 3 || l.image == u32::MAX {
+                continue;
+            }
+            let area = match l.origin {
+                0 => border,
+                2 => content,
+                _ => pad,
+            };
+            self.bg_layer(l, area, border, [0.0; 4]);
+        }
+        let items = std::mem::replace(self.target(), saved);
+        if items.is_empty() {
+            return;
+        }
+        let bounds = border;
+        let layer = DItem::Layer(Box::new(LayerData { items, bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: None, masks: vec![mask], mask_lum: false, blend: 0 }));
+        let at = start.min(self.target().len());
+        self.target().insert(at, layer);
     }
 
     /// Does this box start a stacking context (its positioned descendants
@@ -781,6 +1150,9 @@ impl Builder<'_> {
                         continue;
                     }
                     if end > start {
+                        if let Some(list) = ts.text_shadow.clone() {
+                            self.text_shadows(&list, x, y, w, start, end, face, fs, a + d);
+                        }
                         self.push(DItem::Text { x, y, start, end, src: 0, face, size: fs, color });
                     }
                     let th = (fs / 14.0).round().max(1.0);
@@ -860,6 +1232,171 @@ struct Deferred {
 }
 
 /// Sample a gradient's colour stops into a 256-entry table.
+/// Copies of the text items in `items` (recursing into untransformed
+/// layers), opaque, for a text mask.
+fn collect_text(items: &[DItem], out: &mut Vec<DItem>) {
+    for it in items {
+        match it {
+            DItem::Text { x, y, start, end, src, face, size, .. } => {
+                out.push(DItem::Text { x: *x, y: *y, start: *start, end: *end, src: *src, face: *face, size: *size, color: 0xFF00_0000 });
+            }
+            DItem::Layer(l) if l.m == [1.0, 0.0, 0.0, 1.0, 0.0, 0.0] => collect_text(&l.items, out),
+            _ => {}
+        }
+    }
+}
+
+/// A clip-path shape as polygons in page coordinates, within reference
+/// box `r` (whose corner radii are `br`).
+fn clip_polys(shape: &css::ClipShape, r: [f32; 4], br: [f32; 4]) -> Vec<Vec<(f32, f32)>> {
+    let [x, y, w, h] = r;
+    let px = |v: css::Value, base: f32| match v {
+        css::Value::Pct(p) => p * base / 100.0,
+        css::Value::Px(p) => p,
+        css::Value::Em(e) | css::Value::Rem(e) => e * 16.0,
+        css::Value::Calc(c) => c[0] * base / 100.0 + c[1] + (c[2] + c[3]) * 16.0,
+        _ => 0.0,
+    };
+    let ellipse = |cx: f32, cy: f32, rx: f32, ry: f32| -> Vec<(f32, f32)> {
+        let n = ((rx.max(ry) * 0.8).ceil() as usize).clamp(16, 360);
+        (0..n).map(|i| {
+            let t = i as f32 / n as f32 * std::f32::consts::TAU;
+            (cx + rx * t.cos(), cy + ry * t.sin())
+        }).collect()
+    };
+    match shape {
+        css::ClipShape::Inset(ins, rad) => {
+            let (t, rr, b, l) = (px(ins[0], h), px(ins[1], w), px(ins[2], h), px(ins[3], w));
+            let rect = [x + l, y + t, (w - l - rr).max(0.0), (h - t - b).max(0.0)];
+            let mut radius = [px(rad[0], w), px(rad[1], w), px(rad[2], w), px(rad[3], w)];
+            if ins.iter().all(|v| matches!(v, css::Value::Px(p) if *p == 0.0)) && radius.iter().all(|&v| v == 0.0) {
+                // A bare box keyword keeps the box's own corners.
+                radius = br;
+            }
+            vec![rrect_poly(rect, radius)]
+        }
+        css::ClipShape::Circle(rv, c) => {
+            let (cx, cy) = (x + px(c[0], w), y + px(c[1], h));
+            let rad = match rv {
+                css::Value::Auto => (cx - x).abs().min((x + w - cx).abs()).min((cy - y).abs()).min((y + h - cy).abs()),
+                css::Value::Kw(_) => (cx - x).abs().max((x + w - cx).abs()).max((cy - y).abs()).max((y + h - cy).abs()),
+                v => px(*v, (w * w + h * h).sqrt() / std::f32::consts::SQRT_2),
+            };
+            vec![ellipse(cx, cy, rad, rad)]
+        }
+        css::ClipShape::Ellipse(rv, c) => {
+            let (cx, cy) = (x + px(c[0], w), y + px(c[1], h));
+            let side = |v: css::Value, lo: f32, hi: f32, base: f32| match v {
+                css::Value::Auto => lo.abs().min(hi.abs()),
+                css::Value::Kw(_) => lo.abs().max(hi.abs()),
+                v => px(v, base),
+            };
+            vec![ellipse(cx, cy, side(rv[0], cx - x, x + w - cx, w), side(rv[1], cy - y, y + h - cy, h))]
+        }
+        css::ClipShape::Polygon(_, pts) => vec![pts.iter().map(|p| (x + px(p[0], w), y + px(p[1], h))).collect()],
+        css::ClipShape::Path(_, d) => crate::svg::parse_path_data(d).into_iter().map(|s| s.pts.into_iter().map(|(a, b)| (x + a, y + b)).collect()).collect(),
+    }
+}
+
+/// A rounded rect as a polygon.
+fn rrect_poly(r: [f32; 4], rad: [f32; 4]) -> Vec<(f32, f32)> {
+    let [x, y, w, h] = r;
+    let lim = w.min(h) / 2.0;
+    let rad = rad.map(|v| v.clamp(0.0, lim));
+    let mut out = Vec::new();
+    let corners = [(x + w - rad[1], y + rad[1], -90.0f32), (x + w - rad[2], y + h - rad[2], 0.0), (x + rad[3], y + h - rad[3], 90.0), (x + rad[0], y + rad[0], 180.0)];
+    let rs = [rad[1], rad[2], rad[3], rad[0]];
+    for (k, &(cx, cy, a0)) in corners.iter().enumerate() {
+        let rr = rs[k];
+        if rr <= 0.0 {
+            let p = match k {
+                0 => (x + w, y),
+                1 => (x + w, y + h),
+                2 => (x, y + h),
+                _ => (x, y),
+            };
+            out.push(p);
+            continue;
+        }
+        let n = ((rr * 0.6).ceil() as usize).clamp(4, 64);
+        for i in 0..=n {
+            let t = (a0 + 90.0 * i as f32 / n as f32).to_radians();
+            out.push((cx + rr * t.cos(), cy + rr * t.sin()));
+        }
+    }
+    out
+}
+
+/// A gradient laid out in `rect` (painted within `clip`).
+fn grad_data(g: &css::Gradient, rect: [f32; 4], clip: [f32; 4], radius: [f32; 4], opacity: f32) -> GradData {
+    let (w, h) = (rect[2].max(1e-3), rect[3].max(1e-3));
+    let px = |v: css::Value, base: f32| match v {
+        css::Value::Pct(p) => p * base / 100.0,
+        css::Value::Px(p) => p,
+        css::Value::Em(e) | css::Value::Rem(e) => e * 16.0,
+        css::Value::Calc(c) => c[0] * base / 100.0 + c[1] + (c[2] + c[3]) * 16.0,
+        _ => base / 2.0,
+    };
+    let center = [px(g.pos[0], w), px(g.pos[1], h)];
+    let kind = if g.conic { 2 } else if g.radial { 1 } else { 0 };
+    let mut radii = [w / 2.0, h / 2.0];
+    if g.radial {
+        let (dl, dr, dt, db) = (center[0].abs(), (w - center[0]).abs(), center[1].abs(), (h - center[1]).abs());
+        let (cx, cy) = (dl.min(dr), dt.min(db));
+        let (fx, fy) = (dl.max(dr), dt.max(db));
+        radii = match (g.size, g.circle) {
+            (3, true) => [cx.min(cy); 2],
+            (3, false) => [cx, cy],
+            (1, true) => [fx.max(fy); 2],
+            (1, false) => [fx, fy],
+            (2, true) => [(cx * cx + cy * cy).sqrt(); 2],
+            (2, false) => [cx * std::f32::consts::SQRT_2, cy * std::f32::consts::SQRT_2],
+            (4, _) => {
+                let rx = px(g.radii[0], w);
+                [rx, if g.circle { rx } else { px(g.radii[1], h) }]
+            }
+            (_, true) => [(fx * fx + fy * fy).sqrt(); 2],
+            (_, false) => [fx * std::f32::consts::SQRT_2, fy * std::f32::consts::SQRT_2],
+        };
+        radii = radii.map(|r| r.max(1e-3));
+    }
+    let a = g.angle.to_radians();
+    let len = match kind {
+        1 => radii[0],
+        2 => 1.0,
+        _ => (w * a.sin()).abs() + (h * a.cos()).abs(),
+    };
+    let (lut, period) = gradient_lut(g, len.max(1e-3), opacity);
+    GradData { rect, clip, kind, center, radii, angle: g.angle, period, lut, radius }
+}
+
+/// The gradient's color at (fx, fy) relative to its rect (straight ARGB).
+#[inline]
+fn grad_pixel(d: &GradData, fx: f32, fy: f32) -> u32 {
+    let t = match d.kind {
+        1 => {
+            let (x, y) = (fx - d.center[0], fy - d.center[1]);
+            ((x / d.radii[0]).powi(2) + (y / d.radii[1]).powi(2)).sqrt()
+        }
+        2 => {
+            let (x, y) = (fx - d.center[0], fy - d.center[1]);
+            ((x.atan2(-y).to_degrees() - d.angle) / 360.0).rem_euclid(1.0)
+        }
+        _ => {
+            let (w, h) = (d.rect[2], d.rect[3]);
+            let a = d.angle.to_radians();
+            let (dxv, dyv) = (a.sin(), -a.cos());
+            let len = ((w * dxv).abs() + (h * dyv).abs()).max(1e-3);
+            ((fx - w / 2.0) * dxv + (fy - h / 2.0) * dyv) / len + 0.5
+        }
+    };
+    let t = match d.period {
+        Some(p) => (t / p).rem_euclid(1.0),
+        None => t.clamp(0.0, 1.0),
+    };
+    d.lut[(t * 255.0) as usize]
+}
+
 fn gradient_lut(g: &css::Gradient, len: f32, opacity: f32) -> (Box<[u32; 256]>, Option<f32>) {
     let n = g.stops.len();
     let mut pos: Vec<Option<f32>> = g.stops.iter().map(|s| s.frac.or(s.px.map(|p| p / len))).collect();
@@ -912,9 +1449,15 @@ fn gradient_lut(g: &css::Gradient, len: f32, opacity: f32) -> (Box<[u32; 256]>, 
         } else {
             let (p0, p1) = (pos[k - 1], pos[k]);
             let f = if p1 > p0 { (t - p0) / (p1 - p0) } else { 1.0 };
+            // Interpolated premultiplied (transparent stops don't darken).
             let (a, b) = (g.stops[k - 1].color, g.stops[k].color);
-            let mix = |s| (ch(a, s) + (ch(b, s) - ch(a, s)) * f).round() as u32;
-            mix(24) << 24 | mix(16) << 16 | mix(8) << 8 | mix(0)
+            let (aa, ba) = (ch(a, 24) / 255.0, ch(b, 24) / 255.0);
+            let alpha = aa + (ba - aa) * f;
+            let mix = |s| {
+                let v = ch(a, s) * aa + (ch(b, s) * ba - ch(a, s) * aa) * f;
+                if alpha > 0.0 { (v / alpha).round().clamp(0.0, 255.0) as u32 } else { 0 }
+            };
+            ((alpha * 255.0).round() as u32) << 24 | mix(16) << 16 | mix(8) << 8 | mix(0)
         };
         let alpha = ((c >> 24) as f32 * opacity) as u32;
         *e = alpha << 24 | (c & 0xFF_FFFF);
@@ -930,6 +1473,42 @@ fn blend(dst: u32, src: u32, a: u32) -> u32 {
     let rb = (((src & 0xFF00FF) * a + (dst & 0xFF00FF) * inv) >> 8) & 0xFF00FF;
     let g = (((src & 0x00FF00) * a + (dst & 0x00FF00) * inv) >> 8) & 0x00FF00;
     0xFF00_0000 | rb | g
+}
+
+fn poly_bbox(polys: &[Vec<(f32, f32)>]) -> Option<[f32; 4]> {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for p in polys.iter().flatten() {
+        x0 = x0.min(p.0);
+        y0 = y0.min(p.1);
+        x1 = x1.max(p.0);
+        y1 = y1.max(p.1);
+    }
+    (x1 >= x0 && y1 >= y0).then_some([x0, y0, x1 - x0, y1 - y0])
+}
+
+/// Coverage of the pixel centered at (fx, fy) by a rect.
+#[inline]
+fn cover_rect(fx: f32, fy: f32, r: &[f32; 4]) -> f32 {
+    let cx = ((fx + 0.5).min(r[0] + r[2]) - (fx - 0.5).max(r[0])).clamp(0.0, 1.0);
+    let cy = ((fy + 0.5).min(r[1] + r[3]) - (fy - 0.5).max(r[1])).clamp(0.0, 1.0);
+    cx * cy
+}
+
+/// The darker or lighter variant of a border color (groove, ridge,
+/// inset, outset).
+fn shade(c: u32, dark: bool) -> u32 {
+    let a = c & 0xFF00_0000;
+    let ch = |s: u32| ((c >> s) & 0xFF) as f32;
+    let (r, g, b) = (ch(16), ch(8), ch(0));
+    let (r, g, b) = if dark {
+        (r * 0.6, g * 0.6, b * 0.6)
+    } else if r + g + b < 60.0 {
+        // Black stays visible: its light variant is a gray.
+        (r.max(160.0), g.max(160.0), b.max(160.0))
+    } else {
+        (r, g, b)
+    };
+    a | (r as u32) << 16 | (g as u32) << 8 | b as u32
 }
 
 /// Signed distance from (px, py) to a rounded rect (negative inside).
@@ -1076,10 +1655,147 @@ impl<'a> Surface<'a> {
         }
     }
 
+    /// Fill a vector shape.
+    pub fn path(&mut self, d: &PathData) {
+        let a = d.color >> 24;
+        if a == 0 {
+            return;
+        }
+        let polys: Vec<Vec<(f32, f32)>> = d.polys.iter().map(|p| p.iter().map(|&(x, y)| (x - self.ox, y - self.oy)).collect()).collect();
+        let Some(cov) = crate::svg::rasterize(&polys, d.evenodd, self.w, self.h) else { return };
+        for y in 0..cov.h {
+            let py = cov.y0 + y as i32;
+            if py < self.clip.1 || py >= self.clip.3 {
+                continue;
+            }
+            for x in 0..cov.w {
+                let px = cov.x0 + x as i32;
+                if px < self.clip.0 || px >= self.clip.2 {
+                    continue;
+                }
+                let c = cov.data[y * cov.w + x];
+                if c > 0.0 {
+                    self.put(px, py, d.color, (a as f32 * c) as u32);
+                }
+            }
+        }
+    }
+
+    /// Paint a border ring: per pixel, the side is chosen by the diagonal
+    /// corner joins; each side has its own style and color.
+    pub fn border(&mut self, d: &BorderData) {
+        let o = [d.o[0] - self.ox, d.o[1] - self.oy, d.o[2], d.o[3]];
+        let [wt, wr, wb, wl] = d.w;
+        let i = [o[0] + wl, o[1] + wt, (o[2] - wl - wr).max(0.0), (o[3] - wt - wb).max(0.0)];
+        let ir = [
+            (d.r[0] - wl.max(wt)).max(0.0),
+            (d.r[1] - wr.max(wt)).max(0.0),
+            (d.r[2] - wr.max(wb)).max(0.0),
+            (d.r[3] - wl.max(wb)).max(0.0),
+        ];
+        let x0 = (o[0].floor() as i32).max(self.clip.0);
+        let x1 = ((o[0] + o[2]).ceil() as i32).min(self.clip.2);
+        let y0 = (o[1].floor() as i32).max(self.clip.1);
+        let y1 = ((o[1] + o[3]).ceil() as i32).min(self.clip.3);
+        let rounded = d.r.iter().any(|&v| v > 0.0);
+        let inner = i[2] > 0.0 && i[3] > 0.0;
+        // Dash / dot pattern along a side of length `len` (style 2 / 3).
+        let fit = |len: f32, unit: f32| -> f32 {
+            let n = (len / unit).round().max(1.0);
+            len / n
+        };
+        for py in y0..y1 {
+            let fy = py as f32 + 0.5;
+            for px in x0..x1 {
+                let fx = px as f32 + 0.5;
+                let co = if rounded { (0.5 - rrect_sd(fx, fy, &o, &d.r)).clamp(0.0, 1.0) } else { cover_rect(fx, fy, &o) };
+                if co <= 0.0 {
+                    continue;
+                }
+                let ci = if !inner {
+                    0.0
+                } else if rounded {
+                    (0.5 - rrect_sd(fx, fy, &i, &ir)).clamp(0.0, 1.0)
+                } else {
+                    cover_rect(fx, fy, &i)
+                };
+                let ring = co * (1.0 - ci);
+                if ring <= 0.0 {
+                    continue;
+                }
+                // Normalized depth into each side; the smallest wins.
+                let depth = |dist: f32, w: f32| if w > 0.0 { dist / w } else { f32::INFINITY };
+                let ds = [depth(fy - o[1], wt), depth(o[0] + o[2] - fx, wr), depth(o[1] + o[3] - fy, wb), depth(fx - o[0], wl)];
+                let mut side = 0;
+                for k in 1..4 {
+                    if ds[k] < ds[side] {
+                        side = k;
+                    }
+                }
+                let (style, bw, t) = (d.s[side], d.w[side], ds[side].clamp(0.0, 1.0));
+                if style == 0 || bw <= 0.0 {
+                    continue;
+                }
+                let mut color = d.c[side];
+                let pw = 1.0 / bw;
+                // Fraction of the pixel's depth range inside [a, b].
+                let band = |a: f32, b: f32| ((t + pw / 2.0).min(b) - (t - pw / 2.0).max(a)).max(0.0) / pw;
+                let along = if side % 2 == 0 { fx - o[0] } else { fy - o[1] };
+                let len = if side % 2 == 0 { o[2] } else { o[3] };
+                let k = match style {
+                    2 => {
+                        // Dashes 3x the width (2x for thin borders), as long as the gaps.
+                        let unit = fit(len, if bw < 3.0 { 6.0 * bw } else { 4.0 * bw });
+                        let ph = (along + unit / 4.0).rem_euclid(unit);
+                        let edge = |x: f32| x.clamp(0.0, 1.0);
+                        edge(unit / 2.0 - ph + 0.5).min(edge(ph + 0.5))
+                    }
+                    3 => {
+                        // Round dots one width across, one width apart.
+                        let unit = fit(len, 2.0 * bw);
+                        let cx = (along / unit).floor() * unit + unit / 2.0;
+                        let (dx, dy) = (along - cx, (t - 0.5) * bw);
+                        let dist = (dx * dx + dy * dy).sqrt();
+                        if bw <= 2.0 {
+                            // Thin dots are pixel-aligned squares.
+                            let unit = 2.0 * bw.round().max(1.0);
+                            if (along - 0.5).rem_euclid(unit) < unit / 2.0 { 1.0 } else { 0.0 }
+                        } else {
+                            (bw / 2.0 - dist + 0.5).clamp(0.0, 1.0)
+                        }
+                    }
+                    4 => {
+                        if bw < 3.0 { 1.0 } else { band(0.0, 1.0 / 3.0) + band(2.0 / 3.0, 1.0) }
+                    }
+                    5..=8 => {
+                        let top_left = side == 0 || side == 3;
+                        let outer_half = t < 0.5;
+                        let dark = match style {
+                            5 => top_left == outer_half,  // groove
+                            6 => top_left != outer_half,  // ridge
+                            7 => top_left,                // inset
+                            _ => !top_left,               // outset
+                        };
+                        color = shade(color, dark);
+                        1.0
+                    }
+                    _ => 1.0,
+                };
+                let a = (color >> 24) as f32 * ring * k;
+                if a >= 0.5 {
+                    self.put(px, py, color, a.min(255.0) as u32);
+                }
+            }
+        }
+    }
+
     pub fn shadow(&mut self, d: &ShadowData) {
         let a = d.c >> 24;
         if a == 0 {
             return;
+        }
+        if d.inset {
+            return self.inset_shadow(d);
         }
         let s = [d.s[0] - self.ox, d.s[1] - self.oy, d.s[2], d.s[3]];
         let hole = [d.hole[0] - self.ox, d.hole[1] - self.oy, d.hole[2], d.hole[3]];
@@ -1111,6 +1827,39 @@ impl<'a> Surface<'a> {
                 let dist = rrect_sd(fx, fy, &s, &d.r);
                 let cov = if sigma > 0.0 { 0.5 * (1.0 - erf(dist * k)) } else { (0.5 - dist).clamp(0.0, 1.0) };
                 let cov = cov * (1.0 - inside_hole);
+                if cov > 0.002 {
+                    self.put(px, py, d.c, (a as f32 * cov) as u32);
+                }
+            }
+        }
+    }
+
+    /// An inset shadow: the padding box minus the (blurred) inner shape.
+    fn inset_shadow(&mut self, d: &ShadowData) {
+        let a = d.c >> 24;
+        let s = [d.s[0] - self.ox, d.s[1] - self.oy, d.s[2], d.s[3]];
+        let clip = [d.hole[0] - self.ox, d.hole[1] - self.oy, d.hole[2], d.hole[3]];
+        let sigma = d.blur / 2.0;
+        let k = if sigma > 0.0 { 1.0 / (sigma * std::f32::consts::SQRT_2) } else { 0.0 };
+        let y0 = (clip[1].floor() as i32).max(self.clip.1);
+        let y1 = ((clip[1] + clip[3]).ceil() as i32).min(self.clip.3);
+        let x0 = (clip[0].floor() as i32).max(self.clip.0);
+        let x1 = ((clip[0] + clip[2]).ceil() as i32).min(self.clip.2);
+        let reach = sigma * 3.0 + 1.0;
+        for py in y0..y1 {
+            let fy = py as f32 + 0.5;
+            for px in x0..x1 {
+                let fx = px as f32 + 0.5;
+                let inside = (0.5 - rrect_sd(fx, fy, &clip, &d.hr)).clamp(0.0, 1.0);
+                if inside <= 0.0 {
+                    continue;
+                }
+                let dist = if s[2] > 0.0 && s[3] > 0.0 { rrect_sd(fx, fy, &s, &d.r) } else { reach + 1.0 };
+                if dist < -reach {
+                    continue;
+                }
+                let covered = if sigma > 0.0 { 0.5 * (1.0 - erf(dist * k)) } else { (0.5 - dist).clamp(0.0, 1.0) };
+                let cov = (1.0 - covered) * inside;
                 if cov > 0.002 {
                     self.put(px, py, d.c, (a as f32 * cov) as u32);
                 }
@@ -1198,24 +1947,15 @@ impl<'a> Surface<'a> {
         let x1 = ((cl[0] + cl[2]).min(rx + rw).round() as i32).min(self.clip.2);
         let y0 = (cl[1].max(ry).round() as i32).max(self.clip.1);
         let y1 = ((cl[1] + cl[3]).min(ry + rh).round() as i32).min(self.clip.3);
-        let (cx, cy) = (rx + rw / 2.0, ry + rh / 2.0);
-        let a = d.angle.to_radians();
-        let (dxv, dyv) = (a.sin(), -a.cos());
-        let len = ((rw * dxv).abs() + (rh * dyv).abs()).max(1.0);
-        let (erx, ery) = ((rw / 2.0 * std::f32::consts::SQRT_2).max(1.0), (rh / 2.0 * std::f32::consts::SQRT_2).max(1.0));
+        let _ = rw;
         let rmax = d.radius.iter().copied().fold(0.0, f32::max);
         for py in y0..y1 {
-            let fy = py as f32 + 0.5 - cy;
+            let fy = py as f32 + 0.5 - ry;
             let corner_row = rmax > 0.0 && (py as f32 + 0.5 < cl[1] + rmax || py as f32 + 0.5 > cl[1] + cl[3] - rmax);
             let row = &mut self.buf[py as usize * self.w..][..self.w];
             for px in x0..x1 {
-                let fx = px as f32 + 0.5 - cx;
-                let t = if d.radial { ((fx / erx).powi(2) + (fy / ery).powi(2)).sqrt() } else { (fx * dxv + fy * dyv) / len + 0.5 };
-                let t = match d.period {
-                    Some(p) => (t / p).rem_euclid(1.0),
-                    None => t.clamp(0.0, 1.0),
-                };
-                let c = d.lut[(t * 255.0) as usize];
+                let fx = px as f32 + 0.5 - rx;
+                let c = grad_pixel(d, fx, fy);
                 let mut a = c >> 24;
                 if corner_row {
                     let cov = (0.5 - rrect_sd(px as f32 + 0.5, py as f32 + 0.5, &cl, &d.radius)).clamp(0.0, 1.0);
@@ -1316,6 +2056,11 @@ fn extent(it: &DItem) -> Option<(f32, f32)> {
         DItem::Shadow(d) => (d.s[1] - d.blur * 1.5 - 1.0, d.s[1] + d.s[3] + d.blur * 1.5 + 1.0),
         DItem::Layer(l) => (l.tbounds[1], l.tbounds[1] + l.tbounds[3]),
         DItem::Backdrop(d) => (d.r[1], d.r[1] + d.r[3]),
+        DItem::Border(d) => (d.o[1], d.o[1] + d.o[3]),
+        DItem::Path(d) => {
+            let b = poly_bbox(&d.polys)?;
+            (b[1], b[1] + b[3])
+        }
         DItem::Clip { .. } | DItem::Unclip | DItem::FixedOn | DItem::FixedOff => return None,
     })
 }
@@ -1357,6 +2102,8 @@ fn draw(s: &mut Surface, it: &DItem, texts: [&str; 2], f: &Fonts, cache: &GlyphC
         DItem::FixedOn | DItem::FixedOff => {}
         DItem::Layer(l) => draw_layer(s, l, texts, f, cache),
         DItem::Backdrop(d) => draw_backdrop(s, d),
+        DItem::Border(d) => s.border(d),
+        DItem::Path(d) => s.path(d),
     }
 }
 
@@ -1474,6 +2221,34 @@ fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache
     if let Some(f) = &l.filters {
         crate::filter::apply(&mut img, w, h, f);
     }
+    // Masks multiply the layer's alpha (coverage from the same black /
+    // white rendering).
+    for mask in &l.masks {
+        let mut black = vec![0xFF00_0000u32; w * h];
+        let mut white = vec![0xFFFF_FFFFu32; w * h];
+        for buf in [&mut black, &mut white] {
+            let mut sub = Surface::new(buf, w, h, lx, ly);
+            let mut clips = Vec::new();
+            for it in mask {
+                draw(&mut sub, it, texts, f, cache, &mut clips);
+            }
+        }
+        for (i, p) in img.iter_mut().enumerate() {
+            let (b, wt) = (black[i], white[i]);
+            let a = (255.0 - ((ch(wt, 16) - ch(b, 16)) + (ch(wt, 8) - ch(b, 8)) + (ch(wt, 0) - ch(b, 0))) / 3.0).clamp(0.0, 255.0);
+            let k = if l.mask_lum {
+                // Luminance of the (premultiplied over black) mask color.
+                (0.2126 * ch(b, 16) + 0.7152 * ch(b, 8) + 0.0722 * ch(b, 0)) / 255.0
+            } else {
+                a / 255.0
+            };
+            if k < 1.0 {
+                for v in p.iter_mut() {
+                    *v *= k;
+                }
+            }
+        }
+    }
     let at = |x: i32, y: i32| -> [f32; 4] {
         if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
             return [0.0; 4];
@@ -1506,6 +2281,14 @@ fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache
                 continue;
             }
             let d = s.buf[row + px as usize];
+            if l.blend != 0 {
+                // mix-blend-mode: the canvas compositing math.
+                let dp = [((d >> 16) & 0xFF) as f32 / 255.0, ((d >> 8) & 0xFF) as f32 / 255.0, (d & 0xFF) as f32 / 255.0, 1.0];
+                let o = crate::js::canvas::composite(dp, c.map(|v| v / 255.0), l.blend);
+                let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+                s.buf[row + px as usize] = 0xFF00_0000 | b(o[0]) << 16 | b(o[1]) << 8 | b(o[2]);
+                continue;
+            }
             let ia = 1.0 - c[3] / 255.0;
             let mix = |k: usize, sh: u32| ((c[k] + ((d >> sh) & 0xFF) as f32 * ia).round().clamp(0.0, 255.0) as u32) << sh;
             s.buf[row + px as usize] = 0xFF00_0000 | mix(0, 16) | mix(1, 8) | mix(2, 0);
