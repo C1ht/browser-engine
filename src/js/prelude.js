@@ -1789,3 +1789,429 @@ if (typeof window.name !== 'string') window.name = '';
   Object.defineProperty(WA, Symbol.toStringTag, { value: 'WebAssembly' });
   Object.defineProperty(window, 'WebAssembly', { value: WA, writable: true, configurable: true, enumerable: false });
 })();
+
+// Canvas 2D, Path2D, ImageData, ImageBitmap, OffscreenCanvas, DOMMatrix
+// (natives in src/js/canvas.rs).
+(function () {
+  var C = window['@@canvas'];
+  function hidden(o, k, v) { Object.defineProperty(o, k, { value: v, enumerable: false, configurable: true, writable: true }); }
+  function illegal() { throw new TypeError('Illegal constructor'); }
+
+  // ---------------------------------------------------------- DOMMatrix
+  function DOMMatrixReadOnly(init) {
+    var m = [1, 0, 0, 1, 0, 0], is2D = true;
+    if (typeof init === 'string') {
+      var t = init.trim();
+      if (t && t !== 'none') {
+        var mm = /^matrix\(([^)]*)\)$/.exec(t), m3 = /^matrix3d\(([^)]*)\)$/.exec(t);
+        if (mm) m = mm[1].split(',').map(Number);
+        else if (m3) { var v = m3[1].split(',').map(Number); m = [v[0], v[1], v[4], v[5], v[12], v[13]]; is2D = false; }
+        else {
+          // A transform list: let a temporary element's computed style resolve it.
+          var d = document.createElement('div');
+          d.style.transform = t;
+          var c = getComputedStyle(d).transform;
+          var r = /^matrix\(([^)]*)\)$/.exec(c || '');
+          if (r) m = r[1].split(',').map(Number);
+        }
+      }
+    } else if (init && init.length === 6) m = Array.prototype.slice.call(init).map(Number);
+    else if (init && init.length === 16) { var a = Array.prototype.map.call(init, Number); m = [a[0], a[1], a[4], a[5], a[12], a[13]]; is2D = false; }
+    else if (init !== undefined && init !== null && typeof init === 'object' && !('length' in init)) {
+      m = [init.a !== undefined ? +init.a : init.m11 !== undefined ? +init.m11 : 1, init.b !== undefined ? +init.b : +(init.m12 || 0),
+           init.c !== undefined ? +init.c : +(init.m21 || 0), init.d !== undefined ? +init.d : init.m22 !== undefined ? +init.m22 : 1,
+           init.e !== undefined ? +init.e : +(init.m41 || 0), init.f !== undefined ? +init.f : +(init.m42 || 0)];
+    } else if (init !== undefined) throw new TypeError("Failed to construct 'DOMMatrix': The sequence must contain 6 elements for a 2D matrix or 16 elements for a 3D matrix.");
+    hidden(this, '@@m', m);
+    hidden(this, '@@2d', is2D);
+  }
+  var names = ['a', 'b', 'c', 'd', 'e', 'f'], alias = { m11: 0, m12: 1, m21: 2, m22: 3, m41: 4, m42: 5 };
+  names.forEach(function (n, i) { alias[n] = i; });
+  Object.keys(alias).forEach(function (n) {
+    Object.defineProperty(DOMMatrixReadOnly.prototype, n, { get: function () { return this['@@m'][alias[n]]; }, configurable: true, enumerable: true });
+  });
+  ['m13', 'm14', 'm23', 'm24', 'm31', 'm32', 'm34', 'm43'].forEach(function (n) {
+    Object.defineProperty(DOMMatrixReadOnly.prototype, n, { get: function () { return 0; }, configurable: true, enumerable: true });
+  });
+  ['m33', 'm44'].forEach(function (n) {
+    Object.defineProperty(DOMMatrixReadOnly.prototype, n, { get: function () { return 1; }, configurable: true, enumerable: true });
+  });
+  Object.defineProperty(DOMMatrixReadOnly.prototype, 'is2D', { get: function () { return this['@@2d']; }, configurable: true });
+  Object.defineProperty(DOMMatrixReadOnly.prototype, 'isIdentity', { get: function () { var m = this['@@m']; return m[0] === 1 && m[1] === 0 && m[2] === 0 && m[3] === 1 && m[4] === 0 && m[5] === 0; }, configurable: true });
+  function mul(a, b) {
+    return [a[0] * b[0] + a[2] * b[1], a[1] * b[0] + a[3] * b[1], a[0] * b[2] + a[2] * b[3], a[1] * b[2] + a[3] * b[3], a[0] * b[4] + a[2] * b[5] + a[4], a[1] * b[4] + a[3] * b[5] + a[5]];
+  }
+  function inv(m) {
+    var d = m[0] * m[3] - m[1] * m[2];
+    if (!d) return [NaN, NaN, NaN, NaN, NaN, NaN];
+    return [m[3] / d, -m[1] / d, -m[2] / d, m[0] / d, (m[2] * m[5] - m[3] * m[4]) / d, (m[1] * m[4] - m[0] * m[5]) / d];
+  }
+  function DOMMatrix(init) { DOMMatrixReadOnly.call(this, init); }
+  DOMMatrix.prototype = Object.create(DOMMatrixReadOnly.prototype);
+  DOMMatrix.prototype.constructor = DOMMatrix;
+  Object.keys(alias).forEach(function (n) {
+    Object.defineProperty(DOMMatrix.prototype, n, { get: function () { return this['@@m'][alias[n]]; }, set: function (v) { this['@@m'][alias[n]] = +v; }, configurable: true, enumerable: true });
+  });
+  function mk(C, m, is2D) { var o = Object.create(C.prototype); hidden(o, '@@m', m); hidden(o, '@@2d', is2D !== false); return o; }
+  function matOf(o) { return o instanceof DOMMatrixReadOnly ? o['@@m'] : new DOMMatrixReadOnly(o)['@@m']; }
+  var ops = {
+    multiply: function (m, o) { return mul(m, matOf(o)); },
+    preMultiply: function (m, o) { return mul(matOf(o), m); },
+    inverse: function (m) { return inv(m); },
+    translate: function (m, x, y) { return mul(m, [1, 0, 0, 1, +x || 0, +y || 0]); },
+    scale: function (m, sx, sy, sz, ox, oy) {
+      sx = sx === undefined ? 1 : +sx; sy = sy === undefined ? sx : +sy; ox = +ox || 0; oy = +oy || 0;
+      return mul(mul(mul(m, [1, 0, 0, 1, ox, oy]), [sx, 0, 0, sy, 0, 0]), [1, 0, 0, 1, -ox, -oy]);
+    },
+    scaleNonUniform: function (m, sx, sy) { return mul(m, [sx === undefined ? 1 : +sx, 0, 0, sy === undefined ? 1 : +sy, 0, 0]); },
+    rotate: function (m, rx, ry, rz) { var deg = ry === undefined && rz === undefined ? +rx || 0 : +rz || 0; var r = deg * Math.PI / 180, c = Math.cos(r), s = Math.sin(r); return mul(m, [c, s, -s, c, 0, 0]); },
+    rotateFromVector: function (m, x, y) { var r = Math.atan2(+y || 0, +x || 0), c = Math.cos(r), s = Math.sin(r); return mul(m, [c, s, -s, c, 0, 0]); },
+    skewX: function (m, a) { return mul(m, [1, 0, Math.tan((+a || 0) * Math.PI / 180), 1, 0, 0]); },
+    skewY: function (m, a) { return mul(m, [1, Math.tan((+a || 0) * Math.PI / 180), 0, 1, 0, 0]); },
+    flipX: function (m) { return mul(m, [-1, 0, 0, 1, 0, 0]); },
+    flipY: function (m) { return mul(m, [1, 0, 0, -1, 0, 0]); }
+  };
+  Object.keys(ops).forEach(function (k) {
+    DOMMatrixReadOnly.prototype[k] = function () {
+      var args = [this['@@m'].slice()].concat(Array.prototype.slice.call(arguments));
+      return mk(DOMMatrix, ops[k].apply(null, args), this['@@2d']);
+    };
+    if (k !== 'flipX' && k !== 'flipY' && k !== 'rotateFromVector' && k !== 'scaleNonUniform') {
+      DOMMatrix.prototype[k === 'inverse' ? 'invertSelf' : k + 'Self'] = function () {
+        var args = [this['@@m'].slice()].concat(Array.prototype.slice.call(arguments));
+        hidden(this, '@@m', ops[k].apply(null, args));
+        return this;
+      };
+    }
+  });
+  DOMMatrix.prototype.setMatrixValue = function (s) { hidden(this, '@@m', new DOMMatrixReadOnly(s)['@@m']); return this; };
+  DOMMatrixReadOnly.prototype.transformPoint = function (p) {
+    p = p || {}; var m = this['@@m'], x = +p.x || 0, y = +p.y || 0;
+    return new DOMPoint(m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5], +p.z || 0, p.w === undefined ? 1 : +p.w);
+  };
+  DOMMatrixReadOnly.prototype.toFloat64Array = function () { var m = this['@@m']; return new Float64Array([m[0], m[1], 0, 0, m[2], m[3], 0, 0, 0, 0, 1, 0, m[4], m[5], 0, 1]); };
+  DOMMatrixReadOnly.prototype.toFloat32Array = function () { return new Float32Array(this.toFloat64Array()); };
+  DOMMatrixReadOnly.prototype.toString = function () { return 'matrix(' + this['@@m'].join(', ') + ')'; };
+  DOMMatrixReadOnly.prototype.toJSON = function () {
+    var o = {}, self = this;
+    ['a', 'b', 'c', 'd', 'e', 'f', 'm11', 'm12', 'm13', 'm14', 'm21', 'm22', 'm23', 'm24', 'm31', 'm32', 'm33', 'm34', 'm41', 'm42', 'm43', 'm44', 'is2D', 'isIdentity'].forEach(function (k) { o[k] = self[k]; });
+    return o;
+  };
+  [DOMMatrixReadOnly, DOMMatrix].forEach(function (K) {
+    K.fromMatrix = function (o) { return mk(K, o ? matOf(o).slice() : [1, 0, 0, 1, 0, 0]); };
+    K.fromFloat32Array = K.fromFloat64Array = function (a) { return new K(a); };
+  });
+  DOMPoint.prototype.matrixTransform = function (m) { return new DOMMatrixReadOnly(m['@@m'] || m).transformPoint(this); };
+  window.DOMMatrixReadOnly = DOMMatrixReadOnly;
+  window.DOMMatrix = DOMMatrix;
+  window.WebKitCSSMatrix = DOMMatrix;
+  if (!window.DOMPointReadOnly) window.DOMPointReadOnly = DOMPoint;
+
+  // ---------------------------------------------------------- ImageData
+  function ImageData(a, b, c, d) {
+    var w, h, data;
+    if (a instanceof Uint8ClampedArray) {
+      data = a; w = b >>> 0;
+      if (!w || data.length % 4 || (data.length / 4) % w) throw new DOMException("Failed to construct 'ImageData': The input data length is not a multiple of (4 * width).", 'IndexSizeError');
+      h = c === undefined ? data.length / 4 / w : c >>> 0;
+      if (h * w * 4 !== data.length) throw new DOMException("Failed to construct 'ImageData': The input data length is not equal to (4 * width * height).", 'IndexSizeError');
+    } else {
+      w = a >>> 0; h = b >>> 0;
+      if (!w || !h) throw new DOMException("Failed to construct 'ImageData': The source width is zero or not a number.", 'IndexSizeError');
+      data = new Uint8ClampedArray(w * h * 4);
+    }
+    hidden(this, '@@d', data);
+    hidden(this, '@@w', w);
+    hidden(this, '@@hgt', h);
+  }
+  Object.defineProperty(ImageData.prototype, 'data', { get: function () { return this['@@d']; }, enumerable: true, configurable: true });
+  Object.defineProperty(ImageData.prototype, 'width', { get: function () { return this['@@w']; }, enumerable: true, configurable: true });
+  Object.defineProperty(ImageData.prototype, 'height', { get: function () { return this['@@hgt']; }, enumerable: true, configurable: true });
+  Object.defineProperty(ImageData.prototype, 'colorSpace', { get: function () { return 'srgb'; }, enumerable: true, configurable: true });
+  window.ImageData = ImageData;
+
+  // -------------------------------------------- gradients, patterns, paths
+  function CanvasGradient() { illegal(); }
+  CanvasGradient.prototype.addColorStop = function (offset, color) {
+    if (!isFinite(offset)) throw new TypeError("Failed to execute 'addColorStop' on 'CanvasGradient': The provided double value is non-finite.");
+    C.stop(this['@@h'], +offset, String(color));
+  };
+  function CanvasPattern() { illegal(); }
+  CanvasPattern.prototype.setTransform = function (m) {
+    var a = m ? matOf(m) : [1, 0, 0, 1, 0, 0];
+    C.patternTransform(this['@@h'], a[0], a[1], a[2], a[3], a[4], a[5]);
+  };
+  function wrapH(K, h) { var o = Object.create(K.prototype); hidden(o, '@@h', h); return o; }
+  window.CanvasGradient = CanvasGradient;
+  window.CanvasPattern = CanvasPattern;
+
+  var pathMethods = ['moveTo', 'lineTo', 'quadraticCurveTo', 'bezierCurveTo', 'arc', 'arcTo', 'ellipse', 'rect', 'roundRect', 'closePath'];
+  function Path2D(src) {
+    if (!(this instanceof Path2D)) throw new TypeError("Failed to construct 'Path2D': Please use the 'new' operator.");
+    hidden(this, '@@h', C.path(src instanceof Path2D ? src['@@h'] : typeof src === 'string' ? src : undefined));
+  }
+  pathMethods.forEach(function (n) {
+    Path2D.prototype[n] = function () { C.pathCall.apply(null, [this['@@h'], n].concat(Array.prototype.slice.call(arguments))); };
+  });
+  Path2D.prototype.addPath = function (p, m) {
+    if (!(p instanceof Path2D)) throw new TypeError("Failed to execute 'addPath' on 'Path2D': parameter 1 is not of type 'Path2D'.");
+    var a = m ? matOf(m) : [1, 0, 0, 1, 0, 0];
+    C.pathCall(this['@@h'], 'addPath', p['@@h'], a[0], a[1], a[2], a[3], a[4], a[5]);
+  };
+  window.Path2D = Path2D;
+
+  function TextMetrics() { illegal(); }
+  var tmKeys = ['width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight', 'actualBoundingBoxAscent', 'actualBoundingBoxDescent', 'fontBoundingBoxAscent', 'fontBoundingBoxDescent'];
+  tmKeys.concat(['emHeightAscent', 'emHeightDescent', 'hangingBaseline', 'alphabeticBaseline', 'ideographicBaseline']).forEach(function (k) {
+    Object.defineProperty(TextMetrics.prototype, k, { get: function () { return this['@@v'][k]; }, enumerable: true, configurable: true });
+  });
+  window.TextMetrics = TextMetrics;
+
+  // ------------------------------------------------------- ImageBitmap
+  function ImageBitmap() { illegal(); }
+  function makeBitmap(h) { var o = Object.create(ImageBitmap.prototype); hidden(o, '@@h', h); var s = C.bitmapSize(h); hidden(o, '@@size', s); return o; }
+  Object.defineProperty(ImageBitmap.prototype, 'width', { get: function () { return this['@@h'] ? this['@@size'][0] : 0; }, configurable: true });
+  Object.defineProperty(ImageBitmap.prototype, 'height', { get: function () { return this['@@h'] ? this['@@size'][1] : 0; }, configurable: true });
+  ImageBitmap.prototype.close = function () { hidden(this, '@@h', null); };
+  window.ImageBitmap = ImageBitmap;
+
+  function imgReady(src) {
+    if (src instanceof HTMLImageElement && !src.complete) {
+      return new Promise(function (res, rej) { src.addEventListener('load', function () { res(src); }); src.addEventListener('error', function () { rej(new DOMException('The source image could not be decoded.', 'InvalidStateError')); }); });
+    }
+    return Promise.resolve(src);
+  }
+  window.createImageBitmap = function (src, sx, sy, sw, sh) {
+    var crop = arguments.length >= 5 && typeof sx === 'number';
+    if (src instanceof Blob) {
+      return src.arrayBuffer().then(function (buf) {
+        var h = C.decode(new Uint8Array(buf));
+        if (!h) throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+        return makeBitmap(crop ? C.bitmap(h, sx, sy, sw, sh) : h);
+      });
+    }
+    return imgReady(src).then(function (s) {
+      var arg = s && s['@@h'] && !(s instanceof Node) ? s['@@h'] : s;
+      if (s instanceof HTMLCanvasElement && s['@@ctx']) arg = s['@@ctx']['@@h'];
+      var h = crop ? C.bitmap(arg, sx, sy, sw, sh) : C.bitmap(arg);
+      if (!h) throw new DOMException('The source image could not be decoded.', 'InvalidStateError');
+      return makeBitmap(h);
+    });
+  };
+
+  // ------------------------------------------- CanvasRenderingContext2D
+  var defaults = {
+    fillStyle: '#000000', strokeStyle: '#000000', lineWidth: 1, lineCap: 'butt', lineJoin: 'miter', miterLimit: 10,
+    lineDashOffset: 0, globalAlpha: 1, globalCompositeOperation: 'source-over', shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)',
+    shadowOffsetX: 0, shadowOffsetY: 0, font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', direction: 'ltr',
+    imageSmoothingEnabled: true, imageSmoothingQuality: 'low', filter: 'none', letterSpacing: '0px', wordSpacing: '0px',
+    fontKerning: 'auto', fontStretch: 'normal', fontVariantCaps: 'normal', textRendering: 'auto'
+  };
+  var numeric = { lineWidth: 1, miterLimit: 1, lineDashOffset: 1, globalAlpha: 1, shadowBlur: 1, shadowOffsetX: 1, shadowOffsetY: 1 };
+  var jsOnly = {
+    imageSmoothingQuality: ['low', 'medium', 'high'], fontKerning: ['auto', 'normal', 'none'], textRendering: ['auto', 'optimizeSpeed', 'optimizeLegibility', 'geometricPrecision'],
+    fontStretch: ['ultra-condensed', 'extra-condensed', 'condensed', 'semi-condensed', 'normal', 'semi-expanded', 'expanded', 'extra-expanded', 'ultra-expanded'],
+    fontVariantCaps: ['normal', 'small-caps', 'all-small-caps', 'petite-caps', 'all-petite-caps', 'unicase', 'titling-caps'], wordSpacing: null
+  };
+  function copy(o) { var r = {}; for (var k in o) r[k] = o[k]; return r; }
+  function CanvasRenderingContext2D() { illegal(); }
+  function makeCtx(K, h, canvas, attrs) {
+    var c = Object.create(K.prototype);
+    hidden(c, '@@h', h);
+    hidden(c, '@@canvas', canvas);
+    hidden(c, '@@p', copy(defaults));
+    hidden(c, '@@stack', []);
+    hidden(c, '@@attrs', attrs);
+    return c;
+  }
+  var P = CanvasRenderingContext2D.prototype;
+  Object.defineProperty(P, 'canvas', { get: function () { return this['@@canvas']; }, configurable: true, enumerable: true });
+  Object.keys(defaults).forEach(function (k) {
+    Object.defineProperty(P, k, {
+      get: function () { return this['@@p'][k]; },
+      set: function (v) {
+        if (k in jsOnly) {
+          var allowed = jsOnly[k];
+          if (!allowed || allowed.indexOf(String(v)) >= 0) this['@@p'][k] = String(v);
+          return;
+        }
+        if (k === 'fillStyle' || k === 'strokeStyle') {
+          if (v instanceof CanvasGradient || v instanceof CanvasPattern) {
+            if (C.set(this['@@h'], k, v['@@h']) !== undefined) this['@@p'][k] = v;
+            return;
+          }
+          if (v !== null && typeof v === 'object') return;
+        }
+        if (numeric[k] && typeof v !== 'number') v = +v;
+        var r = C.set(this['@@h'], k, k === 'imageSmoothingEnabled' ? !!v : v);
+        if (r !== undefined) this['@@p'][k] = numeric[k] ? +v : k === 'imageSmoothingEnabled' ? !!v : typeof r === 'string' ? r : String(v);
+      },
+      configurable: true, enumerable: true
+    });
+  });
+  function call(ctx, name, args) {
+    return C.call.apply(null, [ctx['@@h'], name].concat(Array.prototype.slice.call(args)));
+  }
+  pathMethods.concat(['beginPath', 'fillRect', 'strokeRect', 'clearRect', 'fillText', 'strokeText', 'transform', 'translate', 'scale', 'rotate', 'resetTransform', 'getLineDash']).forEach(function (n) {
+    P[n] = function () { return call(this, n, arguments); };
+  });
+  P.save = function () { this['@@stack'].push(copy(this['@@p'])); C.call(this['@@h'], 'save'); };
+  P.restore = function () { var s = this['@@stack'].pop(); if (s) hidden(this, '@@p', s); C.call(this['@@h'], 'restore'); };
+  P.reset = function () { hidden(this, '@@p', copy(defaults)); hidden(this, '@@stack', []); C.call(this['@@h'], 'reset'); };
+  ['fill', 'stroke', 'clip', 'isPointInPath', 'isPointInStroke'].forEach(function (n) {
+    P[n] = function () {
+      var a = Array.prototype.slice.call(arguments);
+      if (a[0] instanceof Path2D) a[0] = a[0]['@@h'];
+      return C.call.apply(null, [this['@@h'], n].concat(a));
+    };
+  });
+  P.setTransform = function (a, b, c, d, e, f) {
+    if (arguments.length === 0 || (arguments.length === 1 && (a === undefined || a === null))) return C.call(this['@@h'], 'resetTransform');
+    if (arguments.length === 1) { var m = matOf(a); return C.call(this['@@h'], 'setTransform', m[0], m[1], m[2], m[3], m[4], m[5]); }
+    return C.call(this['@@h'], 'setTransform', a, b, c, d, e, f);
+  };
+  P.getTransform = function () { return new DOMMatrix(C.call(this['@@h'], 'getTransform')); };
+  P.setLineDash = function (d) {
+    if (d === null || typeof d !== 'object') throw new TypeError("Failed to execute 'setLineDash' on 'CanvasRenderingContext2D': The provided value cannot be converted to a sequence.");
+    C.call(this['@@h'], 'setLineDash', Array.prototype.slice.call(d));
+  };
+  function source(img) {
+    if (img instanceof ImageBitmap) { if (!img['@@h']) throw new DOMException('The image source is detached.', 'InvalidStateError'); return img['@@h']; }
+    if (img && img['@@isOffscreen']) return img['@@ctxH'] || C.ctx(null, img.width, img.height);
+    if (img instanceof HTMLCanvasElement) {
+      if (!img.width || !img.height) throw new DOMException("Failed to execute 'drawImage': The image argument is a canvas element with a width or height of 0.", 'InvalidStateError');
+      return img['@@ctx'] ? img['@@ctx']['@@h'] : img;
+    }
+    if (img instanceof Node || img instanceof SVGElement) return img;
+    throw new TypeError("Failed to execute 'drawImage' on 'CanvasRenderingContext2D': The provided value is not of type '(CSSImageValue or HTMLCanvasElement or HTMLImageElement or HTMLVideoElement or ImageBitmap or OffscreenCanvas or SVGImageElement or VideoFrame)'.");
+  }
+  P.drawImage = function (img) {
+    if (arguments.length !== 3 && arguments.length !== 5 && arguments.length !== 9) throw new TypeError("Failed to execute 'drawImage' on 'CanvasRenderingContext2D': Valid arities are: [3, 5, 9], but " + arguments.length + ' arguments provided.');
+    if (img instanceof HTMLVideoElement) return;
+    var a = Array.prototype.slice.call(arguments);
+    a[0] = source(img);
+    if (img instanceof HTMLImageElement && img.complete && !img.naturalWidth && img.getAttribute('src')) throw new DOMException("Failed to execute 'drawImage': The HTMLImageElement provided is in the 'broken' state.", 'InvalidStateError');
+    C.call.apply(null, [this['@@h'], 'drawImage'].concat(a));
+  };
+  P.createLinearGradient = function (x0, y0, x1, y1) { return wrapH(CanvasGradient, C.gradient('linear', x0, y0, x1, y1, 0, 0)); };
+  P.createRadialGradient = function (x0, y0, r0, x1, y1, r1) { return wrapH(CanvasGradient, C.gradient('radial', x0, y0, r0, x1, y1, r1)); };
+  P.createConicGradient = function (a, x, y) { return wrapH(CanvasGradient, C.gradient('conic', a, x, y, 0, 0, 0)); };
+  P.createPattern = function (img, rep) {
+    if (img instanceof HTMLImageElement && !img.complete) return null;
+    var h = C.pattern(source(img), rep);
+    return h ? wrapH(CanvasPattern, h) : null;
+  };
+  P.createImageData = function (w, h) {
+    if (w instanceof ImageData) return new ImageData(w.width, w.height);
+    return new ImageData(Math.abs(w >> 0), Math.abs(h >> 0));
+  };
+  P.getImageData = function (x, y, w, h) {
+    if (arguments.length < 4) throw new TypeError("Failed to execute 'getImageData' on 'CanvasRenderingContext2D': 4 arguments required, but only " + arguments.length + ' present.');
+    var r = C.call(this['@@h'], 'getImageData', x, y, w, h);
+    return new ImageData(r[0], r[1], r[2]);
+  };
+  P.putImageData = function (d, dx, dy, x, y, w, h) {
+    if (!(d instanceof ImageData)) throw new TypeError("Failed to execute 'putImageData' on 'CanvasRenderingContext2D': parameter 1 is not of type 'ImageData'.");
+    var a = [this['@@h'], 'putImageData', d.data, d.width, d.height, dx, dy];
+    if (arguments.length >= 7) a.push(x, y, w, h);
+    C.call.apply(null, a);
+  };
+  P.measureText = function (text) {
+    var v = C.call(this['@@h'], 'measureText', String(text)), o = Object.create(TextMetrics.prototype), r = {};
+    tmKeys.forEach(function (k, i) { r[k] = v[i]; });
+    r.emHeightAscent = r.fontBoundingBoxAscent; r.emHeightDescent = r.fontBoundingBoxDescent;
+    r.alphabeticBaseline = 0; r.hangingBaseline = r.fontBoundingBoxAscent * 0.8; r.ideographicBaseline = -r.fontBoundingBoxDescent;
+    hidden(o, '@@v', r);
+    return o;
+  };
+  P.getContextAttributes = function () { return this['@@attrs']; };
+  P.isContextLost = function () { return false; };
+  P.drawFocusIfNeeded = function () {};
+  P.scrollPathIntoView = function () {};
+  window.CanvasRenderingContext2D = CanvasRenderingContext2D;
+
+  // ---------------------------------------------------- <canvas> element
+  var CP = HTMLCanvasElement.prototype, setAttr = Element.prototype.setAttribute, removeAttr = Element.prototype.removeAttribute;
+  function dim(el, name) { var v = el.getAttribute(name), d = name === 'width' ? 300 : 150; if (v === null) return d; var n = parseInt(v, 10); return n >= 0 ? n : d; }
+  function syncSize(el) { var c = el['@@ctx']; if (c) C.resize(c['@@h'], dim(el, 'width'), dim(el, 'height')); }
+  ['width', 'height'].forEach(function (name) {
+    Object.defineProperty(CP, name, {
+      get: function () { return dim(this, name); },
+      set: function (v) { setAttr.call(this, name, String(v >>> 0)); syncSize(this); },
+      configurable: true, enumerable: true
+    });
+  });
+  CP.setAttribute = function (n, v) { setAttr.call(this, n, v); if (/^(width|height)$/i.test(n)) syncSize(this); };
+  CP.removeAttribute = function (n) { removeAttr.call(this, n); if (/^(width|height)$/i.test(n)) syncSize(this); };
+  CP.getContext = function (type, opts) {
+    type = String(type);
+    if (this['@@ctx']) return this['@@ctxType'] === type ? this['@@ctx'] : null;
+    if (type !== '2d') return null;
+    var alpha = !(opts && opts.alpha === false);
+    var attrs = { alpha: alpha, colorSpace: 'srgb', desynchronized: false, willReadFrequently: !!(opts && opts.willReadFrequently) };
+    var ctx = makeCtx(CanvasRenderingContext2D, C.ctx(this, this.width, this.height, alpha), this, attrs);
+    hidden(this, '@@ctx', ctx);
+    hidden(this, '@@ctxType', type);
+    return ctx;
+  };
+  function blankUrl(w, h) { return C.call(C.ctx(null, w, h), 'toDataURL'); }
+  CP.toDataURL = function () {
+    if (!this.width || !this.height) return 'data:,';
+    return this['@@ctx'] ? C.call(this['@@ctx']['@@h'], 'toDataURL') : blankUrl(this.width, this.height);
+  };
+  CP.toBlob = function (cb, type) {
+    if (typeof cb !== 'function') throw new TypeError("Failed to execute 'toBlob' on 'HTMLCanvasElement': The callback provided as parameter 1 is not a function.");
+    var bytes = !this.width || !this.height ? null : C.call(this['@@ctx'] ? this['@@ctx']['@@h'] : C.ctx(null, this.width, this.height), 'pixels');
+    setTimeout(function () { cb(bytes ? new Blob([bytes], { type: 'image/png' }) : null); }, 0);
+  };
+  CP.transferControlToOffscreen = function () {
+    if (this['@@ctx']) throw new DOMException('Cannot transfer control from a canvas that has a rendering context.', 'InvalidStateError');
+    var o = new OffscreenCanvas(this.width, this.height);
+    hidden(o, '@@ctxH', C.ctx(this, this.width, this.height));
+    return o;
+  };
+  CP.captureStream = function () { return { getTracks: function () { return []; }, getVideoTracks: function () { return []; }, getAudioTracks: function () { return []; } }; };
+
+  // ---------------------------------------------------- OffscreenCanvas
+  function OffscreenCanvas(w, h) {
+    if (!(this instanceof OffscreenCanvas)) throw new TypeError("Failed to construct 'OffscreenCanvas': Please use the 'new' operator.");
+    hidden(this, '@@w', w >>> 0);
+    hidden(this, '@@hgt', h >>> 0);
+    hidden(this, '@@isOffscreen', true);
+  }
+  ['width', 'height'].forEach(function (name) {
+    var key = name === 'width' ? '@@w' : '@@hgt';
+    Object.defineProperty(OffscreenCanvas.prototype, name, {
+      get: function () { return this[key]; },
+      set: function (v) { hidden(this, key, v >>> 0); if (this['@@ctxH']) C.resize(this['@@ctxH'], this['@@w'], this['@@hgt']); },
+      configurable: true, enumerable: true
+    });
+  });
+  function OffscreenCanvasRenderingContext2D() { illegal(); }
+  OffscreenCanvasRenderingContext2D.prototype = Object.create(P);
+  OffscreenCanvasRenderingContext2D.prototype.constructor = OffscreenCanvasRenderingContext2D;
+  OffscreenCanvas.prototype.getContext = function (type, opts) {
+    if (this['@@ctx']) return this['@@ctxType'] === type ? this['@@ctx'] : null;
+    if (type !== '2d') return null;
+    if (!this['@@ctxH']) hidden(this, '@@ctxH', C.ctx(null, this.width, this.height, !(opts && opts.alpha === false)));
+    var ctx = makeCtx(OffscreenCanvasRenderingContext2D, this['@@ctxH'], this, { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false });
+    hidden(this, '@@ctx', ctx);
+    hidden(this, '@@ctxType', type);
+    return ctx;
+  };
+  OffscreenCanvas.prototype.convertToBlob = function () {
+    var self = this;
+    return new Promise(function (res) {
+      var h = self['@@ctxH'] || C.ctx(null, self.width, self.height);
+      res(new Blob([C.call(h, 'pixels')], { type: 'image/png' }));
+    });
+  };
+  OffscreenCanvas.prototype.transferToImageBitmap = function () {
+    var h = this['@@ctxH'] || C.ctx(null, this.width, this.height);
+    var b = makeBitmap(C.bitmap(h));
+    C.call(h, 'clearRect', 0, 0, this.width, this.height);
+    return b;
+  };
+  window.OffscreenCanvas = OffscreenCanvas;
+  window.OffscreenCanvasRenderingContext2D = OffscreenCanvasRenderingContext2D;
+})();

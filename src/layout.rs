@@ -321,6 +321,14 @@ pub struct LayoutTree {
     pub scroll: crate::fx::FxHashMap<NodeId, (f32, f32)>,
 }
 
+/// The anonymous cell (and its anonymous block for inline content) that
+/// collects loose content in a table.
+#[derive(Default)]
+struct AnonCell {
+    cell: Option<u32>,
+    inline: Option<u32>,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Mode {
     Normal,
@@ -738,14 +746,19 @@ impl<'a> Engine<'a> {
         }
         match kind {
             Kind::Replaced => {
-                let size = match tag {
+                let mut size = match tag {
                     k::iframe | k::video | k::canvas | k::embed | k::object => (300.0, 150.0),
                     _ => (0.0, 0.0),
                 };
-                let img = if tag == k::img || tag == k::svg || tag == k::iframe { self.res.img(c).cloned() } else { None };
+                if tag == k::canvas {
+                    // The bitmap size: width / height attributes.
+                    let dim = |a, d: f32| self.doc.attr(c, a).and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| *v >= 0.0).unwrap_or(d);
+                    size = (dim(k::width, 300.0), dim(k::height, 150.0));
+                }
+                let img = if matches!(tag, k::img | k::svg | k::iframe | k::canvas) { self.res.img(c).cloned() } else { None };
                 let b = &mut self.boxes[bx as usize];
-                // (An iframe's size doesn't come from its document.)
-                b.repl = if tag == k::iframe { size } else { img.as_ref().map_or(size, |i| (i.iw, i.ih)) };
+                // (An iframe's or canvas's size doesn't come from its image.)
+                b.repl = if matches!(tag, k::iframe | k::canvas) { size } else { img.as_ref().map_or(size, |i| (i.iw, i.ih)) };
                 b.fluid = img.as_ref().is_some_and(|i| i.fluid);
                 b.img = tag == k::img;
                 b.image = img;
@@ -903,25 +916,45 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// The rows (and captions) of a table. Content that isn't a row, row
+    /// group, cell or caption is wrapped in an anonymous row and cell;
+    /// positioned children are out of flow.
     fn collect_rows(&mut self, node: NodeId, t: u32, link: u32, anon_row: &mut Option<u32>) {
+        let mut anon = AnonCell::default();
         for c in self.doc.flat_children(node) {
             if self.doc.elem(c).is_none() {
+                if let Some(Data::Text(txt)) = self.doc.nodes.get(c as usize).map(|n| &n.data) {
+                    if !txt.bytes().all(|b| b.is_ascii_whitespace()) {
+                        let cell = self.anon_cell(t, node, anon_row, &mut anon);
+                        self.anon_inline(cell, node, c, link, &mut anon);
+                    }
+                }
                 continue;
             }
-            match self.styles[c as usize].display {
-                Display::None => {}
+            let st = &self.styles[c as usize];
+            if st.display == Display::None {
+                continue;
+            }
+            if matches!(st.position, Pos::Absolute | Pos::Fixed) {
+                self.build_oof(c, link);
+                continue;
+            }
+            match st.display {
                 Display::TableRow => {
                     *anon_row = None;
+                    anon = AnonCell::default();
                     let r = self.new_box(Kind::Row, c, false);
                     self.collect_cells(c, r, link);
                     self.boxes[t as usize].children.push(r);
                 }
                 Display::TableCaption => {
                     *anon_row = None;
+                    anon = AnonCell::default();
                     let b = self.build_box(c, link, 0);
                     self.boxes[t as usize].children.push(b);
                 }
                 Display::TableCell => {
+                    anon = AnonCell::default();
                     let r = match *anon_row {
                         Some(r) => r,
                         None => {
@@ -934,23 +967,100 @@ impl<'a> Engine<'a> {
                     let cell = self.build_cell(c, link);
                     self.boxes[r as usize].children.push(cell);
                 }
-                _ => self.collect_rows(c, t, link, anon_row),
+                Display::TableRowGroup | Display::Contents => {
+                    *anon_row = None;
+                    anon = AnonCell::default();
+                    self.collect_rows(c, t, link, anon_row);
+                    *anon_row = None;
+                }
+                _ => {
+                    let cell = self.anon_cell(t, node, anon_row, &mut anon);
+                    if self.blockish(c) {
+                        anon.inline = None;
+                        let b = self.build_box(c, link, 0);
+                        self.boxes[cell as usize].children.push(b);
+                    } else {
+                        self.anon_inline(cell, node, c, link, &mut anon);
+                    }
+                }
             }
         }
     }
 
+    /// The anonymous cell for loose content in a table (or row).
+    fn anon_cell(&mut self, t: u32, node: NodeId, anon_row: &mut Option<u32>, anon: &mut AnonCell) -> u32 {
+        if let Some(c) = anon.cell {
+            return c;
+        }
+        let r = match *anon_row {
+            Some(r) => r,
+            None => {
+                let r = self.new_box(Kind::Row, node, true);
+                self.boxes[t as usize].children.push(r);
+                *anon_row = Some(r);
+                r
+            }
+        };
+        let cell = self.new_box(Kind::Cell, node, true);
+        self.boxes[cell as usize].colspan = 1;
+        self.boxes[r as usize].children.push(cell);
+        anon.cell = Some(cell);
+        cell
+    }
+
+    /// Inline content (text, inline elements) in an anonymous cell.
+    fn anon_inline(&mut self, cell: u32, node: NodeId, c: NodeId, link: u32, anon: &mut AnonCell) {
+        let blk = match anon.inline {
+            Some(b) => b,
+            None => {
+                let b = self.new_box(Kind::Block, node, true);
+                self.boxes[cell as usize].children.push(b);
+                self.ws_space = true;
+                anon.inline = Some(b);
+                b
+            }
+        };
+        self.collect_inline(c, blk, link, 0);
+    }
+
     fn collect_cells(&mut self, row: NodeId, r: u32, link: u32) {
+        let mut anon = AnonCell::default();
+        let mut row_slot = Some(r);
         for c in self.doc.flat_children(row) {
             if self.doc.elem(c).is_none() {
+                if let Some(Data::Text(txt)) = self.doc.nodes.get(c as usize).map(|n| &n.data) {
+                    if !txt.bytes().all(|b| b.is_ascii_whitespace()) {
+                        let cell = self.anon_cell(NO_BOX, row, &mut row_slot, &mut anon);
+                        self.anon_inline(cell, row, c, link, &mut anon);
+                    }
+                }
                 continue;
             }
-            match self.styles[c as usize].display {
-                Display::None => {}
+            let st = &self.styles[c as usize];
+            if st.display == Display::None {
+                continue;
+            }
+            if matches!(st.position, Pos::Absolute | Pos::Fixed) {
+                self.build_oof(c, link);
+                continue;
+            }
+            match st.display {
                 Display::TableCell => {
+                    anon = AnonCell::default();
                     let cell = self.build_cell(c, link);
                     self.boxes[r as usize].children.push(cell);
                 }
-                _ => self.collect_cells(c, r, link),
+                Display::Contents => self.collect_cells(c, r, link),
+                _ => {
+                    let cell = self.anon_cell(NO_BOX, row, &mut row_slot, &mut anon);
+                    if self.blockish(c) {
+                        anon.inline = None;
+                        let b = self.build_box(c, link, 0);
+                        self.boxes[cell as usize].children.push(b);
+                    } else {
+                        self.anon_inline(cell, row, c, link, &mut anon);
+                    }
+                }
             }
         }
     }

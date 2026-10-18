@@ -597,7 +597,12 @@ fn xhr_send(it: &mut Interp, t: Value, a: &[Value]) -> R<Value> {
     if it.get(&t, "@@async")?.truthy() {
         it.start_request(&method, &url, hdrs, body, Target::Xhr(t));
     } else {
+        let t0 = std::time::Instant::now();
         let r = crate::net::http(&method, &url, &with_referer(&it.url, hdrs), body.as_deref());
+        // (A synchronous request's wait doesn't count against the task.)
+        if let Some(d) = it.deadline {
+            it.deadline = Some(d + t0.elapsed());
+        }
         xhr_complete(it, &t, r)?;
     }
     Ok(Value::Undef)
@@ -1079,7 +1084,7 @@ impl Interp {
         }
         let any = !done.is_empty();
         for (target, r) in done {
-            self.steps = 0;
+            self.begin_task();
             match target {
                 Target::Fetch(p, signal) => {
                     let aborted = !signal.is_nullish() && self.get(&signal, "aborted").map(|v| v.truthy()).unwrap_or(false);
@@ -1114,7 +1119,7 @@ impl Interp {
                         }
                         self.current_script = saved;
                         self.run_microtasks();
-                        self.steps = 0;
+                        self.begin_task();
                         super::dombind::dispatch_nobubble(self, node, "load");
                     }
                     _ => {

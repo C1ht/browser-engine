@@ -3,6 +3,7 @@
 //! promises/timers and a DOM binding (see `dom.rs`).
 
 pub mod bigint;
+pub mod canvas;
 pub mod binary;
 pub mod builtins;
 pub mod coro;
@@ -444,6 +445,8 @@ pub struct Interp {
     pub steps: u64,
     /// Steps a task may run (the time limit normally stops it first).
     pub budget: u64,
+    /// Time limit of one task in ms (0: none, e.g. for --js).
+    pub task_ms: u64,
     pub timers: Vec<Timer>,
     pub next_timer: u32,
     pub micro: VecDeque<(Value, Vec<Value>)>,
@@ -537,6 +540,8 @@ pub struct Interp {
     pub images: FxHashMap<String, Option<std::sync::Arc<crate::image::Image>>>,
     /// <img> elements whose load / error event has fired (for which URL).
     pub img_fired: FxHashMap<NodeId, String>,
+    /// 2D contexts of canvas elements (their bitmaps are displayed).
+    pub canvases: FxHashMap<NodeId, Rc<std::cell::RefCell<canvas::Canvas2D>>>,
     /// <link rel=stylesheet> elements whose load event has fired.
     pub link_fired: FxHashMap<NodeId, String>,
     /// Page scripts that didn't fit the startup budget: run one per event
@@ -594,6 +599,7 @@ impl Interp {
             dirty: false,
             steps: 0,
             budget: 5_000_000_000,
+            task_ms: 0,
             timers: Vec::new(),
             next_timer: 1,
             micro: VecDeque::new(),
@@ -653,6 +659,7 @@ impl Interp {
             vm_env_pool: Vec::new(),
             images: FxHashMap::default(),
             img_fired: FxHashMap::default(),
+            canvases: FxHashMap::default(),
             link_fired: FxHashMap::default(),
             script_queue: Default::default(),
             script_sources: None,
@@ -674,6 +681,7 @@ impl Interp {
         web::install(&mut it);
         messaging::install(&mut it);
         wasm::api::install(&mut it);
+        canvas::install(&mut it);
         if let Err(e) = it.run_script(include_str!("prelude.js")) {
             eprintln!("js prelude: {e}");
         }
@@ -746,6 +754,15 @@ impl Interp {
             return Err(Value::str(TERMINATE));
         }
         Ok(())
+    }
+
+    /// A new task (script, timer, event, network callback): fresh step
+    /// count and time limit.
+    pub fn begin_task(&mut self) {
+        self.steps = 0;
+        if self.task_ms > 0 {
+            self.set_deadline(std::time::Instant::now() + std::time::Duration::from_millis(self.task_ms));
+        }
     }
 
     /// Start a new task's time limit (and end any termination in progress).
@@ -2896,7 +2913,7 @@ impl Interp {
                     self.timers.remove(idx);
                 }
             }
-            self.steps = 0;
+            self.begin_task();
             if let Err(e) = self.call(&f, Value::Undef, &args) {
                 let m = self.describe_error(&e);
                 self.log(&format!("Uncaught {m}"));

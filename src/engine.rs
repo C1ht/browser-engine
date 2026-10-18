@@ -444,6 +444,7 @@ fn run_scripts(doc: Document, sources: &FxHashMap<String, String>, css: &FxHashM
     let t0 = Instant::now();
     let scripts = doc.scripts.clone();
     let mut it = js::Interp::new(doc, url, vw, vh);
+    it.task_ms = script_task_ms();
     // An iframe's document: window.parent / top are the containing page.
     if let Some((parent, name)) = FRAME_PARENT.with(|p| p.borrow_mut().take()) {
         let lit = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"").replace(['\n', '\r'], "");
@@ -564,7 +565,7 @@ fn run_one(it: &mut js::Interp, code: &str) {
     if code.trim().is_empty() {
         return;
     }
-    it.steps = 0;
+    it.begin_task();
     let t = Instant::now();
     if let Err(e) = it.run_script(code) {
         it.log(&e);
@@ -843,6 +844,32 @@ fn inline_svgs(doc: &Document, styles: &[Style], res: &mut Resources) {
     }
 }
 
+/// Turn canvases drawn on since the last call into images (by element);
+/// true if any changed.
+fn sync_canvases(it: &js::Interp, res: &mut Resources) -> bool {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut changed = false;
+    for (&n, c) in &it.canvases {
+        let mut c = c.borrow_mut();
+        if !c.dirty {
+            continue;
+        }
+        c.dirty = false;
+        changed = true;
+        if let Some(old) = res.img_src.remove(&n) {
+            res.images.remove(&old);
+        }
+        if c.w == 0 || c.h == 0 {
+            continue;
+        }
+        let img = image::from_pixels(c.w as u32, c.h as u32, c.display_pixels(), c.w as f32, c.h as f32);
+        let key = format!("canvas:{n}:{}", SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        res.images.insert(key.clone(), Some(Arc::new(img)));
+        res.img_src.insert(n, key);
+    }
+    changed
+}
+
 impl Page {
     /// The document of an iframe nested `depth` levels deep.
     fn new_child(l: Loaded, vw: f32, vh: f32, depth: u32, parent_url: &str, name: &str) -> Page {
@@ -860,6 +887,9 @@ impl Page {
         let (doc, js, script_ms) = run_scripts(l.doc, &l.scripts, &l.css, &l.url, &base, vw, vh);
         let mut res = Resources::default();
         Self::collect_img_src(&doc, &base, &mut res);
+        if let Some(it) = &js {
+            sync_canvases(it, &mut res);
+        }
         let mut css = l.css;
         let mut doc = doc;
         doc.target = target_of(&doc, &l.url);
@@ -1088,8 +1118,12 @@ impl Page {
             self.caret = forms::value(&self.doc, self.doc.focus).chars().count();
             self.focus_value = forms::value(&self.doc, self.doc.focus);
         }
-        if std::mem::take(&mut it.dirty) {
+        let dom_dirty = std::mem::take(&mut it.dirty);
+        let canvases = sync_canvases(it, &mut self.res);
+        if dom_dirty {
             Self::collect_img_src(&self.doc, &self.base, &mut self.res);
+        }
+        if dom_dirty || canvases {
             self.relayout(self.vw, self.vh);
         }
         self.script_requests();

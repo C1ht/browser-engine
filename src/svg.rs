@@ -665,16 +665,16 @@ impl Parser<'_> {
 
 /// A flattened subpath in user space.
 #[derive(Clone, Debug, Default)]
-struct Sub {
-    pts: Vec<(f32, f32)>,
-    closed: bool,
+pub(crate) struct Sub {
+    pub pts: Vec<(f32, f32)>,
+    pub closed: bool,
 }
 
 fn seg_count(len: f32, tol: f32) -> usize {
     ((len / tol).sqrt() * 0.6).ceil().clamp(1.0, 256.0) as usize
 }
 
-fn cubic(out: &mut Vec<(f32, f32)>, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32), tol: f32) {
+pub(crate) fn cubic(out: &mut Vec<(f32, f32)>, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32), tol: f32) {
     let d = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
     let n = seg_count(d(p0, p1) + d(p1, p2) + d(p2, p3), tol);
     for i in 1..=n {
@@ -685,7 +685,7 @@ fn cubic(out: &mut Vec<(f32, f32)>, p0: (f32, f32), p1: (f32, f32), p2: (f32, f3
     }
 }
 
-fn quad(out: &mut Vec<(f32, f32)>, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), tol: f32) {
+pub(crate) fn quad(out: &mut Vec<(f32, f32)>, p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), tol: f32) {
     let d = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
     let n = seg_count(d(p0, p1) + d(p1, p2), tol);
     for i in 1..=n {
@@ -737,6 +737,11 @@ fn arc(out: &mut Vec<(f32, f32)>, p1: (f32, f32), rx: f32, ry: f32, phi_deg: f32
     if let Some(last) = out.last_mut() {
         *last = p2;
     }
+}
+
+/// SVG path data flattened in user space (for Path2D).
+pub(crate) fn parse_path_data(d: &str) -> Vec<Sub> {
+    parse_path(d, 0.1)
 }
 
 fn parse_path(d: &str, tol: f32) -> Vec<Sub> {
@@ -849,7 +854,7 @@ fn parse_path(d: &str, tol: f32) -> Vec<Sub> {
     subs
 }
 
-fn ellipse_sub(cx: f32, cy: f32, rx: f32, ry: f32, tol: f32) -> Sub {
+pub(crate) fn ellipse_sub(cx: f32, cy: f32, rx: f32, ry: f32, tol: f32) -> Sub {
     let r = rx.max(ry);
     let step = 2.0 * (1.0 - (tol / r).min(1.0)).acos();
     let n = ((2.0 * PI) / step.max(0.01)).ceil().clamp(8.0, 720.0) as usize;
@@ -863,17 +868,17 @@ fn ellipse_sub(cx: f32, cy: f32, rx: f32, ry: f32, tol: f32) -> Sub {
 // ============================================================ rasterizer
 
 /// Coverage of a filled shape over a bounding region of the canvas.
-struct Cov {
-    x0: i32,
-    y0: i32,
-    w: usize,
-    h: usize,
-    data: Vec<f32>,
+pub(crate) struct Cov {
+    pub x0: i32,
+    pub y0: i32,
+    pub w: usize,
+    pub h: usize,
+    pub data: Vec<f32>,
 }
 
 const SUB: usize = 4;
 
-fn rasterize(polys: &[Vec<(f32, f32)>], evenodd: bool, cw: usize, ch: usize) -> Option<Cov> {
+pub(crate) fn rasterize(polys: &[Vec<(f32, f32)>], evenodd: bool, cw: usize, ch: usize) -> Option<Cov> {
     struct Edge {
         y0: f32,
         y1: f32,
@@ -989,7 +994,7 @@ fn circle_poly(c: (f32, f32), r: f32, tol: f32) -> Vec<(f32, f32)> {
     ellipse_sub(c.0, c.1, r, r, tol).pts
 }
 
-fn dashes(sub: &Sub, dash: &[f32], offset: f32) -> Vec<Sub> {
+pub(crate) fn dashes(sub: &Sub, dash: &[f32], offset: f32) -> Vec<Sub> {
     let mut pts = sub.pts.clone();
     if sub.closed && pts.first() != pts.last() {
         pts.push(pts[0]);
@@ -1049,8 +1054,18 @@ fn dashes(sub: &Sub, dash: &[f32], offset: f32) -> Vec<Sub> {
     out
 }
 
+/// Stroke parameters: width, cap (0 butt, 1 round, 2 square), join
+/// (0 miter, 1 round, 2 bevel) and miter limit.
+#[derive(Clone, Copy)]
+pub(crate) struct StrokeOpts {
+    pub sw: f32,
+    pub cap: u8,
+    pub join: u8,
+    pub miter: f32,
+}
+
 /// Outline a stroked subpath as polygons (filled with the nonzero rule).
-fn stroke_polys(sub: &Sub, st: &Style, tol: f32, out: &mut Vec<Vec<(f32, f32)>>) {
+pub(crate) fn stroke_polys(sub: &Sub, st: &StrokeOpts, tol: f32, out: &mut Vec<Vec<(f32, f32)>>) {
     let hw = st.sw / 2.0;
     let mut pts: Vec<(f32, f32)> = Vec::with_capacity(sub.pts.len());
     for &p in &sub.pts {
@@ -1540,15 +1555,16 @@ impl<'a> Ctx<'a> {
             }
         }
         if st.sw > 0.0 {
+            let so = StrokeOpts { sw: st.sw, cap: st.cap, join: st.join, miter: st.miter };
             if let Some(src) = self.source(&st.stroke, st, st.stroke_op * op, ctm, bbox) {
                 let mut polys = Vec::new();
                 for s in &subs {
                     if st.dash.is_empty() {
-                        stroke_polys(s, st, tol, &mut polys);
+                        stroke_polys(s, &so, tol, &mut polys);
                     } else {
                         let dash: Vec<f32> = if st.dash.len() % 2 == 1 { st.dash.repeat(2) } else { st.dash.clone() };
                         for d in dashes(s, &dash, st.dash_off) {
-                            stroke_polys(&d, st, tol, &mut polys);
+                            stroke_polys(&d, &so, tol, &mut polys);
                         }
                     }
                 }

@@ -96,7 +96,13 @@ impl Interp {
         if let Some(s) = self.module_sources.remove(url) {
             return Ok(s);
         }
-        match crate::net::http("GET", url, &[], None) {
+        // (Waiting on the network doesn't count against the task's time.)
+        let t = std::time::Instant::now();
+        let res = crate::net::http("GET", url, &[], None);
+        if let Some(d) = self.deadline {
+            self.deadline = Some(d + t.elapsed());
+        }
+        match res {
             Ok(r) if (200..300).contains(&r.status) || r.status == 0 => Ok(crate::net::decode(&r.body)),
             Ok(r) => Err(err("TypeError", format!("Failed to fetch module {url} (HTTP {})", r.status))),
             Err(e) => Err(err("TypeError", format!("Failed to fetch module {url}: {e}"))),

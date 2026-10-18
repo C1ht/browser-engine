@@ -942,6 +942,14 @@ pub fn families(i: u32) -> (Rc<[Box<str>]>, Kw) {
     FAMILIES.with(|t| t.borrow().0[i as usize].clone())
 }
 
+/// A font-family list's names (lowercase) and generic fallback.
+pub fn family_names(v: &str) -> (Rc<[Box<str>]>, Kw) {
+    match font_family(v) {
+        Value::Family(i) => families(i),
+        _ => (Rc::from(Vec::new()), Kw::SansSerif),
+    }
+}
+
 fn font_family(v: &str) -> Value {
     let key = v.trim().to_ascii_lowercase();
     if let Some(&i) = FAMILIES.with(|t| t.borrow().1.get(&key).copied()).as_ref() {

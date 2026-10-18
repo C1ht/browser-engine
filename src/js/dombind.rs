@@ -1754,7 +1754,7 @@ fn dispatch_obj(it: &mut Interp, target: u32, ty: &str, ev: Value) -> R<bool> {
             }
         }
         for (f, passive, is_attr) in fs {
-            it.steps = 0;
+            it.begin_task();
             if let Value::Obj(eo) = &ev {
                 Interp::set_hidden(eo, "@@passive", Value::Bool(passive));
             }
