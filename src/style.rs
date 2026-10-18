@@ -312,6 +312,10 @@ pub struct Style {
     pub collapse: bool,
     pub spacing: f32,
     pub width: Len,
+    /// width: 0 or min-content (1) / max-content (2) / fit-content (3)
+    pub width_kw: u8,
+    /// min-width: the same intrinsic keywords
+    pub min_w_kw: u8,
     pub height: Len,
     pub min_w: Len,
     pub max_w: Len,
@@ -358,6 +362,9 @@ pub struct Style {
     pub anim_names: Option<Rc<[Rc<str>]>>,
     pub anim_fill: bool,
     pub anim_finite: bool,
+    /// filter and backdrop-filter (None if none).
+    pub filter: Option<Rc<[FilterOp]>>,
+    pub backdrop: Option<Rc<[FilterOp]>>,
 }
 
 /// A resolved transform step: a translation (percentages of the border box)
@@ -454,6 +461,8 @@ pub const INITIAL: Style = Style {
     collapse: false,
     spacing: 0.0,
     width: Len::Auto,
+    width_kw: 0,
+    min_w_kw: 0,
     height: Len::Auto,
     min_w: Len::Px(0.0),
     max_w: Len::Auto,
@@ -476,6 +485,8 @@ pub const INITIAL: Style = Style {
     after: 0,
     owner: u32::MAX,
     xform: None,
+    filter: None,
+    backdrop: None,
     x_translate: None,
     x_rotate: None,
     x_scale: None,
@@ -579,6 +590,8 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         BackgroundImage => d.bg_image = s.bg_image,
         Content => d.content = s.content.clone(),
         TransformP => d.xform = s.xform.clone(),
+        FilterP => d.filter = s.filter.clone(),
+        BackdropFilterP => d.backdrop = s.backdrop.clone(),
         TranslateP => d.x_translate = s.x_translate.clone(),
         RotateP => d.x_rotate = s.x_rotate.clone(),
         ScaleP => d.x_scale = s.x_scale.clone(),
@@ -626,9 +639,15 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         AnimFill => d.anim_fill = s.anim_fill,
         AnimIter => d.anim_finite = s.anim_finite,
         BorderSpacing => d.spacing = s.spacing,
-        Width => d.width = s.width,
+        Width => {
+            d.width = s.width;
+            d.width_kw = s.width_kw;
+        }
         Height => d.height = s.height,
-        MinWidth => d.min_w = s.min_w,
+        MinWidth => {
+            d.min_w = s.min_w;
+            d.min_w_kw = s.min_w_kw;
+        }
         MaxWidth => d.max_w = s.max_w,
         MinHeight => d.min_h = s.min_h,
         MaxHeight => d.max_h = s.max_h,
@@ -843,6 +862,27 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                     Some(sh)
                 }
                 _ => None,
+            }
+        }
+        FilterP | BackdropFilterP => {
+            let ops = match v {
+                Value::Filter(i) => {
+                    let mut ops = css::filter_ops(i).to_vec();
+                    for op in &mut ops {
+                        if let FilterOp::DropShadow(sh) = op {
+                            if sh.color == CURRENT_COLOR {
+                                sh.color = s.color;
+                            }
+                        }
+                    }
+                    Some(Rc::from(ops))
+                }
+                _ => None,
+            };
+            if d.prop == FilterP {
+                s.filter = ops;
+            } else {
+                s.backdrop = ops;
             }
         }
         Opacity => {
@@ -1148,7 +1188,33 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
             }
         }
         Width | Height | MinWidth | MaxWidth | MinHeight | MaxHeight => {
-            let Some(l) = c.len(v, fs) else { return };
+            // Intrinsic size keywords: a width sized from its content; for
+            // heights they behave as auto (none for max-height).
+            let size_kw = match kw {
+                Some(Kw::MinContent) => 1,
+                Some(Kw::MaxContent) => 2,
+                Some(Kw::FitContent) => 3,
+                _ => 0,
+            };
+            match d.prop {
+                Width => s.width_kw = size_kw,
+                MinWidth => s.min_w_kw = size_kw,
+                _ => {}
+            }
+            let l = if size_kw > 0 {
+                Len::Auto
+            } else {
+                let Some(l) = c.len(v, fs) else { return };
+                l
+            };
+            if size_kw > 0 && matches!(d.prop, MinWidth | MinHeight) {
+                // (an intrinsic min-width is resolved in layout)
+                match d.prop {
+                    MinWidth => s.min_w = Len::Px(0.0),
+                    _ => s.min_h = Len::Px(0.0),
+                }
+                return;
+            }
             match d.prop {
                 Width => s.width = l,
                 Height => s.height = l,
@@ -2274,7 +2340,192 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
     put("flex-grow", format!("{}", st.grow));
     put("flex-shrink", format!("{}", st.shrink));
     put("flex-basis", css_len(st.basis, bw));
-    put("transform", if st.has_transform() { "matrix(1, 0, 0, 1, 0, 0)".into() } else { "none".into() });
+    put("flex", format!("{} {} {}", st.grow, st.shrink, css_len(st.basis, bw)));
+    put("flex-flow", format!("{} {}", match st.flex_dir {
+        FlexDir::Row => "row",
+        FlexDir::RowRev => "row-reverse",
+        FlexDir::Col => "column",
+        FlexDir::ColRev => "column-reverse",
+    }, if st.wrap { "wrap" } else { "nowrap" }));
+    put("order", st.order.to_string());
+    let al = |a: Al| match a {
+        Al::Stretch => "stretch",
+        Al::Start => "flex-start",
+        Al::End => "flex-end",
+        Al::Center => "center",
+        Al::Baseline => "baseline",
+    };
+    let just = |j: Justify| match j {
+        Justify::Start => "flex-start",
+        Justify::End => "flex-end",
+        Justify::Center => "center",
+        Justify::Between => "space-between",
+        Justify::Around => "space-around",
+        Justify::Evenly => "space-evenly",
+        Justify::Stretch => "normal",
+    };
+    put("align-items", if st.align_items == Al::Stretch { "normal".into() } else { al(st.align_items).into() });
+    put("align-self", st.align_self.map_or("auto", al).into());
+    put("justify-items", if st.justify_items == Al::Stretch { "normal".into() } else { al(st.justify_items).into() });
+    put("justify-self", st.justify_self.map_or("auto", al).into());
+    put("justify-content", if st.justify == Justify::Start { "normal".into() } else { just(st.justify).into() });
+    put("align-content", just(st.align_content).into());
+    let gap = |l: Len| if l == Len::Px(0.0) { "normal".to_string() } else { css_len(l, bw) };
+    put("row-gap", gap(st.row_gap));
+    put("column-gap", gap(st.col_gap));
+    put("gap", if st.row_gap == st.col_gap { gap(st.row_gap) } else { format!("{} {}", gap(st.row_gap), gap(st.col_gap)) });
+    // Corner radii, as specified percentages or px.
+    let rad: Vec<String> = st.radius.iter().map(|&r| match r {
+        Len::Pct(p) => format!("{}%", (p * 1000.0).round() / 1000.0),
+        l => css_len(l, bw),
+    }).collect();
+    for (i, corner) in ["top-left", "top-right", "bottom-right", "bottom-left"].iter().enumerate() {
+        put(&format!("border-{corner}-radius"), rad[i].clone());
+    }
+    put("border-radius", if rad.iter().all(|r| *r == rad[0]) { rad[0].clone() } else { rad.join(" ") });
+    let side_border = |i: usize| format!("{} {} {}", css_px(st.bw[i]), if st.bs[i] { "solid" } else { "none" }, css_color(st.bc[i]));
+    for (i, side) in ["top", "right", "bottom", "left"].iter().enumerate() {
+        put(&format!("border-{side}"), side_border(i));
+    }
+    let same = |f: &dyn Fn(usize) -> String| -> String {
+        let v: Vec<String> = (0..4).map(f).collect();
+        if v.iter().all(|x| *x == v[0]) { v[0].clone() } else { v.join(" ") }
+    };
+    put("border-width", same(&|i| css_px(st.bw[i])));
+    put("border-style", same(&|i| if st.bs[i] { "solid" } else { "none" }.into()));
+    put("border-color", same(&|i| css_color(st.bc[i])));
+    put("border", if (0..4).all(|i| side_border(i) == side_border(0)) { side_border(0) } else { String::new() });
+    put("border-collapse", if st.collapse { "collapse" } else { "separate" }.into());
+    put("border-spacing", css_px(st.spacing));
+    put(
+        "box-shadow",
+        match st.shadow {
+            Some(sh) => format!(
+                "{} {} {} {} {}{}",
+                css_color(sh.color),
+                css_px(sh.x),
+                css_px(sh.y),
+                css_px(sh.blur),
+                css_px(sh.spread),
+                if sh.inset { " inset" } else { "" }
+            ),
+            None => "none".into(),
+        },
+    );
+    put("background-image", if st.bg_image.is_some() { "url(\"\")".into() } else { "none".into() });
+    put(
+        "background-size",
+        match st.bg_fit {
+            1 => "cover".into(),
+            2 => "contain".into(),
+            _ => format!("{} {}", size(st.bg_size[0], bw), size(st.bg_size[1], bh)).replace("auto auto", "auto"),
+        },
+    );
+    put("background-position", format!("{} {}", size(st.bg_pos[0], bw), size(st.bg_pos[1], bh)).replace("auto", "0%"));
+    put(
+        "background-repeat",
+        match st.bg_repeat {
+            (true, true) => "repeat",
+            (true, false) => "repeat-x",
+            (false, true) => "repeat-y",
+            _ => "no-repeat",
+        }
+        .into(),
+    );
+    put(
+        "vertical-align",
+        match st.valign {
+            VAlign::Top => "top",
+            VAlign::Middle => "middle",
+            VAlign::Bottom => "bottom",
+            _ => "baseline",
+        }
+        .into(),
+    );
+    put(
+        "text-transform",
+        match st.transform {
+            Transform::None => "none",
+            Transform::Upper => "uppercase",
+            Transform::Lower => "lowercase",
+            Transform::Capitalize => "capitalize",
+        }
+        .into(),
+    );
+    put("text-overflow", if st.ellipsis { "ellipsis" } else { "clip" }.into());
+    put("word-break", match st.word_break {
+        1 => "break-all",
+        2 => "keep-all",
+        _ => "normal",
+    }.into());
+    put("overflow-wrap", if st.wrap_anywhere { "anywhere" } else { "normal" }.into());
+    put(
+        "list-style-type",
+        match st.list {
+            ListStyle::None => "none",
+            ListStyle::Circle => "circle",
+            ListStyle::Square => "square",
+            ListStyle::Decimal => "decimal",
+            ListStyle::LowerAlpha => "lower-alpha",
+            ListStyle::UpperAlpha => "upper-alpha",
+            ListStyle::LowerRoman => "lower-roman",
+            ListStyle::UpperRoman => "upper-roman",
+            _ => "disc",
+        }
+        .into(),
+    );
+    put("clear", match st.clear {
+        Side::Left => "left",
+        Side::Right => "right",
+        Side::Both => "both",
+        _ => "none",
+    }.into());
+    let filters = |f: &Option<Rc<[FilterOp]>>| match f {
+        None => "none".to_string(),
+        Some(ops) => ops
+            .iter()
+            .map(|op| match *op {
+                FilterOp::Blur(v) => format!("blur({})", css_px(v)),
+                FilterOp::Brightness(v) => format!("brightness({v})"),
+                FilterOp::Contrast(v) => format!("contrast({v})"),
+                FilterOp::Grayscale(v) => format!("grayscale({v})"),
+                FilterOp::HueRotate(v) => format!("hue-rotate({v}deg)"),
+                FilterOp::Invert(v) => format!("invert({v})"),
+                FilterOp::Opacity(v) => format!("opacity({v})"),
+                FilterOp::Saturate(v) => format!("saturate({v})"),
+                FilterOp::Sepia(v) => format!("sepia({v})"),
+                FilterOp::DropShadow(s) => format!("drop-shadow({} {} {} {})", css_color(s.color), css_px(s.x), css_px(s.y), css_px(s.blur)),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    };
+    put("filter", filters(&st.filter));
+    put("backdrop-filter", filters(&st.backdrop));
+    put("transform-origin", format!("{} {}", css_len(st.tf_origin[0], bw), css_len(st.tf_origin[1], bh)));
+    // The transform as a matrix about the origin-independent form.
+    let mut m = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+    for op in [&st.x_translate, &st.x_rotate, &st.x_scale, &st.xform].iter().filter_map(|l| l.as_ref()).flat_map(|l| l.iter()) {
+        let om = match *op {
+            Tf::Translate(tx, ty) => [1.0, 0.0, 0.0, 1.0, tx.px(bw), ty.px(bh)],
+            Tf::M(mm) => mm,
+        };
+        m = [
+            m[0] * om[0] + m[2] * om[1],
+            m[1] * om[0] + m[3] * om[1],
+            m[0] * om[2] + m[2] * om[3],
+            m[1] * om[2] + m[3] * om[3],
+            m[0] * om[4] + m[2] * om[5] + m[4],
+            m[1] * om[4] + m[3] * om[5] + m[5],
+        ];
+    }
+    let num = |v: f32| {
+        let r = (v * 1e6).round() / 1e6;
+        if r == 0.0 { "0".to_string() } else { format!("{r}") }
+    };
+    put(
+        "transform",
+        if st.has_transform() { format!("matrix({})", m.iter().map(|&v| num(v)).collect::<Vec<_>>().join(", ")) } else { "none".into() },
+    );
     put("pointer-events", if st.no_pointer { "none" } else { "auto" }.into());
     put("cursor", "auto".into());
     put(
@@ -2291,6 +2542,81 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
             None => "none".into(),
         },
     );
+    // Properties not modelled: their initial values, so scripts read
+    // strings rather than undefined.
+    for (k, v) in [
+        ("letter-spacing", "normal"),
+        ("word-spacing", "0px"),
+        ("text-indent", "0px"),
+        ("text-shadow", "none"),
+        ("direction", "ltr"),
+        ("writing-mode", "horizontal-tb"),
+        ("outline-style", "none"),
+        ("outline-width", "0px"),
+        ("outline", "none"),
+        ("outline-offset", "0px"),
+        ("transition", "all 0s ease 0s"),
+        ("transition-duration", "0s"),
+        ("transition-property", "all"),
+        ("transition-delay", "0s"),
+        ("animation-duration", "0s"),
+        ("animation-delay", "0s"),
+        ("will-change", "auto"),
+        ("user-select", "auto"),
+        ("resize", "none"),
+        ("table-layout", "auto"),
+        ("caption-side", "top"),
+        ("empty-cells", "show"),
+        ("mix-blend-mode", "normal"),
+        ("isolation", "auto"),
+        ("clip-path", "none"),
+        ("mask-image", "none"),
+        ("object-position", "50% 50%"),
+        ("background-attachment", "scroll"),
+        ("background-clip", "border-box"),
+        ("background-origin", "padding-box"),
+        ("scroll-behavior", "auto"),
+        ("touch-action", "auto"),
+        ("contain", "none"),
+        ("content-visibility", "visible"),
+        ("aspect-ratio", "auto"),
+        ("font-variant", "normal"),
+        ("font-stretch", "100%"),
+        ("text-rendering", "auto"),
+        ("-webkit-font-smoothing", "auto"),
+        ("grid-template-columns", "none"),
+        ("grid-template-rows", "none"),
+        ("grid-template-areas", "none"),
+        ("grid-auto-flow", "row"),
+        ("column-count", "auto"),
+        ("quotes", "auto"),
+        ("tab-size", "8"),
+        ("perspective", "none"),
+        ("backface-visibility", "visible"),
+        ("text-decoration", "none solid"),
+        ("text-decoration-style", "solid"),
+        ("hyphens", "manual"),
+        ("unicode-bidi", "normal"),
+        ("caret-color", "auto"),
+        ("accent-color", "auto"),
+        ("color-scheme", "normal"),
+        ("appearance", "none"),
+        ("box-decoration-break", "slice"),
+    ] {
+        if !out.iter().any(|(n, _)| n == k) {
+            out.push((k.into(), v.into()));
+        }
+    }
+    if !out.iter().any(|(k, _)| k == "inset") {
+        let v = ["top", "right", "bottom", "left"].map(|s| out.iter().find(|(k, _)| k == s).map(|(_, v)| v.clone()).unwrap_or_default());
+        out.push(("inset".into(), v.join(" ")));
+    }
+    if !out.iter().any(|(k, _)| k == "object-fit") {
+        out.push(("object-fit".into(), ["fill", "contain", "cover", "none", "scale-down"][st.object_fit.min(4) as usize].into()));
+    }
+    if !out.iter().any(|(k, _)| k == "animation-name") {
+        out.push(("animation-name".into(), st.anim_names.as_ref().map_or("none".into(), |n| n.join(", "))));
+    }
     out
 }
 
@@ -2401,7 +2727,7 @@ mod tests {
             #b { color: green } @layer theme { #b { color: red } }
             .card { & .title { color: oklch(62.8% 0.2577 29.23) } &:first-child { padding-left: 7px } }
             @supports (display: grid) and (not (foo: bar)) { #c { color: #010203 } }
-            @supports (backdrop-filter: blur(2px)) { #c { color: red } }
+            @supports (offset-path: ray(45deg)) { #c { color: red } }
             @media (width>=500px) and (not (hover: none)) { #d { color: rgb(4, 5, 6) } }
             @media (forced-colors: active) { #d { color: red } }
             li:nth-of-type(2) { color: color-mix(in srgb, rgb(255, 0, 0), rgb(0, 0, 255)) }

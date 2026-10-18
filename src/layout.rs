@@ -1520,6 +1520,15 @@ impl<'a> Engine<'a> {
             Mode::Forced(fw) => fw - pb_h,
             _ => match specified {
                 Some(w) => w,
+                None if !anon && st.width_kw > 0 => {
+                    let (mn, mx) = self.intrinsic_content(id);
+                    let avail = cb_w - m[1] - m[3] - pb_h;
+                    match st.width_kw {
+                        1 => mn,
+                        2 => mx,
+                        _ => mx.min(avail).max(mn),
+                    }
+                }
                 None if mode == Mode::Fit => {
                     let (mn, mx) = self.intrinsic_content(id);
                     let avail = cb_w - m[1] - m[3] - pb_h;
@@ -1533,6 +1542,10 @@ impl<'a> Engine<'a> {
                 w = w.min(st.max_w.px(cb_w) - adj_h);
             }
             w = w.max(st.min_w.px(cb_w) - adj_h);
+            if st.min_w_kw > 0 {
+                let (mn, mx) = self.intrinsic_content(id);
+                w = w.max(if st.min_w_kw == 1 { mn } else { mx });
+            }
         }
         w = w.max(0.0);
         if mode == Mode::Normal && !anon {
@@ -1592,6 +1605,11 @@ impl<'a> Engine<'a> {
             }
         }
         self.boxes[id as usize].h = h.max(0.0);
+        // A button's content is centered vertically in its box (unless the
+        // button is itself a flex or grid container).
+        if !anon && !matches!(kind, Kind::Flex | Kind::Grid) && self.doc.tag(self.boxes[id as usize].node) == Some(k::button) {
+            self.boxes[id as usize].cell_off = ((h - content_h) / 2.0).max(0.0);
+        }
         self.after_layout(id, cb_w);
     }
 
@@ -2078,7 +2096,7 @@ impl<'a> Engine<'a> {
         // (layout_block made this container's definite height the current one)
         let _ = pb_v;
         let spec_h = self.avail_h.filter(|_| !self.boxes[id as usize].anon);
-        let main_size = if row { Some(w) } else { spec_h };
+        let mut main_size = if row { Some(w) } else { spec_h };
         let cross_size = if row { spec_h } else { Some(w) };
 
         struct Fi {
@@ -2172,6 +2190,24 @@ impl<'a> Engine<'a> {
             lines.push((start, fis.len()));
         }
 
+        // A column container of auto height: its main size is the content
+        // size clamped by min/max height, which items can grow into.
+        if !row && main_size.is_none() && lines.len() == 1 && !self.boxes[id as usize].anon {
+            let cb = &self.boxes[id as usize];
+            let adj_v = if st.border_box { cb.p[0] + cb.p[2] + cb.b[0] + cb.b[2] } else { 0.0 };
+            let (mn, mx) = (self.resolve_h(st.min_h), self.resolve_h(st.max_h));
+            if mn.is_some() || mx.is_some() {
+                let gaps = gap_main * (fis.len().max(1) - 1) as f32;
+                let mut used: f32 = fis.iter().map(|f| f.hypo + f.margins).sum::<f32>() + gaps;
+                if let Some(m) = mx {
+                    used = used.min((m - adj_v).max(0.0));
+                }
+                if let Some(m) = mn {
+                    used = used.max(m - adj_v);
+                }
+                main_size = Some(used);
+            }
+        }
         // Resolve flexible lengths.
         if let Some(ms) = main_size {
             for &(s, e) in &lines {
@@ -2251,6 +2287,18 @@ impl<'a> Engine<'a> {
             }
         }
         let mut line_cross: Vec<f32> = lines.iter().map(|&(s, e)| cross[s..e].iter().copied().fold(0.0, f32::max)).collect();
+        // A single-line row container of auto height still has a definite
+        // cross size range: its min/max height bound the line.
+        if row && cross_size.is_none() && lines.len() == 1 && !self.boxes[id as usize].anon {
+            let cb = &self.boxes[id as usize];
+            let adj_v = if st.border_box { cb.p[0] + cb.p[2] + cb.b[0] + cb.b[2] } else { 0.0 };
+            if let Some(mh) = self.resolve_h(st.max_h) {
+                line_cross[0] = line_cross[0].min((mh - adj_v).max(0.0));
+            }
+            if let Some(mh) = self.resolve_h(st.min_h) {
+                line_cross[0] = line_cross[0].max(mh - adj_v);
+            }
+        }
         if let Some(cs) = cross_size {
             if lines.len() == 1 {
                 line_cross[0] = cs;
@@ -2796,16 +2844,19 @@ impl<'a> Engine<'a> {
         let widths = distribute(&mins, &maxs, &pcts, total_w - sp_total);
 
         let children = std::mem::take(&mut self.boxes[id as usize].children);
-        let mut y = if n > 0 { spacing } else { 0.0 };
+        let start_y = if n > 0 { spacing } else { 0.0 };
+        let mut y = start_y;
+        // First pass: lay out cells and find each row's natural height.
+        let mut heights = vec![0.0f32; children.len()];
         self.bfcs.push(Bfc::default());
-        for &r in &children {
+        for (i, &r) in children.iter().enumerate() {
             if self.boxes[r as usize].kind != Kind::Row {
                 // caption
                 self.layout_block(r, total_w, Mode::Normal, 0.0, y);
                 let cb = &mut self.boxes[r as usize];
                 cb.x = cb.m[3];
-                cb.y = y + cb.m[0];
-                y += cb.m[0] + cb.border_h() + cb.m[2];
+                heights[i] = cb.m[0] + cb.border_h() + cb.m[2];
+                y += heights[i];
                 continue;
             }
             self.resolve_edges(r, total_w);
@@ -2831,7 +2882,37 @@ impl<'a> Engine<'a> {
                     row_h = row_h.max(h);
                 }
             }
-            for &c in &cells {
+            self.boxes[r as usize].children = cells;
+            heights[i] = row_h;
+            y += row_h + spacing;
+        }
+        self.bfcs.pop();
+
+        // A table taller than its rows gives the rest to the rows, in
+        // proportion to their heights (equally if they have none).
+        let content_h = self.resolve_h(st.height).map(|h| h - p[0] - p[2] - b[0] - b[2]);
+        if let Some(target) = content_h {
+            let extra = target - y;
+            let rows: Vec<usize> = (0..children.len()).filter(|&i| self.boxes[children[i] as usize].kind == Kind::Row).collect();
+            if extra > 0.01 && !rows.is_empty() {
+                let sum: f32 = rows.iter().map(|&i| heights[i]).sum();
+                for &i in &rows {
+                    heights[i] += if sum > 0.0 { extra * heights[i] / sum } else { extra / rows.len() as f32 };
+                }
+            }
+        }
+
+        // Second pass: place rows and align cells within them.
+        let mut y = start_y;
+        for (i, &r) in children.iter().enumerate() {
+            if self.boxes[r as usize].kind != Kind::Row {
+                let cb = &mut self.boxes[r as usize];
+                cb.y = y + cb.m[0];
+                y += heights[i];
+                continue;
+            }
+            let row_h = heights[i];
+            for c in self.boxes[r as usize].children.clone() {
                 let valign = self.st(c).valign;
                 let cb = &mut self.boxes[c as usize];
                 let extra = row_h - cb.border_h();
@@ -2843,14 +2924,12 @@ impl<'a> Engine<'a> {
                 cb.h += extra;
             }
             let rb = &mut self.boxes[r as usize];
-            rb.children = cells;
             rb.x = 0.0;
             rb.y = y;
             rb.w = total_w;
             rb.h = row_h;
             y += row_h + spacing;
         }
-        self.bfcs.pop();
         self.boxes[id as usize].children = children;
 
         if mode == Mode::Normal {
@@ -2865,8 +2944,8 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        let h = match self.resolve_h(st.height) {
-            Some(h) => y.max(h - p[0] - p[2] - b[0] - b[2]),
+        let h = match content_h {
+            Some(h) => y.max(h),
             None => y,
         };
         let bx = &mut self.boxes[id as usize];

@@ -22,6 +22,7 @@ mod css;
 mod dom;
 mod engine;
 mod entities;
+mod filter;
 mod fonts;
 mod forms;
 mod fx;

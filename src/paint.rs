@@ -6,8 +6,8 @@
 //! needed glyph is in the cache (single-threaded), then split the framebuffer
 //! into horizontal bands and rasterize them in parallel with no locking.
 
-use crate::css;
-use crate::dom::Document;
+use crate::css::{self, FilterOp};
+use crate::dom::{Document, NodeId};
 use crate::engine::Resources;
 use crate::fonts::{fonts, glyph_key, Fonts, GlyphCache};
 use crate::image::Image;
@@ -81,6 +81,15 @@ pub enum DItem {
     /// A transformed element: its items are rasterized offscreen, then
     /// drawn through the matrix.
     Layer(Box<LayerData>),
+    /// backdrop-filter: filter what is already painted under a rounded
+    /// rect.
+    Backdrop(Box<BackdropData>),
+}
+
+pub struct BackdropData {
+    pub r: [f32; 4],
+    pub radii: [f32; 4],
+    pub filters: Arc<[FilterOp]>,
 }
 
 pub struct LayerData {
@@ -93,6 +102,8 @@ pub struct LayerData {
     pub tbounds: [f32; 4],
     /// Group opacity.
     pub alpha: f32,
+    /// CSS filters, applied to the rasterized layer.
+    pub filters: Option<Arc<[FilterOp]>>,
 }
 
 /// a · b (apply b first).
@@ -155,6 +166,8 @@ pub struct DisplayList {
     pub fixed_links: Vec<LinkArea>,
     pub extra: String,
     pub bg: u32,
+    /// Some item reads back painted pixels (backdrop-filter).
+    pub has_backdrop: bool,
 }
 
 impl DisplayList {
@@ -187,6 +200,9 @@ struct Builder<'a> {
     decor_mark: Option<usize>,
     /// This box's opacity is applied by its layer.
     group_opacity: Option<u32>,
+    /// The element whose background image paints the whole canvas (html,
+    /// or body when html has no background); NO_NODE if none.
+    canvas_img: NodeId,
 }
 
 pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style], res: &Resources) -> DisplayList {
@@ -210,6 +226,7 @@ pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style], res: &Resource
             fixed_links: Vec::new(),
             extra: String::new(),
             bg: bg | 0xFF00_0000,
+            has_backdrop: false,
         },
         opacity: 1.0,
         in_fixed: false,
@@ -220,7 +237,18 @@ pub fn build(tree: &LayoutTree, doc: &Document, styles: &[Style], res: &Resource
         mark_after_decor: None,
         decor_mark: None,
         group_opacity: None,
+        canvas_img: NodeId::MAX,
     };
+    // The root background (or body's, if the root has none) paints the
+    // canvas.
+    let html_st = &styles[doc.html as usize];
+    let owner = if html_st.bg_image.is_some() || html_bg >> 24 != 0 { doc.html } else { doc.body };
+    let rb = &tree.boxes[tree.root as usize];
+    if styles.get(owner as usize).is_some_and(|s| s.bg_image.is_some() && !s.hidden) && rb.node == doc.html && !rb.anon {
+        b.canvas_img = owner;
+        let canvas = [0.0, 0.0, rb.border_w().max(rb.x + rb.border_w() + rb.m[1]), tree.height.max(rb.border_h()).max(1.0)];
+        b.background_image(rb, &styles[owner as usize], rb.x, rb.y, Some(canvas));
+    }
     b.paint_box(tree.root, 0.0, 0.0);
     b.dl
 }
@@ -280,7 +308,9 @@ impl Builder<'_> {
             if c >> 24 != 0 {
                 self.push(DItem::RRect(Box::new(([bx, by, bw, bh], r, c))));
             }
-            self.background_image(b, st, bx, by);
+            if b.node != self.canvas_img {
+                self.background_image(b, st, bx, by, None);
+            }
             let bc = self.fade(st.bc[0]);
             if b.b.iter().any(|&v| v > 0.0) && bc >> 24 != 0 {
                 let i = [bx + b.b[3], by + b.b[0], bw - b.b[1] - b.b[3], bh - b.b[0] - b.b[2]];
@@ -294,7 +324,9 @@ impl Builder<'_> {
             }
         } else {
             self.rect(bx, by, bw, bh, st.bg);
-            self.background_image(b, st, bx, by);
+            if b.node != self.canvas_img {
+                self.background_image(b, st, bx, by, None);
+            }
             self.rect(bx, by, bw, b.b[0], st.bc[0]);
             self.rect(bx, by + bh - b.b[2], bw, b.b[2], st.bc[2]);
             self.rect(bx, by, b.b[3], bh, st.bc[3]);
@@ -322,13 +354,19 @@ impl Builder<'_> {
         }
     }
 
-    fn background_image(&mut self, b: &LBox, st: &Style, bx: f32, by: f32) {
+    /// Paint `st`'s background image for box `b`; `canvas` paints a root
+    /// background over the whole canvas instead of the border box.
+    fn background_image(&mut self, b: &LBox, st: &Style, bx: f32, by: f32, canvas: Option<[f32; 4]>) {
         let Some(bi) = st.bg_image else { return };
         let (bw, bh) = (b.border_w(), b.border_h());
-        let clip = [bx, by, bw, bh];
-        let radius = radii(st, bw, bh);
+        let clip = canvas.unwrap_or([bx, by, bw, bh]);
+        let radius = if canvas.is_some() { [0.0; 4] } else { radii(st, bw, bh) };
         let (px, py) = (bx + b.b[3], by + b.b[0]);
-        let (pw, ph) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
+        let (pw, mut ph) = (b.w + b.p[1] + b.p[3], b.h + b.p[0] + b.p[2]);
+        if let Some(c) = canvas {
+            // (An auto-sized gradient covers the canvas rather than tiling.)
+            ph = ph.max(c[3] - py);
+        }
         if pw <= 0.0 || ph <= 0.0 {
             return;
         }
@@ -398,6 +436,7 @@ impl Builder<'_> {
                 [*x - 1.0, y - size * 1.2, w + 2.0, size * 1.6]
             }
             DItem::Layer(l) => l.tbounds,
+            DItem::Backdrop(d) => d.r,
             DItem::Clip { .. } | DItem::Unclip | DItem::FixedOn | DItem::FixedOff => return None,
         })
     }
@@ -417,7 +456,20 @@ impl Builder<'_> {
         let m = if st.has_transform() && st.pure_translate(b.border_w(), b.border_h()).is_none() { box_matrix(st, bx, by, b.border_w(), b.border_h()) } else { None };
         // Group opacity: the element and its content are composited as one.
         let group_alpha = st.opacity < 1.0 && st.opacity >= 0.004 && !st.hidden;
-        if m.is_none() && !group_alpha {
+        // backdrop-filter: the backdrop is everything painted so far, under
+        // the element's border box (outside any layer of its own).
+        if let Some(f) = st.backdrop.as_ref().filter(|_| !st.hidden && st.opacity >= 0.004) {
+            let (w, h) = (b.border_w(), b.border_h());
+            let (r, radii) = match m {
+                Some(m) => (transform_rect(m, [bx, by, w, h]), [0.0; 4]),
+                None => ([bx, by, w, h], radii(st, w, h)),
+            };
+            if r[2] > 0.0 && r[3] > 0.0 {
+                self.dl.has_backdrop = true;
+                self.push(DItem::Backdrop(Box::new(BackdropData { r, radii, filters: Arc::from(&f[..]) })));
+            }
+        }
+        if m.is_none() && !group_alpha && (st.filter.is_none() || st.hidden) {
             return self.paint_context_or_box(id, ox, oy);
         }
         let saved = std::mem::take(self.target());
@@ -444,9 +496,18 @@ impl Builder<'_> {
         }
         let Some(bounds) = bb else { return };
         let m = m.unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        let tbounds = transform_rect(m, bounds);
         let alpha = if group_alpha { st.opacity * self.opacity } else { 1.0 };
-        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds, alpha })));
+        let filters = st.filter.as_ref().filter(|_| !st.hidden).map(|f| Arc::from(&f[..]));
+        // Room for blurs and shadows to spread.
+        let bounds = match &filters {
+            Some(f) => {
+                let o = crate::filter::outset(f);
+                [bounds[0] - o[0], bounds[1] - o[1], bounds[2] + o[0] + o[2], bounds[3] + o[1] + o[3]]
+            }
+            None => bounds,
+        };
+        let tbounds = transform_rect(m, bounds);
+        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds, alpha, filters })));
     }
 
     /// Does this box start a stacking context (its positioned descendants
@@ -460,7 +521,7 @@ impl Builder<'_> {
             return false;
         }
         let st = &self.styles[b.node as usize];
-        (st.position != Pos::Static && st.z.is_some()) || st.position == Pos::Fixed || st.opacity < 1.0 || st.has_transform()
+        (st.position != Pos::Static && st.z.is_some()) || st.position == Pos::Fixed || st.opacity < 1.0 || st.has_transform() || st.filter.is_some() || st.backdrop.is_some()
     }
 
     fn is_positioned(&self, id: u32) -> bool {
@@ -1254,6 +1315,7 @@ fn extent(it: &DItem) -> Option<(f32, f32)> {
         DItem::Gradient(d) => (d.clip[1], d.clip[1] + d.clip[3]),
         DItem::Shadow(d) => (d.s[1] - d.blur * 1.5 - 1.0, d.s[1] + d.s[3] + d.blur * 1.5 + 1.0),
         DItem::Layer(l) => (l.tbounds[1], l.tbounds[1] + l.tbounds[3]),
+        DItem::Backdrop(d) => (d.r[1], d.r[1] + d.r[3]),
         DItem::Clip { .. } | DItem::Unclip | DItem::FixedOn | DItem::FixedOff => return None,
     })
 }
@@ -1294,6 +1356,60 @@ fn draw(s: &mut Surface, it: &DItem, texts: [&str; 2], f: &Fonts, cache: &GlyphC
         // (Handled by the top-level painter.)
         DItem::FixedOn | DItem::FixedOff => {}
         DItem::Layer(l) => draw_layer(s, l, texts, f, cache),
+        DItem::Backdrop(d) => draw_backdrop(s, d),
+    }
+}
+
+/// Filter the pixels under a rounded rect in place. The backdrop is
+/// clipped to the rect, so blurs extend its edge pixels.
+fn draw_backdrop(s: &mut Surface, d: &BackdropData) {
+    let [x, y, w, h] = d.r;
+    let x0 = ((x - s.ox).floor() as i32).max(s.clip.0);
+    let y0 = ((y - s.oy).floor() as i32).max(s.clip.1);
+    let x1 = ((x + w - s.ox).ceil() as i32).min(s.clip.2);
+    let y1 = ((y + h - s.oy).ceil() as i32).min(s.clip.3);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let (rw, rh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+    let mut img: Vec<crate::filter::Px> = Vec::with_capacity(rw * rh);
+    for py in y0..y1 {
+        let row = py as usize * s.w;
+        for px in x0..x1 {
+            let c = s.buf[row + px as usize];
+            img.push([((c >> 16) & 0xFF) as f32, ((c >> 8) & 0xFF) as f32, (c & 0xFF) as f32, 255.0]);
+        }
+    }
+    crate::filter::apply(&mut img, rw, rh, &d.filters);
+    let rounded = d.radii.iter().any(|&r| r > 0.0);
+    let shape = [x - s.ox, y - s.oy, w, h];
+    for py in y0..y1 {
+        let row = py as usize * s.w;
+        for px in x0..x1 {
+            // Coverage of the pixel by the (rounded) rect.
+            let cov = if rounded {
+                (0.5 - rrect_sd(px as f32 + 0.5, py as f32 + 0.5, &shape, &d.radii)).clamp(0.0, 1.0)
+            } else {
+                let cx = ((px + 1) as f32).min(shape[0] + w) - (px as f32).max(shape[0]);
+                let cy = ((py + 1) as f32).min(shape[1] + h) - (py as f32).max(shape[1]);
+                cx.clamp(0.0, 1.0) * cy.clamp(0.0, 1.0)
+            };
+            if cov <= 0.0 {
+                continue;
+            }
+            let p = img[(py - y0) as usize * rw + (px - x0) as usize];
+            let dst = &mut s.buf[row + px as usize];
+            let d0 = *dst;
+            let ch = |sh: u32| ((d0 >> sh) & 0xFF) as f32;
+            // The filtered backdrop replaces the original (over it, if the
+            // filters left it translucent).
+            let ia = 1.0 - p[3] / 255.0;
+            let mix = |k: usize, sh: u32| {
+                let f = p[k] + ch(sh) * ia;
+                ((ch(sh) + (f - ch(sh)) * cov).round().clamp(0.0, 255.0) as u32) << sh
+            };
+            *dst = 0xFF00_0000 | mix(0, 16) | mix(1, 8) | mix(2, 0);
+        }
     }
 }
 
@@ -1314,9 +1430,25 @@ fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache
     if x0 >= x1 || y0 >= y1 {
         return;
     }
-    let (lx, ly) = (l.bounds[0].floor(), l.bounds[1].floor());
-    let w = ((l.bounds[0] + l.bounds[2] - lx).ceil() as usize + 1).min(4096);
-    let h = ((l.bounds[1] + l.bounds[3] - ly).ceil() as usize + 1).min(4096);
+    // The part of the layer that can reach visible pixels: all of it when
+    // transformed, else what's under the clip plus the filters' reach.
+    let mut lb = l.bounds;
+    if m[0] == 1.0 && m[1] == 0.0 && m[2] == 0.0 && m[3] == 1.0 {
+        let o = l.filters.as_deref().map_or([0.0; 4], crate::filter::outset);
+        let vx0 = x0 as f32 + s.ox - m[4] - o[2];
+        let vy0 = y0 as f32 + s.oy - m[5] - o[3];
+        let vx1 = x1 as f32 + s.ox - m[4] + o[0];
+        let vy1 = y1 as f32 + s.oy - m[5] + o[1];
+        let (bx0, by0) = (lb[0].max(vx0), lb[1].max(vy0));
+        let (bx1, by1) = ((lb[0] + lb[2]).min(vx1), (lb[1] + lb[3]).min(vy1));
+        if bx0 >= bx1 || by0 >= by1 {
+            return;
+        }
+        lb = [bx0, by0, bx1 - bx0, by1 - by0];
+    }
+    let (lx, ly) = (lb[0].floor(), lb[1].floor());
+    let w = ((lb[0] + lb[2] - lx).ceil() as usize + 1).min(4096);
+    let h = ((lb[1] + lb[3] - ly).ceil() as usize + 1).min(4096);
     let mut black = vec![0xFF00_0000u32; w * h];
     let mut white = vec![0xFFFF_FFFFu32; w * h];
     for buf in [&mut black, &mut white] {
@@ -1328,16 +1460,25 @@ fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache
     }
     // Inverse matrix: page -> layer.
     let inv = [m[3] / det, -m[1] / det, -m[2] / det, m[0] / det, (m[2] * m[5] - m[3] * m[4]) / det, (m[1] * m[4] - m[0] * m[5]) / det];
-    // Premultiplied colour (over black) and alpha (white - black) at a pixel.
+    // Premultiplied colour (over black) and alpha (white - black).
+    let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as f32;
+    let mut img: Vec<crate::filter::Px> = black
+        .iter()
+        .zip(&white)
+        .map(|(&b, &wt)| {
+            let a = (255.0 - ((ch(wt, 16) - ch(b, 16)) + (ch(wt, 8) - ch(b, 8)) + (ch(wt, 0) - ch(b, 0))) / 3.0).clamp(0.0, 255.0);
+            [ch(b, 16).min(a), ch(b, 8).min(a), ch(b, 0).min(a), a]
+        })
+        .collect();
+    drop((black, white));
+    if let Some(f) = &l.filters {
+        crate::filter::apply(&mut img, w, h, f);
+    }
     let at = |x: i32, y: i32| -> [f32; 4] {
         if x < 0 || y < 0 || x as usize >= w || y as usize >= h {
             return [0.0; 4];
         }
-        let i = y as usize * w + x as usize;
-        let (b, wt) = (black[i], white[i]);
-        let ch = |c: u32, sh: u32| ((c >> sh) & 0xFF) as f32;
-        let a = 255.0 - ((ch(wt, 16) - ch(b, 16)) + (ch(wt, 8) - ch(b, 8)) + (ch(wt, 0) - ch(b, 0))) / 3.0;
-        [ch(b, 16), ch(b, 8), ch(b, 0), a.clamp(0.0, 255.0)]
+        img[y as usize * w + x as usize]
     };
     for py in y0..y1 {
         let gy = py as f32 + 0.5 + s.oy;
@@ -1396,7 +1537,8 @@ pub fn paint(dl: &DisplayList, layout_text: &str, cache: &mut GlyphCache, buf: &
     let bg = dl.bg;
 
     let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
-    let threads = if visible.len() < 64 || h < 64 { 1 } else { threads };
+    // (Backdrop filters read pixels across bands.)
+    let threads = if visible.len() < 64 || h < 64 || dl.has_backdrop { 1 } else { threads };
     let band = h.div_ceil(threads).max(1);
     let paint_band = |chunk: &mut [u32], i: usize| {
         chunk.fill(bg);

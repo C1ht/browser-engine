@@ -44,6 +44,8 @@ pub enum Value {
     Names(u32),
     /// grid-template-areas: index into the areas table.
     Areas(u32),
+    /// filter / backdrop-filter: index into the filter table.
+    Filter(u32),
     /// An identifier (interned), e.g. a grid area name.
     Name(u32),
     /// font-family list: index into the family table.
@@ -137,6 +139,10 @@ pub enum Kw {
     RepeatY,
     Fill,
     ScaleDown,
+    // intrinsic sizes (width / min-width / max-width)
+    MinContent,
+    MaxContent,
+    FitContent,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -248,6 +254,8 @@ pub enum Prop {
     BgPosY,
     BgRepeat,
     ObjectFit,
+    FilterP,
+    BackdropFilterP,
     Custom,
     Unresolved,
 }
@@ -1177,6 +1185,12 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
                 }
                 return;
             }
+            "filter" | "-webkit-filter" | "backdrop-filter" | "-webkit-backdrop-filter" => {
+                if let Some(f) = filter_value(&lower) {
+                    push!(if name.ends_with("backdrop-filter") { BackdropFilterP } else { FilterP }, f);
+                }
+                return;
+            }
             "translate" | "rotate" | "scale" => {
                 if let Some(t) = transform_prop(name, &lower) {
                     push!(match name { "translate" => TranslateP, "rotate" => RotateP, _ => ScaleP }, t);
@@ -1262,16 +1276,79 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
         return;
     }
     if let Some(g) = global {
+        // A global keyword applies to every longhand the property sets.
         let props: &[Prop] = match name {
             "margin" => &MARGIN,
             "padding" => &PADDING,
+            "margin-block" => &[MarginTop, MarginBottom],
+            "margin-inline" => &[MarginLeft, MarginRight],
+            "padding-block" => &[PaddingTop, PaddingBottom],
+            "padding-inline" => &[PaddingLeft, PaddingRight],
             "border" => &[
                 BorderTopWidth, BorderRightWidth, BorderBottomWidth, BorderLeftWidth,
                 BorderTopColor, BorderRightColor, BorderBottomColor, BorderLeftColor,
                 BorderTopStyle, BorderRightStyle, BorderBottomStyle, BorderLeftStyle,
             ],
-            "background" | "background-color" => &[Background],
+            "border-width" => &[BorderTopWidth, BorderRightWidth, BorderBottomWidth, BorderLeftWidth],
+            "border-color" => &[BorderTopColor, BorderRightColor, BorderBottomColor, BorderLeftColor],
+            "border-style" => &[BorderTopStyle, BorderRightStyle, BorderBottomStyle, BorderLeftStyle],
+            "border-top" | "border-block-start" => &[BorderTopWidth, BorderTopColor, BorderTopStyle],
+            "border-right" | "border-inline-end" => &[BorderRightWidth, BorderRightColor, BorderRightStyle],
+            "border-bottom" | "border-block-end" => &[BorderBottomWidth, BorderBottomColor, BorderBottomStyle],
+            "border-left" | "border-inline-start" => &[BorderLeftWidth, BorderLeftColor, BorderLeftStyle],
+            "border-block" => &[BorderTopWidth, BorderTopColor, BorderTopStyle, BorderBottomWidth, BorderBottomColor, BorderBottomStyle],
+            "border-inline" => &[BorderLeftWidth, BorderLeftColor, BorderLeftStyle, BorderRightWidth, BorderRightColor, BorderRightStyle],
+            "border-radius" | "-webkit-border-radius" | "-moz-border-radius" => &[RadiusTL, RadiusTR, RadiusBR, RadiusBL],
+            "border-top-left-radius" | "border-start-start-radius" => &[RadiusTL],
+            "border-top-right-radius" | "border-start-end-radius" => &[RadiusTR],
+            "border-bottom-right-radius" | "border-end-end-radius" => &[RadiusBR],
+            "border-bottom-left-radius" | "border-end-start-radius" => &[RadiusBL],
+            "inset" => &[InsetTop, InsetRight, InsetBottom, InsetLeft],
+            "inset-block" => &[InsetTop, InsetBottom],
+            "inset-inline" => &[InsetLeft, InsetRight],
+            "inset-block-start" => &[InsetTop],
+            "inset-block-end" => &[InsetBottom],
+            "inset-inline-start" => &[InsetLeft],
+            "inset-inline-end" => &[InsetRight],
+            "inline-size" => &[Width],
+            "block-size" => &[Height],
+            "min-inline-size" => &[MinWidth],
+            "max-inline-size" => &[MaxWidth],
+            "min-block-size" => &[MinHeight],
+            "max-block-size" => &[MaxHeight],
+            "overflow" => &[Overflow, OverflowX, OverflowY],
+            "overflow-x" => &[OverflowX],
+            "overflow-y" => &[OverflowY],
+            "flex" => &[FlexGrow, FlexShrink, FlexBasis],
+            "flex-flow" => &[FlexDirection, FlexWrap],
+            "gap" | "grid-gap" => &[RowGap, ColumnGap],
+            "grid-row-gap" => &[RowGap],
+            "grid-column-gap" => &[ColumnGap],
+            "place-items" => &[AlignItems, JustifyItems],
+            "place-content" => &[AlignContent, JustifyContent],
+            "place-self" => &[AlignSelf, JustifySelf],
+            "grid" | "grid-template" => &[GridTemplateColumns, GridTemplateRows, GridTemplateAreas, GridAutoRows],
+            "grid-template-areas" => &[GridTemplateAreas],
+            "grid-area" => &[GridArea, GridRowStart, GridColumnStart, GridRowEnd, GridColumnEnd],
+            "grid-row" => &[GridRowStart, GridRowEnd],
+            "grid-column" => &[GridColumnStart, GridColumnEnd],
+            "grid-row-start" => &[GridRowStart],
+            "grid-row-end" => &[GridRowEnd],
+            "grid-column-start" => &[GridColumnStart],
+            "grid-column-end" => &[GridColumnEnd],
+            "background" => &[Background, BackgroundImage, BgSizeX, BgSizeY, BgPosX, BgPosY, BgRepeat],
+            "background-color" => &[Background],
+            "background-size" => &[BgSizeX, BgSizeY],
+            "background-position" => &[BgPosX, BgPosY],
+            "background-position-x" => &[BgPosX],
+            "background-position-y" => &[BgPosY],
+            "transform-origin" => &[TransformOriginX, TransformOriginY],
             "font" => &[FontSize, FontWeight, FontStyle, FontFamily, LineHeight],
+            "word-break" => &[WordBreak],
+            "overflow-wrap" | "word-wrap" => &[OverflowWrap],
+            "text-overflow" => &[TextOverflow],
+            "-webkit-line-clamp" | "line-clamp" => &[LineClamp],
+            "animation" => &[AnimName, AnimFill, AnimIter],
             _ => match simple_prop(name) {
                 Some(p) => {
                     push_global!(p, g);
@@ -1441,8 +1518,14 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             _ => None,
         },
         "border-spacing" => tokens(v).first().and_then(|t| length(t)),
-        "width" | "height" | "min-width" | "min-height" => length(v),
-        "max-width" | "max-height" => if v == "none" { Some(Value::Auto) } else { length(v) },
+        "width" | "height" | "min-width" | "min-height" | "max-width" | "max-height" => match v {
+            "none" if name.starts_with("max-") => Some(Value::Auto),
+            "min-content" | "-webkit-min-content" | "-moz-min-content" => kw(Kw::MinContent),
+            "max-content" | "-webkit-max-content" | "-moz-max-content" | "intrinsic" => kw(Kw::MaxContent),
+            "fit-content" | "-webkit-fit-content" | "-moz-fit-content" => kw(Kw::FitContent),
+            "-webkit-fill-available" | "-moz-available" | "stretch" if name.ends_with("width") => Some(Value::Auto),
+            _ => length(v),
+        },
         "margin" | "padding" => {
             let vals: Option<Vec<Value>> = tokens(v).into_iter().map(length).collect();
             if let Some(vals) = vals {
@@ -1533,6 +1616,8 @@ fn line_height(v: &str) -> Option<Value> {
 
 fn simple_prop(name: &str) -> Option<Prop> {
     Some(match name {
+        "filter" | "-webkit-filter" => FilterP,
+        "backdrop-filter" | "-webkit-backdrop-filter" => BackdropFilterP,
         "display" => Display,
         "position" => Position,
         "color" => Color,
@@ -2692,6 +2777,107 @@ fn transform_value(v: &str) -> Option<Value> {
         });
     }
     Some(store_transform(ops))
+}
+
+/// One filter function (lengths in px, amounts as fractions, angles in
+/// degrees).
+#[derive(Clone, Copy, Debug)]
+pub enum FilterOp {
+    Blur(f32),
+    Brightness(f32),
+    Contrast(f32),
+    Grayscale(f32),
+    HueRotate(f32),
+    Invert(f32),
+    Opacity(f32),
+    Saturate(f32),
+    Sepia(f32),
+    DropShadow(Shadow),
+}
+
+thread_local! {
+    static FILTERS: RefCell<Vec<Rc<[FilterOp]>>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn filter_ops(i: u32) -> Rc<[FilterOp]> {
+    FILTERS.with(|t| t.borrow()[i as usize].clone())
+}
+
+/// A `filter` / `backdrop-filter` value: `none` or a list of filter
+/// functions (SVG `url()` references are skipped).
+fn filter_value(v: &str) -> Option<Value> {
+    let v = v.trim();
+    if v == "none" {
+        return Some(Value::Kw(Kw::None));
+    }
+    let px = |s: &str| match length(s) {
+        Some(Value::Px(p)) => Some(p),
+        Some(Value::Em(e) | Value::Rem(e)) => Some(e * 16.0),
+        _ => (s == "0").then_some(0.0),
+    };
+    // A number or percentage amount; `default` when omitted.
+    let amount = |s: Option<&str>, default: f32| -> Option<f32> {
+        match s {
+            None => Some(default),
+            Some(s) => match s.strip_suffix('%') {
+                Some(p) => p.trim().parse::<f32>().ok().map(|p| p / 100.0),
+                None => s.parse().ok(),
+            },
+        }
+    };
+    let mut ops = Vec::new();
+    let mut rest = v;
+    while !rest.trim().is_empty() {
+        let r = rest.trim_start();
+        let open = r.find('(')?;
+        // The matching parenthesis (drop-shadow colours nest).
+        let mut depth = 0;
+        let mut close = None;
+        for (i, ch) in r.char_indices().skip(open) {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let close = close?;
+        let name = r[..open].trim();
+        let inner = r[open + 1..close].trim();
+        rest = &r[close + 1..];
+        let arg = (!inner.is_empty()).then_some(inner);
+        let clamp1 = |a: f32| a.clamp(0.0, 1.0);
+        ops.push(match name {
+            "blur" => FilterOp::Blur(arg.map_or(Some(0.0), px)?.max(0.0)),
+            "brightness" => FilterOp::Brightness(amount(arg, 1.0)?.max(0.0)),
+            "contrast" => FilterOp::Contrast(amount(arg, 1.0)?.max(0.0)),
+            "grayscale" => FilterOp::Grayscale(clamp1(amount(arg, 1.0)?)),
+            "invert" => FilterOp::Invert(clamp1(amount(arg, 1.0)?)),
+            "opacity" => FilterOp::Opacity(clamp1(amount(arg, 1.0)?)),
+            "saturate" => FilterOp::Saturate(amount(arg, 1.0)?.max(0.0)),
+            "sepia" => FilterOp::Sepia(clamp1(amount(arg, 1.0)?)),
+            "hue-rotate" => FilterOp::HueRotate(arg.map_or(Some(0.0), |a| angle_deg(a).or_else(|| (a == "0").then_some(0.0)))?),
+            "drop-shadow" => match shadow(inner)? {
+                Value::Shadow(sh) => FilterOp::DropShadow(Shadow { spread: 0.0, inset: false, ..sh }),
+                _ => return None,
+            },
+            "url" => continue,
+            _ => return None,
+        });
+    }
+    if ops.is_empty() {
+        return Some(Value::Kw(Kw::None));
+    }
+    FILTERS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push(ops.into());
+        Some(Value::Filter(t.len() as u32 - 1))
+    })
 }
 
 /// The individual `translate` / `rotate` / `scale` properties.
