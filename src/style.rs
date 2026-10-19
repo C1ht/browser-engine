@@ -1521,6 +1521,66 @@ enum Pass {
     Rest,
 }
 
+/// Compute the custom properties an element declares: substitute their
+/// var() references (to its own properties or inherited ones). A property
+/// in a reference cycle is invalid and removed, so var() falls back.
+fn resolve_vars(s: &mut Style, ps: &Style) {
+    let Some(vars) = s.vars.clone() else { return };
+    let parent = ps.vars.as_ref();
+    let own: crate::fx::FxHashSet<&str> = vars
+        .iter()
+        .filter(|(k, v)| parent.and_then(|p| p.get(*k)).is_none_or(|pv| !Rc::ptr_eq(pv, v)))
+        .map(|(k, _)| &**k)
+        .collect();
+    if !own.iter().any(|k| vars[*k].contains("var(")) {
+        return;
+    }
+    struct Res<'a> {
+        raw: &'a Vars,
+        own: &'a crate::fx::FxHashSet<&'a str>,
+        done: std::cell::RefCell<FxHashMap<String, Option<String>>>,
+        stack: std::cell::RefCell<Vec<String>>,
+        bad: std::cell::RefCell<crate::fx::FxHashSet<String>>,
+    }
+    impl Res<'_> {
+        fn get(&self, n: &str) -> Option<String> {
+            if !self.own.contains(n) {
+                return self.raw.get(n).map(|v| v.to_string());
+            }
+            if let Some(v) = self.done.borrow().get(n) {
+                return v.clone();
+            }
+            let pos = self.stack.borrow().iter().position(|x| x == n);
+            if let Some(p) = pos {
+                // A cycle: every property in it is invalid.
+                let cyc: Vec<String> = self.stack.borrow()[p..].to_vec();
+                self.bad.borrow_mut().extend(cyc);
+                return None;
+            }
+            let raw = self.raw.get(n)?.clone();
+            self.stack.borrow_mut().push(n.to_owned());
+            let r = if raw.contains("var(") { css::substitute_vars(&raw, &|m| self.get(m), 0) } else { Some(raw.to_string()) };
+            self.stack.borrow_mut().pop();
+            let r = if self.bad.borrow().contains(n) { None } else { r };
+            self.done.borrow_mut().insert(n.to_owned(), r.clone());
+            r
+        }
+    }
+    let res = Res { raw: &vars, own: &own, done: Default::default(), stack: Default::default(), bad: Default::default() };
+    let mut out: Vars = (*vars).clone();
+    for &n in &own {
+        match res.get(n) {
+            Some(v) => {
+                out.insert(n.into(), Rc::from(v.as_str()));
+            }
+            None => {
+                out.remove(n);
+            }
+        }
+    }
+    s.vars = Some(Rc::new(out));
+}
+
 /// Apply one declaration for the given pass, resolving custom properties
 /// and var() references.
 /// Parsed results of var()-substituted declarations, keyed by (declaration,
@@ -2187,6 +2247,9 @@ fn apply_matched(s: &mut Style, ps: &Style, cas: &Cascade, matched: &[u32], ctx:
     let passes: &[Pass] = if has_custom { &[Pass::Custom, Pass::Font, Pass::Rest] } else { &[Pass::Font, Pass::Rest] };
     for &pass in passes {
         let font_pass = pass == Pass::Font;
+        if font_pass && has_custom {
+            resolve_vars(s, ps);
+        }
         for important in [false, true] {
             for &ri in matched {
                 let r = &cas.rules[ri as usize];
@@ -2340,6 +2403,9 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
         let raws = &cas.raws[..];
         for &pass in passes {
             let font_pass = pass == Pass::Font;
+            if font_pass && has_custom {
+                resolve_vars(s, ps);
+            }
             let rules = || matched.iter().map(|&ri| &cas.rules[ri as usize]).filter(|r| !font_pass || r.font);
             let decls = |r: &CRule| (r.level, &cas.decls[r.start as usize..r.end as usize]);
             // normal declarations: UA, hints, author, inline
@@ -3010,6 +3076,34 @@ mod tests {
         assert_eq!(by("g").opacity, 1.0);
         assert_eq!(by("s").color & 0xFFFFFF, 0x090909, "infinite animations keep the base style");
         assert_eq!(by("n").opacity, 0.0, "no fill: the element's own style");
+    }
+
+    #[test]
+    fn var_cycles() {
+        let doc = html::parse(
+            r#"<!doctype html><style>
+            .p { --c: rgb(0, 0, 9) }
+            #a { --s: var(--s, rgb(0, 0, 1)); color: var(--s, rgb(0, 0, 1)) }
+            #b { --c: var(--c); color: var(--c, rgb(0, 0, 2)) }
+            #c { --d: var(--e); --e: var(--d, red); color: var(--d, rgb(0, 0, 3)) }
+            #d { --x: rgb(0, 0, 4); --y: var(--x); color: var(--y) }
+            #e { color: var(--c) }
+            </style>
+            <p id=a>a</p><div class=p><p id=b>b</p><p id=e>e</p></div><p id=c>c</p><p id=d>d</p>"#,
+        );
+        let m = Media { vw: 800.0, vh: 600.0 };
+        let sheets = crate::engine::sheets_for(&doc, "", &mut Default::default());
+        let cas = build_cascade(&sheets, &m, doc.quirks);
+        let st = compute(&doc, &cas, 800.0, 600.0);
+        let rgb = |id: &str| {
+            let a = crate::atom::lookup(id).unwrap();
+            st[(0..doc.nodes.len() as u32).find(|&n| doc.elem(n).is_some_and(|e| e.id == Some(a))).unwrap() as usize].color & 0xFFFFFF
+        };
+        assert_eq!(rgb("a"), 1, "a self-reference is invalid: the fallback applies");
+        assert_eq!(rgb("b"), 2, "--c: var(--c) is a cycle, not the inherited value");
+        assert_eq!(rgb("c"), 3, "properties in a cycle are all invalid");
+        assert_eq!(rgb("d"), 4);
+        assert_eq!(rgb("e"), 9, "inherited custom properties resolve");
     }
 
     #[test]
