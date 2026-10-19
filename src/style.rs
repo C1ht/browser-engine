@@ -302,8 +302,26 @@ pub struct Style {
     pub center_blocks: bool,
     pub line_height: LineHeight,
     pub ws: WhiteSpace,
-    pub underline: bool,
-    pub strike: bool,
+    /// The element's own text-decoration: line bits (1 underline,
+    /// 2 overline, 4 line-through), style (0 solid, 1 double, 2 dotted,
+    /// 3 dashed, 4 wavy), color, thickness and underline offset (NaN: auto).
+    pub deco_line: u8,
+    pub deco_style: u8,
+    pub deco_color: u32,
+    pub deco_thick: f32,
+    pub deco_offset: f32,
+    /// The decorations its text draws: its own and its ancestors'
+    /// (propagated, so inherited).
+    pub decos: Option<Rc<[Deco]>>,
+    /// text-underline-position: under (inherited).
+    pub under_pos: bool,
+    /// -webkit-text-fill-color (CURRENT_COLOR: the color) and
+    /// -webkit-text-stroke (inherited).
+    pub text_fill: u32,
+    pub stroke_w: f32,
+    pub stroke_c: u32,
+    /// image-rendering: pixelated / crisp-edges (inherited).
+    pub pixelated: bool,
     pub transform: Transform,
     pub list: ListStyle,
     pub hidden: bool,
@@ -368,6 +386,18 @@ pub struct Style {
     pub blend: u8,
     /// object-fit: 0 fill, 1 contain, 2 cover, 3 none, 4 scale-down
     pub object_fit: u8,
+    /// object-position.
+    pub obj_pos: [Len; 2],
+    /// border-image: source image, slices (top, right, bottom, left; image
+    /// px, or percentages), `fill`, widths and outsets as (kind, value) —
+    /// kind 0 a multiple of the border width, 1 px, 2 percent, 3 auto —
+    /// and repeat (x | y << 4: 0 stretch, 1 repeat, 2 round, 3 space).
+    pub bimg: Option<u32>,
+    pub bimg_slice: [Len; 4],
+    pub bimg_fill: bool,
+    pub bimg_width: [(u8, f32); 4],
+    pub bimg_outset: [(u8, f32); 4],
+    pub bimg_rep: u8,
     /// `content` (None = normal / none).
     pub content: Option<Rc<[css::ContentItem]>>,
     /// Indices (into the styles vector) of this element's ::before / ::after
@@ -475,7 +505,7 @@ impl Style {
 
     /// Every image this style paints (backgrounds, masks), for fetching.
     pub fn image_ids(&self) -> Vec<u32> {
-        self.bg_images.iter().chain(self.mask_images.iter()).flat_map(|l| l.iter().copied()).filter(|&i| i != u32::MAX).collect()
+        self.bg_images.iter().chain(self.mask_images.iter()).flat_map(|l| l.iter().copied()).chain(self.bimg).filter(|&i| i != u32::MAX).collect()
     }
 }
 
@@ -563,8 +593,17 @@ pub const INITIAL: Style = Style {
     center_blocks: false,
     line_height: LineHeight::Normal,
     ws: WhiteSpace::Normal,
-    underline: false,
-    strike: false,
+    deco_line: 0,
+    deco_style: 0,
+    deco_color: CURRENT_COLOR,
+    deco_thick: f32::NAN,
+    deco_offset: f32::NAN,
+    decos: None,
+    under_pos: false,
+    text_fill: CURRENT_COLOR,
+    stroke_w: 0.0,
+    stroke_c: CURRENT_COLOR,
+    pixelated: false,
     transform: Transform::None,
     list: ListStyle::Disc,
     hidden: false,
@@ -611,6 +650,13 @@ pub const INITIAL: Style = Style {
     clip_path: None,
     blend: 0,
     object_fit: 0,
+    obj_pos: [Len::Pct(50.0); 2],
+    bimg: None,
+    bimg_slice: [Len::Pct(100.0); 4],
+    bimg_fill: false,
+    bimg_width: [(0, 1.0); 4],
+    bimg_outset: [(0, 0.0); 4],
+    bimg_rep: 0,
     content: None,
     before: 0,
     after: 0,
@@ -646,8 +692,12 @@ impl Style {
             center_blocks: p.center_blocks,
             line_height: p.line_height,
             ws: p.ws,
-            underline: p.underline,
-            strike: p.strike,
+            decos: p.decos.clone(),
+            under_pos: p.under_pos,
+            text_fill: p.text_fill,
+            stroke_w: p.stroke_w,
+            stroke_c: p.stroke_c,
+            pixelated: p.pixelated,
             transform: p.transform,
             list: p.list,
             hidden: p.hidden,
@@ -766,10 +816,26 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         }
         LineHeight => d.line_height = s.line_height,
         WhiteSpace => d.ws = s.ws,
-        TextDecoration => {
-            d.underline = s.underline;
-            d.strike = s.strike
+        TextDecoration => d.deco_line = s.deco_line,
+        DecoStyle => d.deco_style = s.deco_style,
+        DecoColor => d.deco_color = s.deco_color,
+        DecoThickness => d.deco_thick = s.deco_thick,
+        UnderlineOffset => d.deco_offset = s.deco_offset,
+        UnderlinePosition => d.under_pos = s.under_pos,
+        TextFillColor => d.text_fill = s.text_fill,
+        TextStrokeWidth => d.stroke_w = s.stroke_w,
+        TextStrokeColor => d.stroke_c = s.stroke_c,
+        ObjectPosX => d.obj_pos[0] = s.obj_pos[0],
+        ObjectPosY => d.obj_pos[1] = s.obj_pos[1],
+        ImageRendering => d.pixelated = s.pixelated,
+        BorderImageSource => d.bimg = s.bimg,
+        BorderImageSlice => {
+            d.bimg_slice = s.bimg_slice;
+            d.bimg_fill = s.bimg_fill;
         }
+        BorderImageWidth => d.bimg_width = s.bimg_width,
+        BorderImageOutset => d.bimg_outset = s.bimg_outset,
+        BorderImageRepeat => d.bimg_rep = s.bimg_rep,
         TextTransform => d.transform = s.transform,
         ListStyleType => d.list = s.list,
         Visibility => d.hidden = s.hidden,
@@ -1368,14 +1434,87 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
             }
         }
         TextDecoration => {
-            let (u, l) = match kw {
-                Some(Kw::Underline) => (true, false),
-                Some(Kw::LineThrough) => (false, true),
-                Some(Kw::UnderlineLineThrough) => (true, true),
-                _ => (false, false),
+            s.deco_line = match v {
+                Value::Num(n) => n as u8,
+                _ => 0,
+            }
+        }
+        DecoStyle | UnderlinePosition | ImageRendering | BorderImageRepeat => {
+            let n = match v {
+                Value::Num(n) => n as u8,
+                _ => 0,
             };
-            s.underline = u;
-            s.strike = l;
+            match d.prop {
+                DecoStyle => s.deco_style = n,
+                UnderlinePosition => s.under_pos = n != 0,
+                ImageRendering => s.pixelated = n != 0,
+                _ => s.bimg_rep = n,
+            }
+        }
+        DecoColor | TextFillColor | TextStrokeColor => {
+            if let Value::Color(col) = v {
+                match d.prop {
+                    DecoColor => s.deco_color = col,
+                    TextFillColor => s.text_fill = col,
+                    _ => s.stroke_c = col,
+                }
+            } else if matches!(v, Value::Initial) {
+                match d.prop {
+                    DecoColor => s.deco_color = CURRENT_COLOR,
+                    TextFillColor => s.text_fill = CURRENT_COLOR,
+                    _ => s.stroke_c = CURRENT_COLOR,
+                }
+            }
+        }
+        DecoThickness | UnderlineOffset | TextStrokeWidth => {
+            let px = match v {
+                Value::Auto => f32::NAN,
+                v => c.px(v, fs).unwrap_or(f32::NAN),
+            };
+            match d.prop {
+                DecoThickness => s.deco_thick = px,
+                UnderlineOffset => s.deco_offset = px,
+                _ => s.stroke_w = if px.is_nan() { 0.0 } else { px.max(0.0) },
+            }
+        }
+        ObjectPosX | ObjectPosY => {
+            if let Some(l) = c.len(v, fs) {
+                s.obj_pos[(d.prop == ObjectPosY) as usize] = l;
+            }
+        }
+        BorderImageSource => {
+            s.bimg = match v {
+                Value::Image(i) => Some(i),
+                _ => None,
+            }
+        }
+        BorderImageSlice | BorderImageWidth | BorderImageOutset => {
+            if let Value::Quad(i) = v {
+                let (q, flag) = css::quad_of(i);
+                match d.prop {
+                    BorderImageSlice => {
+                        s.bimg_slice = q.map(|x| match x {
+                            Value::Num(n) => Len::Px(n),
+                            Value::Pct(p) => Len::Pct(p),
+                            _ => Len::Pct(100.0),
+                        });
+                        s.bimg_fill = flag;
+                    }
+                    _ => {
+                        let r = q.map(|x| match x {
+                            Value::Num(n) => (0u8, n),
+                            Value::Auto => (3, 0.0),
+                            Value::Pct(p) => (2, p),
+                            x => (1, c.px(x, fs).unwrap_or(0.0)),
+                        });
+                        if d.prop == BorderImageWidth {
+                            s.bimg_width = r;
+                        } else {
+                            s.bimg_outset = r;
+                        }
+                    }
+                }
+            }
         }
         TextTransform => {
             s.transform = match kw {
@@ -1495,6 +1634,31 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
         }
         Custom | Unresolved => {}
     }
+}
+
+/// One text decoration a run of text draws.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Deco {
+    pub line: u8,
+    pub style: u8,
+    pub color: u32,
+    pub thick: f32,
+    pub offset: f32,
+}
+
+/// An element that sets text-decoration adds it to the decorations its
+/// text (and its descendants' text) draws.
+fn add_decoration(s: &mut Style) {
+    if s.deco_line == 0 {
+        return;
+    }
+    let color = if s.deco_color == CURRENT_COLOR { s.color } else { s.deco_color };
+    let d = Deco { line: s.deco_line, style: s.deco_style, color, thick: s.deco_thick, offset: s.deco_offset };
+    let mut v: Vec<Deco> = s.decos.as_deref().map(|x| x.to_vec()).unwrap_or_default();
+    if v.last() != Some(&d) {
+        v.push(d);
+    }
+    s.decos = Some(Rc::from(v));
 }
 
 /// A border-style keyword as a style code (see `Style::bs`).
@@ -2276,6 +2440,7 @@ fn apply_matched(s: &mut Style, ps: &Style, cas: &Cascade, matched: &[u32], ctx:
     if s.oc == CURRENT_COLOR {
         s.oc = s.color;
     }
+    add_decoration(s);
     if s.bg == CURRENT_COLOR {
         s.bg = s.color;
     }
@@ -2472,6 +2637,7 @@ pub fn compute(doc: &Document, cas: &Cascade, vw: f32, vh: f32) -> Vec<Style> {
         if s.oc == CURRENT_COLOR {
             s.oc = s.color;
         }
+        add_decoration(s);
         if s.bg == CURRENT_COLOR {
             s.bg = s.color;
         }
@@ -2650,12 +2816,20 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         }
         .into(),
     );
-    put("text-decoration-line", match (st.underline, st.strike) {
-        (true, true) => "underline line-through",
-        (true, false) => "underline",
-        (false, true) => "line-through",
-        _ => "none",
-    }.into());
+    let lines: Vec<&str> = [(1, "underline"), (2, "overline"), (4, "line-through")].iter().filter(|(b, _)| st.deco_line & b != 0).map(|(_, n)| *n).collect();
+    let line = if lines.is_empty() { "none".to_string() } else { lines.join(" ") };
+    let dstyle = ["solid", "double", "dotted", "dashed", "wavy"][st.deco_style.min(4) as usize];
+    let dcolor = css_color(if st.deco_color == CURRENT_COLOR { st.color } else { st.deco_color });
+    put("text-decoration", format!("{line} {dstyle} {dcolor}"));
+    put("text-decoration-line", line);
+    put("text-decoration-style", dstyle.into());
+    put("text-decoration-color", dcolor);
+    put("text-decoration-thickness", if st.deco_thick.is_nan() { "auto".into() } else { css_px(st.deco_thick) });
+    put("text-underline-offset", if st.deco_offset.is_nan() { "auto".into() } else { css_px(st.deco_offset) });
+    put("-webkit-text-fill-color", css_color(if st.text_fill == CURRENT_COLOR { st.color } else { st.text_fill }));
+    put("-webkit-text-stroke-width", css_px(st.stroke_w));
+    put("object-position", format!("{} {}", size(st.obj_pos[0], bw), size(st.obj_pos[1], bh)));
+    put("image-rendering", if st.pixelated { "pixelated" } else { "auto" }.into());
     put(
         "float",
         match st.float {
@@ -2935,7 +3109,6 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         ("isolation", "auto"),
         ("clip-path", "none"),
         ("mask-image", "none"),
-        ("object-position", "50% 50%"),
         ("scroll-behavior", "auto"),
         ("touch-action", "auto"),
         ("contain", "none"),
@@ -2954,8 +3127,6 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         ("tab-size", "8"),
         ("perspective", "none"),
         ("backface-visibility", "visible"),
-        ("text-decoration", "none solid"),
-        ("text-decoration-style", "solid"),
         ("hyphens", "manual"),
         ("unicode-bidi", "normal"),
         ("caret-color", "auto"),

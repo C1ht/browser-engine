@@ -6,7 +6,7 @@
 //! needed glyph is in the cache (single-threaded), then split the framebuffer
 //! into horizontal bands and rasterize them in parallel with no locking.
 
-use crate::css::{self, FilterOp};
+use crate::css::{self, FilterOp, CURRENT_COLOR};
 use crate::dom::{Document, NodeId};
 use crate::engine::Resources;
 use crate::fonts::{fonts, glyph_key, Fonts, GlyphCache};
@@ -51,6 +51,8 @@ pub struct ImgData {
     pub alpha: u32,
     /// Corner radii of the clip rect.
     pub radius: [f32; 4],
+    /// Nearest-neighbour scaling (image-rendering: pixelated).
+    pub pixelated: bool,
 }
 
 pub struct GradData {
@@ -133,6 +135,8 @@ pub struct LayerData {
     pub mask_lum: bool,
     /// mix-blend-mode as a canvas composite operation (0 = normal).
     pub blend: u8,
+    /// The masks cut out (1 - coverage) instead of keeping.
+    pub invert: bool,
 }
 
 /// A filled vector shape (page coordinates).
@@ -346,6 +350,15 @@ impl Builder<'_> {
         // on rounded corners) go through the general border painter.
         let has_border = b.b.iter().any(|&v| v > 0.0);
         let plain = st.bs.iter().zip(&b.b).all(|(&s, &w)| s <= 1 || w <= 0.0) && (!rounded || (0..4).all(|i| b.b[i] <= 0.0 || st.bc[i] == st.bc[0]));
+        let bimg = self.border_image_source(b, st);
+        if let Some(src) = bimg {
+            self.bg_color(b, st, bx, by, r);
+            if b.node != self.canvas_img {
+                self.background_image(b, st, bx, by, None);
+            }
+            self.inset_shadows(b, st, bx, by, r);
+            self.border_image(b, st, bx, by, &src);
+        } else
         if has_border && !plain {
             self.bg_color(b, st, bx, by, r);
             if b.node != self.canvas_img {
@@ -408,11 +421,119 @@ impl Builder<'_> {
                 4 => (cw / iw).min(ch / ih).min(1.0),
                 _ => 0.0,
             };
-            let dst = if fit == 0 { [cx, cy, cw, ch] } else { [cx + (cw - iw * s) / 2.0, cy + (ch - ih * s) / 2.0, iw * s, ih * s] };
+            let dst = if fit == 0 { [cx, cy, cw, ch] } else { [cx + st.obj_pos[0].px(cw - iw * s), cy + st.obj_pos[1].px(ch - ih * s), iw * s, ih * s] };
             let alpha = (255.0 * self.opacity) as u32;
             let r = radii(st, b.border_w(), b.border_h());
             let radius = [0, 1, 2, 3].map(|i| (r[i] - b.b[3].max(b.b[0]) - b.p[3].max(b.p[0])).max(0.0));
-            self.push(DItem::Image(Box::new(ImgData { img: img.clone(), dst, clip: [cx, cy, cw, ch], tile: (false, false), alpha, radius })));
+            self.push(DItem::Image(Box::new(ImgData { img: img.clone(), dst, clip: [cx, cy, cw, ch], tile: (false, false), alpha, radius, pixelated: st.pixelated })));
+        }
+    }
+
+    /// border-image-source as an image (gradients rendered at the border
+    /// box size), if it can be drawn.
+    fn border_image_source(&self, b: &LBox, st: &Style) -> Option<Arc<Image>> {
+        let id = st.bimg?;
+        match css::bg_image(id) {
+            css::BgImage::Url(u) => self.res.url(&u).cloned(),
+            css::BgImage::Gradient(g) => {
+                let (w, h) = (b.border_w().max(1.0), b.border_h().max(1.0));
+                let gd = grad_data(&g, [0.0, 0.0, w, h], [0.0, 0.0, w, h], [0.0; 4], 1.0);
+                let (tw, th) = (w.round().clamp(1.0, 2048.0) as u32, h.round().clamp(1.0, 2048.0) as u32);
+                let mut px = Vec::with_capacity((tw * th) as usize);
+                for y in 0..th {
+                    for x in 0..tw {
+                        px.push(grad_pixel(&gd, (x as f32 + 0.5) * w / tw as f32, (y as f32 + 0.5) * h / th as f32));
+                    }
+                }
+                Some(Arc::new(crate::image::from_pixels(tw, th, px, w, h)))
+            }
+        }
+    }
+
+    /// Nine-slice border image.
+    fn border_image(&mut self, b: &LBox, st: &Style, bx: f32, by: f32, img: &Arc<Image>) {
+        let (iw, ih) = (img.iw.max(1e-3), img.ih.max(1e-3));
+        let (bw, bh) = (b.border_w(), b.border_h());
+        let bws = [b.b[0], b.b[1], b.b[2], b.b[3]];
+        // Slices in image px (top, right, bottom, left).
+        let sl = [st.bimg_slice[0].px(ih), st.bimg_slice[1].px(iw), st.bimg_slice[2].px(ih), st.bimg_slice[3].px(iw)].map(|v| v.max(0.0));
+        let sl = [sl[0].min(ih), sl[1].min(iw), sl[2].min(ih), sl[3].min(iw)];
+        // The border image area: the border box grown by the outsets.
+        let out: Vec<f32> = (0..4).map(|i| match st.bimg_outset[i] {
+            (0, n) => n * bws[i],
+            (_, v) => v,
+        }).collect();
+        let area = [bx - out[3], by - out[0], bw + out[1] + out[3], bh + out[0] + out[2]];
+        let mut wid: Vec<f32> = (0..4).map(|i| match st.bimg_width[i] {
+            (0, n) => n * bws[i],
+            (2, p) => p * if i % 2 == 0 { area[3] } else { area[2] } / 100.0,
+            (3, _) => sl[i],
+            (_, v) => v,
+        }).collect();
+        let f = (area[2] / (wid[1] + wid[3]).max(1e-3)).min(area[3] / (wid[0] + wid[2]).max(1e-3)).min(1.0);
+        wid.iter_mut().for_each(|v| *v *= f);
+        let (sx, sy) = (img.w as f32 / iw, img.h as f32 / ih);
+        // Source and destination columns / rows.
+        let scol = [0.0, sl[3], iw - sl[1], iw];
+        let srow = [0.0, sl[0], ih - sl[2], ih];
+        let dcol = [area[0], area[0] + wid[3], area[0] + area[2] - wid[1], area[0] + area[2]];
+        let drow = [area[1], area[1] + wid[0], area[1] + area[3] - wid[2], area[1] + area[3]];
+        let alpha = (255.0 * self.opacity) as u32;
+        for r in 0..3 {
+            for c in 0..3 {
+                if r == 1 && c == 1 && !st.bimg_fill {
+                    continue;
+                }
+                let src = [scol[c], srow[r], scol[c + 1] - scol[c], srow[r + 1] - srow[r]];
+                let dst = [dcol[c], drow[r], dcol[c + 1] - dcol[c], drow[r + 1] - drow[r]];
+                if src[2] <= 0.0 || src[3] <= 0.0 || dst[2] <= 0.5 || dst[3] <= 0.5 {
+                    continue;
+                }
+                let piece = crop_image(img, [src[0] * sx, src[1] * sy, src[2] * sx, src[3] * sy], src[2], src[3]);
+                // Tile size: edges scale to the border width they sit in.
+                let mut tw = dst[2];
+                let mut th = dst[3];
+                let rx = if r != 1 && c == 1 { st.bimg_rep & 0xF } else if c == 1 { st.bimg_rep & 0xF } else { 0 };
+                let ry = if c != 1 && r == 1 { st.bimg_rep >> 4 } else if r == 1 { st.bimg_rep >> 4 } else { 0 };
+                if c == 1 && r != 1 {
+                    tw = src[2] * dst[3] / src[3];
+                }
+                if r == 1 && c != 1 {
+                    th = src[3] * dst[2] / src[2];
+                }
+                if r == 1 && c == 1 {
+                    // The middle scales like the top and left edges.
+                    let kx = if wid[0] > 0.0 { wid[0] / sl[0].max(1e-3) } else { 1.0 };
+                    let ky = if wid[3] > 0.0 { wid[3] / sl[3].max(1e-3) } else { 1.0 };
+                    tw = src[2] * kx;
+                    th = src[3] * ky;
+                }
+                let fit = |len: f32, t: f32, mode: u8| -> (f32, f32, bool) {
+                    match mode {
+                        1 => (t, (len - t) / 2.0, true),
+                        2 => {
+                            let n = (len / t).round().max(1.0);
+                            (len / n, 0.0, true)
+                        }
+                        3 => {
+                            let n = (len / t).floor();
+                            if n < 1.0 { (t, 0.0, false) } else { (t, 0.0, true) }
+                        }
+                        _ => (len, 0.0, false),
+                    }
+                };
+                let (w, ox, tile_x) = fit(dst[2], tw, if c == 1 { rx } else { 0 });
+                let (h, oy, tile_y) = fit(dst[3], th, if r == 1 { ry } else { 0 });
+                self.push(DItem::Image(Box::new(ImgData {
+                    img: piece,
+                    dst: [dst[0] + ox, dst[1] + oy, w, h],
+                    clip: dst,
+                    tile: (tile_x, tile_y),
+                    alpha,
+                    radius: [0.0; 4],
+                    pixelated: st.pixelated,
+                })));
+            }
         }
     }
 
@@ -446,6 +567,76 @@ impl Builder<'_> {
         }
     }
 
+    /// -webkit-text-stroke: offset copies of the glyphs in the stroke
+    /// color (cut out of the glyph shapes when the fill is transparent).
+    #[allow(clippy::too_many_arguments)]
+    fn text_stroke(&mut self, x: f32, y: f32, w: f32, start: u32, end: u32, face: u8, fs: f32, line: f32, sw: f32, sc: u32, hollow: bool) {
+        let r = (sw / 2.0).max(0.5);
+        let n = if r <= 1.0 { 8 } else { 16 };
+        let mut items = Vec::new();
+        for k in 0..n {
+            let t = k as f32 / n as f32 * std::f32::consts::TAU;
+            items.push(DItem::Text { x: x + r * t.cos(), y: y + r * t.sin(), start, end, src: 0, face, size: fs, color: sc });
+        }
+        let pad = r.ceil() + 2.0;
+        let bounds = [x - pad, y - line * fs - pad, w + 2.0 * pad, line * fs * 1.6 + 2.0 * pad];
+        let cut = if hollow { vec![vec![DItem::Text { x, y, start, end, src: 0, face, size: fs, color: 0xFF00_0000 }]] } else { Vec::new() };
+        let inverted = !cut.is_empty();
+        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: None, masks: cut, mask_lum: inverted, blend: 0, invert: inverted })));
+    }
+
+    /// One text decoration line set for a text run at (x, baseline y).
+    #[allow(clippy::too_many_arguments)]
+    fn decoration(&mut self, dc: &Deco, x: f32, y: f32, w: f32, fs: f32, ascent: f32, descent: f32, under: bool) {
+        let th = if dc.thick.is_nan() { (fs / 14.0).round().max(1.0) } else { dc.thick.max(0.5) };
+        let color = self.fade(dc.color);
+        if color >> 24 == 0 || w <= 0.0 {
+            return;
+        }
+        let mut ys = Vec::new();
+        if dc.line & 1 != 0 {
+            let base = if under { descent * fs * 0.8 } else { (fs * 0.11).round() };
+            ys.push(y + if dc.offset.is_nan() { base } else { dc.offset.max(0.0) + th / 2.0 });
+        }
+        if dc.line & 2 != 0 {
+            ys.push(y - ascent * fs);
+        }
+        if dc.line & 4 != 0 {
+            ys.push(y - (fs * 0.3).round());
+        }
+        for ly in ys {
+            match dc.style {
+                1 => {
+                    self.rect(x, ly, w, th, dc.color);
+                    self.rect(x, ly + th * 2.0, w, th, dc.color);
+                }
+                2 | 3 => {
+                    // dotted: squares a thickness apart; dashed: 3x long.
+                    let (on, off) = if dc.style == 2 { (th, th) } else { (th * 3.0, th * 2.0) };
+                    let mut px = x;
+                    while px < x + w {
+                        self.rect(px, ly, on.min(x + w - px), th, dc.color);
+                        px += on + off;
+                    }
+                }
+                4 => {
+                    // A sine wave as a filled band.
+                    let amp = th * 1.2;
+                    let period = (th * 6.0).max(4.0);
+                    let n = ((w / period) * 12.0).ceil().max(2.0) as usize;
+                    let pt = |i: usize, dy: f32| {
+                        let px = x + w * i as f32 / n as f32;
+                        (px, ly + th / 2.0 + amp * ((px - x) / period * std::f32::consts::TAU).sin() + dy)
+                    };
+                    let mut poly: Vec<(f32, f32)> = (0..=n).map(|i| pt(i, -th / 2.0)).collect();
+                    poly.extend((0..=n).rev().map(|i| pt(i, th / 2.0)));
+                    self.push(DItem::Path(Box::new(PathData { polys: vec![poly], evenodd: false, color })));
+                }
+                _ => self.rect(x, ly, w, th, dc.color),
+            }
+        }
+    }
+
     /// text-shadow for a text run at (x, baseline y), the first shadow on
     /// top: sharp ones are offset copies, blurred ones a blurred layer.
     #[allow(clippy::too_many_arguments)]
@@ -463,7 +654,7 @@ impl Builder<'_> {
             let pad = (sh.blur * 1.5).ceil() + 2.0;
             let bounds = [x + sh.x - pad, y + sh.y - line * fs - pad, w + 2.0 * pad, line * fs * 1.6 + 2.0 * pad];
             let filters: Arc<[FilterOp]> = Arc::from(vec![FilterOp::Blur(sh.blur / 2.0)]);
-            self.push(DItem::Layer(Box::new(LayerData { items: vec![item], bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: Some(filters), masks: Vec::new(), mask_lum: false, blend: 0 })));
+            self.push(DItem::Layer(Box::new(LayerData { items: vec![item], bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: Some(filters), masks: Vec::new(), mask_lum: false, blend: 0, invert: false })));
         }
     }
 
@@ -667,7 +858,7 @@ impl Builder<'_> {
         match img {
             css::BgImage::Url(_) => {
                 if let Some(i) = decoded {
-                    self.push(DItem::Image(Box::new(ImgData { img: i.clone(), dst, clip, tile, alpha, radius })));
+                    self.push(DItem::Image(Box::new(ImgData { img: i.clone(), dst, clip, tile, alpha, radius, pixelated: false })));
                 }
             }
             css::BgImage::Gradient(g) => {
@@ -687,7 +878,7 @@ impl Builder<'_> {
                         }
                     }
                     let img = Arc::new(crate::image::from_pixels(tw, th, px, dst[2], dst[3]));
-                    self.push(DItem::Image(Box::new(ImgData { img, dst, clip, tile, alpha: 255, radius })));
+                    self.push(DItem::Image(Box::new(ImgData { img, dst, clip, tile, alpha: 255, radius, pixelated: false })));
                 }
             }
         }
@@ -795,7 +986,7 @@ impl Builder<'_> {
             None => bounds,
         };
         let tbounds = transform_rect(m, bounds);
-        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds, alpha, filters, masks, mask_lum, blend })));
+        self.push(DItem::Layer(Box::new(LayerData { items, bounds, m, tbounds, alpha, filters, masks, mask_lum, blend, invert: false })));
     }
 
     /// Mask lists for an element: its mask-image layers and clip-path.
@@ -874,7 +1065,7 @@ impl Builder<'_> {
             return;
         }
         let bounds = border;
-        let layer = DItem::Layer(Box::new(LayerData { items, bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: None, masks: vec![mask], mask_lum: false, blend: 0 }));
+        let layer = DItem::Layer(Box::new(LayerData { items, bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: None, masks: vec![mask], mask_lum: false, blend: 0, invert: false }));
         let at = start.min(self.target().len());
         self.target().insert(at, layer);
     }
@@ -1123,7 +1314,7 @@ impl Builder<'_> {
                     if bg >> 24 != 0 {
                         self.rect(x, y - a * fs, w, (a + d) * fs, bg);
                     }
-                    let color = self.fade(ts.color);
+                    let color = self.fade(if ts.text_fill == CURRENT_COLOR { ts.color } else { ts.text_fill });
                     let right = cx + b.w;
                     if st.ellipsis && clipped && x + w > right + 0.5 && end > start {
                         // text-overflow: ellipsis
@@ -1153,14 +1344,16 @@ impl Builder<'_> {
                         if let Some(list) = ts.text_shadow.clone() {
                             self.text_shadows(&list, x, y, w, start, end, face, fs, a + d);
                         }
+                        if ts.stroke_w > 0.0 {
+                            let sc = self.fade(if ts.stroke_c == CURRENT_COLOR { ts.color } else { ts.stroke_c });
+                            self.text_stroke(x, y, w, start, end, face, fs, a + d, ts.stroke_w, sc, color >> 24 == 0);
+                        }
                         self.push(DItem::Text { x, y, start, end, src: 0, face, size: fs, color });
                     }
-                    let th = (fs / 14.0).round().max(1.0);
-                    if ts.underline {
-                        self.rect(x, y + (fs * 0.11).round(), w, th, ts.color);
-                    }
-                    if ts.strike {
-                        self.rect(x, y - (fs * 0.3).round(), w, th, ts.color);
+                    if let Some(decos) = ts.decos.clone() {
+                        for dc in decos.iter() {
+                            self.decoration(dc, x, y, w, fs, a, d, ts.under_pos);
+                        }
                     }
                     if link != NO_LINK {
                         self.link(x, y - a * fs, w, (a + d) * fs, link);
@@ -1232,6 +1425,22 @@ struct Deferred {
 }
 
 /// Sample a gradient's colour stops into a 256-entry table.
+/// A sub-rectangle (pixel coordinates) of an image, `iw` x `ih` CSS px.
+fn crop_image(img: &Arc<Image>, r: [f32; 4], iw: f32, ih: f32) -> Arc<Image> {
+    let x0 = (r[0].round() as i64).clamp(0, img.w as i64) as u32;
+    let y0 = (r[1].round() as i64).clamp(0, img.h as i64) as u32;
+    let x1 = ((r[0] + r[2]).round() as i64).clamp(x0 as i64 + 1, img.w as i64) as u32;
+    let y1 = ((r[1] + r[3]).round() as i64).clamp(y0 as i64 + 1, img.h as i64) as u32;
+    let (w, h) = (x1.saturating_sub(x0).max(1), y1.saturating_sub(y0).max(1));
+    let mut px = Vec::with_capacity((w * h) as usize);
+    for y in y0..y0 + h {
+        for x in x0..x0 + w {
+            px.push(img.px.get((y.min(img.h - 1) * img.w + x.min(img.w - 1)) as usize).copied().unwrap_or(0));
+        }
+    }
+    Arc::new(crate::image::from_pixels(w, h, px, iw, ih))
+}
+
 /// Copies of the text items in `items` (recursing into untransformed
 /// layers), opaque, for a text mask.
 fn collect_text(items: &[DItem], out: &mut Vec<DItem>) {
@@ -1892,7 +2101,7 @@ impl<'a> Surface<'a> {
         // Pick the mip level closest to (but not below) the target size.
         let mut scale = (img.w as f32 / dw).min(img.h as f32 / dh);
         let mut level = 0;
-        while scale >= 2.0 && level < img.mips.len() {
+        while scale >= 2.0 && level < img.mips.len() && !d.pixelated {
             scale /= 2.0;
             level += 1;
         }
@@ -1901,6 +2110,10 @@ impl<'a> Surface<'a> {
             let mut u = p as f32 + 0.5 - d0;
             if tile {
                 u = u.rem_euclid(dl);
+            }
+            if d.pixelated {
+                let i0 = ((u * sl as f32 / dl) as u32).min(sl - 1);
+                return (i0, i0, 0);
             }
             let f = (u * sl as f32 / dl - 0.5).clamp(0.0, sl as f32 - 1.0);
             let i0 = f as u32;
@@ -2236,7 +2449,9 @@ fn draw_layer(s: &mut Surface, l: &LayerData, texts: [&str; 2], f: &Fonts, cache
         for (i, p) in img.iter_mut().enumerate() {
             let (b, wt) = (black[i], white[i]);
             let a = (255.0 - ((ch(wt, 16) - ch(b, 16)) + (ch(wt, 8) - ch(b, 8)) + (ch(wt, 0) - ch(b, 0))) / 3.0).clamp(0.0, 255.0);
-            let k = if l.mask_lum {
+            let k = if l.invert {
+                1.0 - a / 255.0
+            } else if l.mask_lum {
                 // Luminance of the (premultiplied over black) mask color.
                 (0.2126 * ch(b, 16) + 0.7152 * ch(b, 8) + 0.0722 * ch(b, 0)) / 255.0
             } else {

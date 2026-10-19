@@ -52,6 +52,9 @@ pub enum Value {
     BgList(u32),
     /// clip-path: index into the shape table.
     Shape(u32),
+    /// Four numbers / lengths (border-image-slice / width / outset):
+    /// index into the quad table.
+    Quad(u32),
     /// An identifier (interned), e.g. a grid area name.
     Name(u32),
     /// font-family list: index into the family table.
@@ -118,10 +121,6 @@ pub enum Kw {
     BRidge,
     BInset,
     BOutset,
-    // text-decoration bit sets
-    Underline,
-    LineThrough,
-    UnderlineLineThrough,
     Flex,
     InlineFlex,
     Grid,
@@ -278,6 +277,22 @@ pub enum Prop {
     MaskMode,
     ClipPath,
     MixBlend,
+    DecoStyle,
+    DecoColor,
+    DecoThickness,
+    UnderlineOffset,
+    UnderlinePosition,
+    TextFillColor,
+    TextStrokeWidth,
+    TextStrokeColor,
+    ObjectPosX,
+    ObjectPosY,
+    ImageRendering,
+    BorderImageSource,
+    BorderImageSlice,
+    BorderImageWidth,
+    BorderImageOutset,
+    BorderImageRepeat,
     TextShadow,
     OutlineWidth,
     OutlineColor,
@@ -1187,6 +1202,11 @@ fn inherited(p: Prop) -> bool {
         p,
         Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | PointerEvents | BorderCollapse | WordBreak | OverflowWrap
             | TextShadow
+            | TextFillColor
+            | TextStrokeWidth
+            | TextStrokeColor
+            | UnderlinePosition
+            | ImageRendering
     )
 }
 
@@ -1392,6 +1412,24 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             "mask-mode" => &[MaskMode],
             "clip-path" | "-webkit-clip-path" => &[ClipPath],
             "mix-blend-mode" => &[MixBlend],
+            "text-decoration" | "-webkit-text-decoration" => &[TextDecoration, DecoStyle, DecoColor, DecoThickness],
+            "text-decoration-style" | "-webkit-text-decoration-style" => &[DecoStyle],
+            "text-decoration-color" | "-webkit-text-decoration-color" => &[DecoColor],
+            "text-decoration-thickness" => &[DecoThickness],
+            "text-underline-offset" => &[UnderlineOffset],
+            "text-underline-position" => &[UnderlinePosition],
+            "-webkit-text-fill-color" => &[TextFillColor],
+            "-webkit-text-stroke" => &[TextStrokeWidth, TextStrokeColor],
+            "-webkit-text-stroke-width" => &[TextStrokeWidth],
+            "-webkit-text-stroke-color" => &[TextStrokeColor],
+            "object-position" => &[ObjectPosX, ObjectPosY],
+            "image-rendering" => &[ImageRendering],
+            "border-image" | "-webkit-border-image" => &[BorderImageSource, BorderImageSlice, BorderImageWidth, BorderImageOutset, BorderImageRepeat],
+            "border-image-source" => &[BorderImageSource],
+            "border-image-slice" => &[BorderImageSlice],
+            "border-image-width" => &[BorderImageWidth],
+            "border-image-outset" => &[BorderImageOutset],
+            "border-image-repeat" => &[BorderImageRepeat],
             "background-clip" | "-webkit-background-clip" => &[BgClip],
             "background-attachment" => &[BgAttachment],
             "background-position" => &[BgPosX, BgPosY],
@@ -1510,17 +1548,7 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             _ => None,
         },
         "text-wrap" | "text-wrap-mode" if v == "nowrap" => kw(Kw::Nowrap),
-        "text-decoration" | "text-decoration-line" => {
-            let u = v.contains("underline");
-            let l = v.contains("line-through");
-            match (u, l) {
-                (true, true) => kw(Kw::UnderlineLineThrough),
-                (true, false) => kw(Kw::Underline),
-                (false, true) => kw(Kw::LineThrough),
-                _ if v.split_whitespace().any(|t| t == "none") => kw(Kw::None),
-                _ => None,
-            }
-        }
+        "text-decoration-line" | "-webkit-text-decoration-line" => deco_lines(v).map(|b| Value::Num(b as f32)),
         "text-transform" => match v {
             "uppercase" => kw(Kw::Uppercase),
             "lowercase" => kw(Kw::Lowercase),
@@ -1713,7 +1741,7 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "text-align" => TextAlign,
         "line-height" => LineHeight,
         "white-space" | "white-space-collapse" | "text-wrap" | "text-wrap-mode" => WhiteSpace,
-        "text-decoration" | "text-decoration-line" => TextDecoration,
+        "text-decoration-line" | "-webkit-text-decoration-line" => TextDecoration,
         "text-transform" => TextTransform,
         "list-style-type" | "list-style" => ListStyleType,
         "visibility" => Visibility,
@@ -1785,6 +1813,15 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "grid-auto-rows" => GridAutoRows,
         "background-image" => BackgroundImage,
         "background-origin" => BgOrigin,
+        "text-decoration-style" => DecoStyle,
+        "text-decoration-color" => DecoColor,
+        "text-decoration-thickness" => DecoThickness,
+        "text-underline-offset" => UnderlineOffset,
+        "-webkit-text-fill-color" => TextFillColor,
+        "-webkit-text-stroke-width" => TextStrokeWidth,
+        "-webkit-text-stroke-color" => TextStrokeColor,
+        "image-rendering" => ImageRendering,
+        "border-image-source" => BorderImageSource,
         "clip-path" | "-webkit-clip-path" => ClipPath,
         "mix-blend-mode" => MixBlend,
         "background-clip" | "-webkit-background-clip" => BgClip,
@@ -1834,13 +1871,22 @@ pub fn parse_declarations(body: &str, out: &mut Vec<Decl>, raws: &mut Vec<Raw>) 
         let name = name.to_ascii_lowercase();
         if value.contains("var(") {
             // Resolved per element once custom property values are known.
-            let n = name.strip_prefix("-webkit-").unwrap_or(&name);
+            let n = unprefix(&name);
             raws.push((n.into(), value.into()));
             out.push(Decl { prop: Unresolved, value: Value::Raw(raws.len() as u32 - 1), important });
             continue;
         }
-        let name = name.strip_prefix("-webkit-").unwrap_or(&name);
+        let name = unprefix(&name);
         parse_property(name, value, important, out);
+    }
+}
+
+/// A property name without a -webkit- prefix, unless the property only
+/// exists prefixed.
+fn unprefix(name: &str) -> &str {
+    match name.strip_prefix("-webkit-") {
+        Some(n) if !n.starts_with("text-fill") && !n.starts_with("text-stroke") => n,
+        _ => name,
     }
 }
 
@@ -2607,6 +2653,117 @@ fn parse_more(name: &str, v: &str, orig: &str, important: bool, out: &mut Vec<De
         }
         "background" => background(orig, important, out, false),
         "mask" | "-webkit-mask" => background(orig, important, out, true),
+        "text-decoration" | "-webkit-text-decoration" => {
+            // Lines, style, color and thickness in any order.
+            let (mut lines, mut style, mut color, mut thick) = (0u8, 0u8, Value::Color(CURRENT_COLOR), Value::Auto);
+            for t in tokens(v) {
+                if let Some(b) = deco_lines(t) {
+                    lines |= b;
+                } else if let Some(st) = deco_style(t) {
+                    style = st;
+                } else if t == "from-font" || t == "auto" {
+                } else if let Some(l) = length(t) {
+                    thick = l;
+                } else if let Some(c) = color_value(t) {
+                    color = c;
+                }
+            }
+            push!(TextDecoration, Value::Num(lines as f32));
+            push!(DecoStyle, Value::Num(style as f32));
+            push!(DecoColor, color);
+            push!(DecoThickness, thick);
+        }
+        "text-decoration-style" | "-webkit-text-decoration-style" => {
+            if let Some(st) = deco_style(v) {
+                push!(DecoStyle, Value::Num(st as f32));
+            }
+        }
+        "text-decoration-color" | "-webkit-text-decoration-color" => {
+            if let Some(c) = color_value(v) {
+                push!(DecoColor, c);
+            }
+        }
+        "text-decoration-thickness" | "text-underline-offset" => {
+            let val = if v == "auto" || v == "from-font" { Some(Value::Auto) } else { length(v) };
+            if let Some(l) = val {
+                push!(if name == "text-underline-offset" { UnderlineOffset } else { DecoThickness }, l);
+            }
+        }
+        "text-underline-position" => push!(UnderlinePosition, Value::Num(v.contains("under") as u8 as f32)),
+        "-webkit-text-fill-color" => {
+            if let Some(c) = color_value(v) {
+                push!(TextFillColor, c);
+            }
+        }
+        "-webkit-text-stroke" => {
+            let (mut w, mut c) = (Value::Px(0.0), Value::Color(CURRENT_COLOR));
+            for t in tokens(v) {
+                if let Some(l) = border_width(t) {
+                    w = l;
+                } else if let Some(cv) = color_value(t) {
+                    c = cv;
+                }
+            }
+            push!(TextStrokeWidth, w);
+            push!(TextStrokeColor, c);
+        }
+        "-webkit-text-stroke-width" => {
+            if let Some(l) = border_width(v) {
+                push!(TextStrokeWidth, l);
+            }
+        }
+        "-webkit-text-stroke-color" => {
+            if let Some(c) = color_value(v) {
+                push!(TextStrokeColor, c);
+            }
+        }
+        "object-position" => {
+            if let Some((x, y)) = bg_pos_values(&tokens_ws(v)) {
+                push!(ObjectPosX, x);
+                push!(ObjectPosY, y);
+            }
+        }
+        "image-rendering" => push!(ImageRendering, Value::Num(matches!(v, "pixelated" | "crisp-edges" | "-webkit-optimize-contrast" | "optimizespeed" | "-moz-crisp-edges") as u8 as f32)),
+        "border-image" | "-webkit-border-image" => {
+            if v == "none" {
+                push!(BorderImageSource, Value::Kw(Kw::None));
+                return true;
+            }
+            // source || slice [/ width [/ outset]] || repeat
+            let mut src = Value::Kw(Kw::None);
+            let mut rest = String::new();
+            let mut reps = Vec::new();
+            for t in tokens_ws(orig) {
+                let lt = t.to_ascii_lowercase();
+                if let Some(img) = image_value(t) {
+                    src = img;
+                } else if matches!(lt.as_str(), "stretch" | "repeat" | "round" | "space") {
+                    reps.push(lt);
+                } else {
+                    rest.push_str(&lt);
+                    rest.push(' ');
+                }
+            }
+            push!(BorderImageSource, src);
+            let parts: Vec<&str> = rest.split('/').collect();
+            push!(BorderImageSlice, slice_quad(parts.first().copied().unwrap_or("100%")).unwrap_or(Value::Kw(Kw::None)));
+            push!(BorderImageWidth, parts.get(1).and_then(|p| quad(p.trim(), true)).unwrap_or_else(|| store_quad([Value::Num(1.0); 4], false)));
+            push!(BorderImageOutset, parts.get(2).and_then(|p| quad(p.trim(), false)).unwrap_or_else(|| store_quad([Value::Px(0.0); 4], false)));
+            let r: Vec<&str> = reps.iter().map(|s| s.as_str()).collect();
+            push!(BorderImageRepeat, Value::Num(image_repeat(&r) as f32));
+        }
+        "border-image-source" => push!(BorderImageSource, if v == "none" { Value::Kw(Kw::None) } else { image_value(orig.trim()).unwrap_or(Value::Kw(Kw::None)) }),
+        "border-image-slice" => {
+            if let Some(q) = slice_quad(v) {
+                push!(BorderImageSlice, q);
+            }
+        }
+        "border-image-width" | "border-image-outset" => {
+            if let Some(q) = quad(v, name.ends_with("width")) {
+                push!(if name.ends_with("width") { BorderImageWidth } else { BorderImageOutset }, q);
+            }
+        }
+        "border-image-repeat" => push!(BorderImageRepeat, Value::Num(image_repeat(&tokens_ws(v)) as f32)),
         "clip-path" | "-webkit-clip-path" => {
             if let Some(sh) = clip_shape(orig.trim()) {
                 push!(ClipPath, sh);
@@ -3441,6 +3598,95 @@ fn bg_pos_values(toks: &[&str]) -> Option<(Value, Value)> {
     })
 }
 
+/// text-decoration-line keywords as bits: 1 underline, 2 overline,
+/// 4 line-through (`none`: 0).
+fn deco_lines(v: &str) -> Option<u8> {
+    let mut b = 0u8;
+    for t in v.split_whitespace() {
+        b |= match t {
+            "underline" | "spelling-error" | "grammar-error" => 1,
+            "overline" => 2,
+            "line-through" => 4,
+            "none" | "blink" => 0,
+            _ => return None,
+        };
+    }
+    Some(b)
+}
+
+/// text-decoration-style: 0 solid, 1 double, 2 dotted, 3 dashed, 4 wavy.
+fn deco_style(v: &str) -> Option<u8> {
+    Some(match v {
+        "solid" => 0,
+        "double" => 1,
+        "dotted" => 2,
+        "dashed" => 3,
+        "wavy" => 4,
+        _ => return None,
+    })
+}
+
+thread_local! {
+    static QUADS: RefCell<Vec<([Value; 4], bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Four values (top, right, bottom, left) and a flag (border-image-slice
+/// `fill`).
+pub fn quad_of(i: u32) -> ([Value; 4], bool) {
+    QUADS.with(|t| t.borrow()[i as usize])
+}
+
+fn store_quad(v: [Value; 4], flag: bool) -> Value {
+    QUADS.with(|t| {
+        let mut t = t.borrow_mut();
+        t.push((v, flag));
+        Value::Quad(t.len() as u32 - 1)
+    })
+}
+
+/// 1-4 lengths / numbers (/ `auto` for widths), expanded to four.
+fn quad(v: &str, allow_auto: bool) -> Option<Value> {
+    let vals: Option<Vec<Value>> = tokens_ws(v)
+        .iter()
+        .map(|t| if allow_auto && *t == "auto" { Some(Value::Auto) } else if let Ok(n) = t.parse::<f32>() { Some(Value::Num(n)) } else { length(t) })
+        .collect();
+    let v = vals?;
+    let four = match v.as_slice() {
+        [a] => [*a; 4],
+        [a, b] => [*a, *b, *a, *b],
+        [a, b, c] => [*a, *b, *c, *b],
+        [a, b, c, d] => [*a, *b, *c, *d],
+        _ => return None,
+    };
+    Some(store_quad(four, false))
+}
+
+/// border-image-slice: numbers (image px) or percentages, plus `fill`.
+fn slice_quad(v: &str) -> Option<Value> {
+    let fill = v.split_whitespace().any(|t| t == "fill");
+    let rest: Vec<&str> = v.split_whitespace().filter(|t| *t != "fill").collect();
+    match quad(&rest.join(" "), false)? {
+        Value::Quad(i) => Some(store_quad(quad_of(i).0, fill)),
+        _ => None,
+    }
+}
+
+/// border-image-repeat: per axis 0 stretch, 1 repeat, 2 round, 3 space;
+/// packed as x | y << 4.
+fn image_repeat(toks: &[&str]) -> u8 {
+    let k = |t: &str| match t {
+        "repeat" => 1,
+        "round" => 2,
+        "space" => 3,
+        _ => 0,
+    };
+    match toks {
+        [a] => k(a) | k(a) << 4,
+        [a, b, ..] => k(a) | k(b) << 4,
+        _ => 0,
+    }
+}
+
 /// A per-layer list (background / mask longhands).
 #[derive(Clone, Debug)]
 pub enum BgList {
@@ -3873,7 +4119,7 @@ pub fn supports(cond: &str) -> bool {
         if name.starts_with("--") {
             return true;
         }
-        let name = name.strip_prefix("-webkit-").unwrap_or(&name);
+        let name = unprefix(&name);
         let mut out = Vec::new();
         parse_property(name, value.trim(), false, &mut out);
         return !out.is_empty();
