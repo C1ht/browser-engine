@@ -180,6 +180,35 @@ pub enum Align {
     Left,
     Right,
     Center,
+    Justify,
+    /// Left in ltr text, right in rtl.
+    Start,
+    End,
+}
+
+impl Align {
+    /// The physical alignment for a direction.
+    pub fn resolve(self, rtl: bool) -> Align {
+        match (self, rtl) {
+            (Align::Start, false) | (Align::End, true) => Align::Left,
+            (Align::Start, true) | (Align::End, false) => Align::Right,
+            (a, _) => a,
+        }
+    }
+}
+
+/// A text-align keyword (`match-parent`: the parent's, made physical).
+fn align_of(kw: Option<Kw>, ps: &Style) -> Option<Align> {
+    Some(match kw {
+        Some(Kw::Right) => Align::Right,
+        Some(Kw::Left) => Align::Left,
+        Some(Kw::Center | Kw::WebkitCenter) => Align::Center,
+        Some(Kw::Justify) => Align::Justify,
+        Some(Kw::End) => Align::End,
+        Some(Kw::MatchParent) => ps.align.resolve(ps.rtl),
+        Some(Kw::Start) => Align::Start,
+        _ => return None,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -222,12 +251,18 @@ pub enum ListStyle {
     UpperRoman,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum VAlign {
     Baseline,
     Top,
     Middle,
     Bottom,
+    Sub,
+    Super,
+    TextTop,
+    TextBottom,
+    /// Raised by this many px (a length or percentage of line-height).
+    Shift(f32),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -293,6 +328,17 @@ pub struct Style {
     pub bg: u32,
     pub font_size: f32,
     pub bold: bool,
+    /// font-weight (1-1000; `bold` is weight >= 600).
+    pub weight: u16,
+    /// letter-spacing / word-spacing in px; text-indent; small caps
+    /// (1 small-caps, 2 all-small-caps); direction rtl (all inherited).
+    pub letter_sp: f32,
+    pub word_sp: f32,
+    pub indent: Len,
+    pub caps: u8,
+    pub rtl: bool,
+    /// text-align-last (None: auto).
+    pub align_last: Option<Align>,
     pub italic: bool,
     pub family: Family,
     /// font-family names (lowercase), for matching web fonts.
@@ -586,6 +632,13 @@ pub const INITIAL: Style = Style {
     bg: 0,
     font_size: 16.0,
     bold: false,
+    weight: 400,
+    letter_sp: 0.0,
+    word_sp: 0.0,
+    indent: Len::Px(0.0),
+    caps: 0,
+    rtl: false,
+    align_last: None,
     italic: false,
     family: Family::Sans,
     families: None,
@@ -685,6 +738,13 @@ impl Style {
             color: p.color,
             font_size: p.font_size,
             bold: p.bold,
+            weight: p.weight,
+            letter_sp: p.letter_sp,
+            word_sp: p.word_sp,
+            indent: p.indent,
+            caps: p.caps,
+            rtl: p.rtl,
+            align_last: p.align_last,
             italic: p.italic,
             family: p.family,
             families: p.families.clone(),
@@ -804,7 +864,16 @@ fn copy_prop(d: &mut Style, s: &Style, p: Prop) {
         Color => d.color = s.color,
         Background => d.bg = s.bg,
         FontSize => d.font_size = s.font_size,
-        FontWeight => d.bold = s.bold,
+        FontWeight => {
+            d.bold = s.bold;
+            d.weight = s.weight;
+        }
+        LetterSpacing => d.letter_sp = s.letter_sp,
+        WordSpacing => d.word_sp = s.word_sp,
+        TextIndent => d.indent = s.indent,
+        FontVariantCaps => d.caps = s.caps,
+        Direction => d.rtl = s.rtl,
+        TextAlignLast => d.align_last = s.align_last,
         FontStyle => d.italic = s.italic,
         FontFamily => {
             d.family = s.family;
@@ -1388,7 +1457,39 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
                 s.bg = col
             }
         }
-        FontWeight => s.bold = kw == Some(Kw::Bold),
+        FontWeight => {
+            let pw = ps.weight;
+            s.weight = match v {
+                Value::Num(n) if n == -1.0 => if pw < 350 { 400 } else if pw < 550 { 700 } else { pw.max(900) },
+                Value::Num(n) if n == -2.0 => if pw < 550 { 100 } else if pw < 750 { 400 } else { 700 },
+                Value::Num(n) => n.clamp(1.0, 1000.0) as u16,
+                _ => 400,
+            };
+            s.bold = s.weight >= 600;
+        }
+        LetterSpacing | WordSpacing => {
+            if let Some(px) = c.px(v, fs) {
+                if d.prop == LetterSpacing {
+                    s.letter_sp = px;
+                } else {
+                    s.word_sp = px;
+                }
+            }
+        }
+        TextIndent => {
+            if let Some(l) = c.len(v, fs) {
+                s.indent = l;
+            }
+        }
+        FontVariantCaps => {
+            s.caps = match kw {
+                Some(Kw::SmallCaps) => 1,
+                Some(Kw::AllSmallCaps) => 2,
+                _ => 0,
+            }
+        }
+        Direction => s.rtl = kw == Some(Kw::Rtl),
+        TextAlignLast => s.align_last = align_of(kw, ps),
         FontStyle => s.italic = kw == Some(Kw::Italic),
         FontFamily => {
             let (names, generic) = match v {
@@ -1406,11 +1507,7 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
             s.families = names;
         }
         TextAlign => {
-            s.align = match kw {
-                Some(Kw::Right) => Align::Right,
-                Some(Kw::Center | Kw::WebkitCenter) => Align::Center,
-                _ => Align::Left,
-            };
+            s.align = align_of(kw, ps).unwrap_or(Align::Start);
             s.center_blocks = kw == Some(Kw::WebkitCenter);
         }
         LineHeight => {
@@ -1540,11 +1637,19 @@ fn apply(s: &mut Style, ps: &Style, d: &Decl, c: &Ctx, font_pass: bool) {
         Visibility => s.hidden = kw == Some(Kw::Hidden),
         PointerEvents => s.no_pointer = kw == Some(Kw::None),
         VerticalAlign => {
-            s.valign = match kw {
-                Some(Kw::Top) => VAlign::Top,
-                Some(Kw::Middle) => VAlign::Middle,
-                Some(Kw::Bottom) => VAlign::Bottom,
-                _ => VAlign::Baseline,
+            s.valign = match (kw, v) {
+                (Some(Kw::Top), _) => VAlign::Top,
+                (Some(Kw::Middle), _) => VAlign::Middle,
+                (Some(Kw::Bottom), _) => VAlign::Bottom,
+                (Some(Kw::TextTop), _) => VAlign::TextTop,
+                (Some(Kw::TextBottom), _) => VAlign::TextBottom,
+                (Some(Kw::Sub), _) => VAlign::Sub,
+                (Some(Kw::Super), _) => VAlign::Super,
+                (_, Value::Pct(p)) => VAlign::Shift(p / 100.0 * s.line_height_px(1.2)),
+                (_, v) => match c.px(v, fs) {
+                    Some(px) => VAlign::Shift(px),
+                    None => VAlign::Baseline,
+                },
             }
         }
         BoxSizing => s.border_box = kw == Some(Kw::BorderBox),
@@ -1842,6 +1947,8 @@ u, ins { text-decoration: underline }
 s, strike, del { text-decoration: line-through }
 a[href] { color: #0000ee; text-decoration: underline }
 small, sub, sup { font-size: smaller }
+sub { vertical-align: sub }
+sup { vertical-align: super }
 big { font-size: larger }
 center { text-align: -webkit-center }
 hr { border: 1px solid #a0a0a0; margin: .5em 0; color: gray }
@@ -2774,7 +2881,13 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
     put("padding", pad.iter().map(|p| css_px(*p)).collect::<Vec<_>>().join(" "));
     put("box-sizing", if st.border_box { "border-box" } else { "content-box" }.into());
     put("font-size", css_px(st.font_size));
-    put("font-weight", if st.bold { "700" } else { "400" }.into());
+    put("font-weight", st.weight.to_string());
+    put("letter-spacing", if st.letter_sp == 0.0 { "normal".into() } else { css_px(st.letter_sp) });
+    put("word-spacing", css_px(st.word_sp));
+    put("text-indent", css_len(st.indent, bw));
+    put("direction", if st.rtl { "rtl" } else { "ltr" }.into());
+    put("font-variant-caps", ["normal", "small-caps", "all-small-caps"][st.caps.min(2) as usize].into());
+    put("font-variant", ["normal", "small-caps", "all-small-caps"][st.caps.min(2) as usize].into());
     put("font-style", if st.italic { "italic" } else { "normal" }.into());
     put(
         "font-family",
@@ -2799,9 +2912,12 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
     put(
         "text-align",
         match st.align {
-            Align::Left => "start",
+            Align::Left => "left",
             Align::Right => "right",
             Align::Center => "center",
+            Align::Justify => "justify",
+            Align::Start => "start",
+            Align::End => "end",
         }
         .into(),
     );
@@ -2978,12 +3094,16 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
     put(
         "vertical-align",
         match st.valign {
-            VAlign::Top => "top",
-            VAlign::Middle => "middle",
-            VAlign::Bottom => "bottom",
-            _ => "baseline",
-        }
-        .into(),
+            VAlign::Top => "top".into(),
+            VAlign::Middle => "middle".into(),
+            VAlign::Bottom => "bottom".into(),
+            VAlign::Sub => "sub".into(),
+            VAlign::Super => "super".into(),
+            VAlign::TextTop => "text-top".into(),
+            VAlign::TextBottom => "text-bottom".into(),
+            VAlign::Shift(px) => css_px(px),
+            VAlign::Baseline => "baseline".to_string(),
+        },
     );
     put(
         "text-transform",
@@ -3088,10 +3208,6 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
     // Properties not modelled: their initial values, so scripts read
     // strings rather than undefined.
     for (k, v) in [
-        ("letter-spacing", "normal"),
-        ("word-spacing", "0px"),
-        ("text-indent", "0px"),
-        ("direction", "ltr"),
         ("writing-mode", "horizontal-tb"),
         ("transition", "all 0s ease 0s"),
         ("transition-duration", "0s"),
@@ -3114,7 +3230,6 @@ pub fn computed_values(st: &Style, rect: Option<[f32; 4]>) -> Vec<(String, Strin
         ("contain", "none"),
         ("content-visibility", "visible"),
         ("aspect-ratio", "auto"),
-        ("font-variant", "normal"),
         ("font-stretch", "100%"),
         ("text-rendering", "auto"),
         ("-webkit-font-smoothing", "auto"),

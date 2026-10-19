@@ -76,7 +76,6 @@ pub enum Kw {
     TableCaption,
     Contents,
     Normal,
-    Bold,
     Italic,
     Left,
     Right,
@@ -121,6 +120,15 @@ pub enum Kw {
     BRidge,
     BInset,
     BOutset,
+    Justify,
+    MatchParent,
+    Sub,
+    Super,
+    TextTop,
+    TextBottom,
+    Rtl,
+    SmallCaps,
+    AllSmallCaps,
     Flex,
     InlineFlex,
     Grid,
@@ -293,6 +301,12 @@ pub enum Prop {
     BorderImageWidth,
     BorderImageOutset,
     BorderImageRepeat,
+    LetterSpacing,
+    WordSpacing,
+    TextIndent,
+    TextAlignLast,
+    Direction,
+    FontVariantCaps,
     TextShadow,
     OutlineWidth,
     OutlineColor,
@@ -1202,6 +1216,12 @@ fn inherited(p: Prop) -> bool {
         p,
         Color | FontSize | FontWeight | FontStyle | FontFamily | TextAlign | LineHeight | WhiteSpace | TextTransform | ListStyleType | Visibility | PointerEvents | BorderCollapse | WordBreak | OverflowWrap
             | TextShadow
+            | LetterSpacing
+            | WordSpacing
+            | TextIndent
+            | TextAlignLast
+            | Direction
+            | FontVariantCaps
             | TextFillColor
             | TextStrokeWidth
             | TextStrokeColor
@@ -1436,7 +1456,7 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             "background-position-x" => &[BgPosX],
             "background-position-y" => &[BgPosY],
             "transform-origin" => &[TransformOriginX, TransformOriginY],
-            "font" => &[FontSize, FontWeight, FontStyle, FontFamily, LineHeight],
+            "font" => &[FontSize, FontWeight, FontStyle, FontFamily, LineHeight, FontVariantCaps],
             "word-break" => &[WordBreak],
             "overflow-wrap" | "word-wrap" => &[OverflowWrap],
             "text-overflow" => &[TextOverflow],
@@ -1491,9 +1511,12 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
         }
         "font-size" => font_size(v),
         "font-weight" => match v {
-            "bold" | "bolder" => kw(Kw::Bold),
-            "normal" | "lighter" => kw(Kw::Normal),
-            _ => v.parse::<f32>().ok().map(|n| Value::Kw(if n >= 600.0 { Kw::Bold } else { Kw::Normal })),
+            "bold" => Some(Value::Num(700.0)),
+            "normal" => Some(Value::Num(400.0)),
+            // (relative to the parent's weight)
+            "bolder" => Some(Value::Num(-1.0)),
+            "lighter" => Some(Value::Num(-2.0)),
+            _ => v.parse::<f32>().ok().filter(|n| (1.0..=1000.0).contains(n)).map(Value::Num),
         },
         "font-style" => match v {
             "italic" | "oblique" => kw(Kw::Italic),
@@ -1503,8 +1526,9 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
         "font-family" => Some(font_family(v)),
         "font" => {
             let toks = tokens(value.trim());
-            let mut bold = false;
+            let mut weight = 400.0;
             let mut italic = false;
+            let mut caps = false;
             for (i, t) in toks.iter().enumerate() {
                 let tl = t.to_ascii_lowercase();
                 let (size_part, lh_part) = match tl.split_once('/') {
@@ -1513,7 +1537,8 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
                 };
                 if let Some(sz) = font_size(&size_part) {
                     push!(FontSize, sz);
-                    push!(FontWeight, Value::Kw(if bold { Kw::Bold } else { Kw::Normal }));
+                    push!(FontWeight, Value::Num(weight));
+                    push!(FontVariantCaps, Value::Kw(if caps { Kw::SmallCaps } else { Kw::Normal }));
                     push!(FontStyle, Value::Kw(if italic { Kw::Italic } else { Kw::Normal }));
                     let lh = lh_part.and_then(|l| line_height(&l)).unwrap_or(Value::Kw(Kw::Normal));
                     push!(LineHeight, lh);
@@ -1524,20 +1549,44 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
                     return;
                 }
                 match tl.as_str() {
-                    "bold" | "bolder" | "600" | "700" | "800" | "900" => bold = true,
+                    "bold" | "bolder" => weight = 700.0,
+                    "lighter" => weight = 300.0,
                     "italic" | "oblique" => italic = true,
+                    "small-caps" => caps = true,
+                    n if n.parse::<f32>().is_ok_and(|w| (1.0..=1000.0).contains(&w)) => weight = n.parse().unwrap(),
                     _ => {}
                 }
             }
             return;
         }
-        "text-align" => match v {
-            "left" | "start" | "justify" | "-webkit-left" => kw(Kw::Left),
-            "right" | "end" | "-webkit-right" => kw(Kw::Right),
+        "text-align" | "text-align-last" => match v {
+            "left" | "-webkit-left" => kw(Kw::Left),
+            "right" | "-webkit-right" => kw(Kw::Right),
+            "start" => kw(Kw::Start),
+            "end" => kw(Kw::End),
+            "justify" | "justify-all" => kw(Kw::Justify),
+            "match-parent" => kw(Kw::MatchParent),
             "center" => kw(Kw::Center),
             "-webkit-center" | "-moz-center" => kw(Kw::WebkitCenter),
+            "auto" if name == "text-align-last" => kw(Kw::Normal),
             _ => None,
         },
+        "letter-spacing" | "word-spacing" => if v == "normal" { Some(Value::Px(0.0)) } else { length(v) },
+        "text-indent" => tokens(v).iter().find_map(|t| length(t)),
+        "direction" => match v {
+            "rtl" => kw(Kw::Rtl),
+            "ltr" => kw(Kw::Normal),
+            _ => None,
+        },
+        "font-variant" | "font-variant-caps" => {
+            if v.split_whitespace().any(|t| t == "all-small-caps") {
+                kw(Kw::AllSmallCaps)
+            } else if v.split_whitespace().any(|t| t == "small-caps" || t == "petite-caps" || t == "all-petite-caps" || t == "unicase") {
+                kw(Kw::SmallCaps)
+            } else {
+                kw(Kw::Normal)
+            }
+        }
         "line-height" => line_height(v),
         "white-space" | "white-space-collapse" => match v {
             "normal" => kw(Kw::Normal),
@@ -1585,10 +1634,15 @@ pub fn parse_property(name: &str, value: &str, important: bool, out: &mut Vec<De
             _ => None,
         },
         "vertical-align" => match v {
-            "top" | "text-top" => kw(Kw::Top),
+            "top" => kw(Kw::Top),
             "middle" => kw(Kw::Middle),
-            "bottom" | "text-bottom" => kw(Kw::Bottom),
-            _ => kw(Kw::Baseline),
+            "bottom" => kw(Kw::Bottom),
+            "text-top" => kw(Kw::TextTop),
+            "text-bottom" => kw(Kw::TextBottom),
+            "sub" => kw(Kw::Sub),
+            "super" => kw(Kw::Super),
+            "baseline" => kw(Kw::Baseline),
+            _ => length(v).or(Some(Value::Kw(Kw::Baseline))),
         },
         "box-sizing" => match v {
             "border-box" => kw(Kw::BorderBox),
@@ -1739,6 +1793,12 @@ fn simple_prop(name: &str) -> Option<Prop> {
         "font-style" => FontStyle,
         "font-family" => FontFamily,
         "text-align" => TextAlign,
+        "text-align-last" => TextAlignLast,
+        "letter-spacing" => LetterSpacing,
+        "word-spacing" => WordSpacing,
+        "text-indent" => TextIndent,
+        "direction" => Direction,
+        "font-variant" | "font-variant-caps" => FontVariantCaps,
         "line-height" => LineHeight,
         "white-space" | "white-space-collapse" | "text-wrap" | "text-wrap-mode" => WhiteSpace,
         "text-decoration-line" | "-webkit-text-decoration-line" => TextDecoration,

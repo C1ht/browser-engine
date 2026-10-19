@@ -73,7 +73,7 @@ pub struct GradData {
 pub enum DItem {
     Rect { x: f32, y: f32, w: f32, h: f32, c: u32 },
     /// `src` 0 = layout text buffer, 1 = display-list owned text (markers).
-    Text { x: f32, y: f32, start: u32, end: u32, src: u8, face: u8, size: f32, color: u32 },
+    Text { x: f32, y: f32, start: u32, end: u32, src: u8, face: u8, size: f32, color: u32, sp: TextSp },
     /// Rounded rect: (x, y, w, h), radii, colour.
     RRect(Box<([f32; 4], [f32; 4], u32)>),
     Ring(Box<RingData>),
@@ -108,6 +108,22 @@ pub struct BorderData {
     pub w: [f32; 4],
     pub s: [u8; 4],
     pub c: [u32; 4],
+}
+
+/// How a text run is spaced and shaped: letter and word spacing,
+/// small caps and paragraph direction.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TextSp {
+    pub ls: f32,
+    pub ws: f32,
+    pub caps: u8,
+    pub rtl: bool,
+}
+
+impl TextSp {
+    pub fn of(st: &Style) -> TextSp {
+        TextSp { ls: st.letter_sp, ws: st.word_sp, caps: st.caps, rtl: st.rtl }
+    }
 }
 
 pub struct BackdropData {
@@ -570,17 +586,17 @@ impl Builder<'_> {
     /// -webkit-text-stroke: offset copies of the glyphs in the stroke
     /// color (cut out of the glyph shapes when the fill is transparent).
     #[allow(clippy::too_many_arguments)]
-    fn text_stroke(&mut self, x: f32, y: f32, w: f32, start: u32, end: u32, face: u8, fs: f32, line: f32, sw: f32, sc: u32, hollow: bool) {
+    fn text_stroke(&mut self, x: f32, y: f32, w: f32, start: u32, end: u32, face: u8, fs: f32, line: f32, sw: f32, sc: u32, hollow: bool, sp: TextSp) {
         let r = (sw / 2.0).max(0.5);
         let n = if r <= 1.0 { 8 } else { 16 };
         let mut items = Vec::new();
         for k in 0..n {
             let t = k as f32 / n as f32 * std::f32::consts::TAU;
-            items.push(DItem::Text { x: x + r * t.cos(), y: y + r * t.sin(), start, end, src: 0, face, size: fs, color: sc });
+            items.push(DItem::Text { x: x + r * t.cos(), y: y + r * t.sin(), start, end, src: 0, face, size: fs, color: sc, sp });
         }
         let pad = r.ceil() + 2.0;
         let bounds = [x - pad, y - line * fs - pad, w + 2.0 * pad, line * fs * 1.6 + 2.0 * pad];
-        let cut = if hollow { vec![vec![DItem::Text { x, y, start, end, src: 0, face, size: fs, color: 0xFF00_0000 }]] } else { Vec::new() };
+        let cut = if hollow { vec![vec![DItem::Text { x, y, start, end, src: 0, face, size: fs, color: 0xFF00_0000, sp }]] } else { Vec::new() };
         let inverted = !cut.is_empty();
         self.push(DItem::Layer(Box::new(LayerData { items, bounds, m: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], tbounds: bounds, alpha: 1.0, filters: None, masks: cut, mask_lum: inverted, blend: 0, invert: inverted })));
     }
@@ -640,13 +656,13 @@ impl Builder<'_> {
     /// text-shadow for a text run at (x, baseline y), the first shadow on
     /// top: sharp ones are offset copies, blurred ones a blurred layer.
     #[allow(clippy::too_many_arguments)]
-    fn text_shadows(&mut self, list: &[css::Shadow], x: f32, y: f32, w: f32, start: u32, end: u32, face: u8, fs: f32, line: f32) {
+    fn text_shadows(&mut self, list: &[css::Shadow], x: f32, y: f32, w: f32, start: u32, end: u32, face: u8, fs: f32, line: f32, sp: TextSp) {
         for sh in list.iter().rev() {
             if sh.color >> 24 == 0 {
                 continue;
             }
             let color = self.fade(sh.color);
-            let item = DItem::Text { x: x + sh.x, y: y + sh.y, start, end, src: 0, face, size: fs, color };
+            let item = DItem::Text { x: x + sh.x, y: y + sh.y, start, end, src: 0, face, size: fs, color, sp };
             if sh.blur < 0.5 {
                 self.push(item);
                 continue;
@@ -1270,7 +1286,7 @@ impl Builder<'_> {
             self.dl.extra.push_str(m);
             let end = self.dl.extra.len() as u32;
             let color = self.fade(st.color);
-            self.push(DItem::Text { x: cx - w - fs * 0.5, y: base, start, end, src: 1, face, size: fs, color });
+            self.push(DItem::Text { x: cx - w - fs * 0.5, y: base, start, end, src: 1, face, size: fs, color, sp: TextSp::default() });
         }
 
         // In-flow blocks, floats, inline content; positioned descendants go
@@ -1302,7 +1318,7 @@ impl Builder<'_> {
 
         for f in &b.frags {
             match f.kind {
-                FragKind::Text { start, end, node, link, bg, w } => {
+                FragKind::Text { start, end, node, link, bg, w, extra } => {
                     let ts = &self.styles[node as usize];
                     if ts.hidden {
                         continue;
@@ -1319,12 +1335,12 @@ impl Builder<'_> {
                     if st.ellipsis && clipped && x + w > right + 0.5 && end > start {
                         // text-overflow: ellipsis
                         let text = &self.tree.text[start as usize..end as usize];
-                        let ew = self.f.measure(face, fs, "\u{2026}");
+                        let ew = self.f.measure_sp(face, fs, "\u{2026}", ts.letter_sp, ts.word_sp, ts.caps);
                         let avail = right - x - ew;
                         let mut cut = 0;
                         let mut acc = 0.0;
                         for (i, ch) in text.char_indices() {
-                            let cw = self.f.measure(face, fs, &text[i..i + ch.len_utf8()]);
+                            let cw = self.f.measure_sp(face, fs, &text[i..i + ch.len_utf8()], ts.letter_sp, ts.word_sp, ts.caps);
                             if acc + cw > avail {
                                 break;
                             }
@@ -1336,19 +1352,20 @@ impl Builder<'_> {
                             self.dl.extra.push_str(text[..cut].trim_end());
                             self.dl.extra.push('\u{2026}');
                             let e0 = self.dl.extra.len() as u32;
-                            self.push(DItem::Text { x, y, start: s0, end: e0, src: 1, face, size: fs, color });
+                            self.push(DItem::Text { x, y, start: s0, end: e0, src: 1, face, size: fs, color, sp: TextSp::of(ts) });
                         }
                         continue;
                     }
+                    let sp = TextSp { ws: ts.word_sp + extra, ..TextSp::of(ts) };
                     if end > start {
                         if let Some(list) = ts.text_shadow.clone() {
-                            self.text_shadows(&list, x, y, w, start, end, face, fs, a + d);
+                            self.text_shadows(&list, x, y, w, start, end, face, fs, a + d, sp);
                         }
                         if ts.stroke_w > 0.0 {
                             let sc = self.fade(if ts.stroke_c == CURRENT_COLOR { ts.color } else { ts.stroke_c });
-                            self.text_stroke(x, y, w, start, end, face, fs, a + d, ts.stroke_w, sc, color >> 24 == 0);
+                            self.text_stroke(x, y, w, start, end, face, fs, a + d, ts.stroke_w, sc, color >> 24 == 0, sp);
                         }
-                        self.push(DItem::Text { x, y, start, end, src: 0, face, size: fs, color });
+                        self.push(DItem::Text { x, y, start, end, src: 0, face, size: fs, color, sp });
                     }
                     if let Some(decos) = ts.decos.clone() {
                         for dc in decos.iter() {
@@ -1446,8 +1463,8 @@ fn crop_image(img: &Arc<Image>, r: [f32; 4], iw: f32, ih: f32) -> Arc<Image> {
 fn collect_text(items: &[DItem], out: &mut Vec<DItem>) {
     for it in items {
         match it {
-            DItem::Text { x, y, start, end, src, face, size, .. } => {
-                out.push(DItem::Text { x: *x, y: *y, start: *start, end: *end, src: *src, face: *face, size: *size, color: 0xFF00_0000 });
+            DItem::Text { x, y, start, end, src, face, size, sp, .. } => {
+                out.push(DItem::Text { x: *x, y: *y, start: *start, end: *end, src: *src, face: *face, size: *size, color: 0xFF00_0000, sp: *sp });
             }
             DItem::Layer(l) if l.m == [1.0, 0.0, 0.0, 1.0, 0.0, 0.0] => collect_text(&l.items, out),
             _ => {}
@@ -2184,7 +2201,7 @@ impl<'a> Surface<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn text(&mut self, s: &str, x: f32, y: f32, face: u8, size: f32, color: u32, f: &Fonts, cache: &GlyphCache) {
+    pub fn text(&mut self, s: &str, x: f32, y: f32, face: u8, size: f32, color: u32, sp: &TextSp, f: &Fonts, cache: &GlyphCache) {
         let ca = color >> 24;
         if ca == 0 {
             return;
@@ -2196,12 +2213,15 @@ impl<'a> Surface<'a> {
         }
         let w = self.w as i32;
         let mut pen = x - self.ox;
-        for ch in s.chars() {
+        let plain = *sp == TextSp::default() && s.chars().all(|c| (c as u32) < 0x590);
+        let glyphs: Vec<(char, f32, f32)> = if plain { s.chars().map(|c| (c, 1.0, 0.0)).collect() } else { visual_glyphs(s, sp) };
+        for (ch, k, after) in glyphs {
+            let size_k = size * k;
             let a = f.adv(face, ch);
             if pen > cx1 as f32 {
                 break;
             }
-            if let Some(g) = cache.get(glyph_key(a.face, ch, size)) {
+            if let Some(g) = cache.get(glyph_key(a.face, ch, size_k)) {
                 if g.w > 0 {
                     let gw = g.w as i32;
                     let gx = pen.round() as i32 + g.xmin as i32;
@@ -2227,8 +2247,128 @@ impl<'a> Surface<'a> {
                     }
                 }
             }
-            pen += a.adv * size;
+            pen += a.adv * size_k + after;
         }
+    }
+}
+
+/// The glyphs of a text run in visual order: (char, size factor, extra
+/// advance after it). Applies small caps, letter / word spacing, Arabic
+/// joining forms and bidi reordering (right-to-left runs reversed; their
+/// order reversed too in right-to-left paragraphs).
+pub fn visual_glyphs(s: &str, sp: &TextSp) -> Vec<(char, f32, f32)> {
+    let mut v: Vec<(char, f32, f32)> = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let extra = sp.ls + if c == ' ' || c == '\u{A0}' { sp.ws } else { 0.0 };
+        let start = v.len();
+        for (ch, k) in crate::fonts::caps_chars(c, sp.caps) {
+            v.push((ch, k, 0.0));
+        }
+        if let Some(last) = v[start..].last_mut() {
+            last.2 = extra;
+        }
+    }
+    let any_rtl = v.iter().any(|g| is_rtl(g.0));
+    if !any_rtl && !sp.rtl {
+        return v;
+    }
+    shape_arabic(&mut v);
+    // Resolve directions: strong letters, then neutrals from their
+    // neighbours (else the paragraph direction).
+    let strong: Vec<Option<bool>> = v.iter().map(|g| if is_rtl(g.0) { Some(true) } else if g.0.is_alphabetic() || g.0.is_ascii_digit() { Some(false) } else { None }).collect();
+    let n = v.len();
+    let mut dir = vec![sp.rtl; n];
+    for i in 0..n {
+        dir[i] = match strong[i] {
+            Some(d) => d,
+            None => {
+                let prev = strong[..i].iter().rev().find_map(|d| *d).unwrap_or(sp.rtl);
+                let next = strong[i + 1..].iter().find_map(|d| *d).unwrap_or(sp.rtl);
+                if prev == next { prev } else { sp.rtl }
+            }
+        };
+    }
+    let mut runs: Vec<Vec<(char, f32, f32)>> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let d = dir[i];
+        let mut j = i;
+        while j < n && dir[j] == d {
+            j += 1;
+        }
+        let mut run = v[i..j].to_vec();
+        if d {
+            run.reverse();
+            for g in &mut run {
+                g.0 = mirror(g.0);
+            }
+        }
+        runs.push(run);
+        i = j;
+    }
+    if sp.rtl {
+        runs.reverse();
+    }
+    runs.concat()
+}
+
+fn is_rtl(c: char) -> bool {
+    matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF | 0x10800..=0x10FFF)
+}
+
+/// Paired punctuation is mirrored in right-to-left runs.
+fn mirror(c: char) -> char {
+    match c {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        '<' => '>',
+        '>' => '<',
+        '\u{AB}' => '\u{BB}',
+        '\u{BB}' => '\u{AB}',
+        c => c,
+    }
+}
+
+/// Arabic letters as presentation forms by joining context (isolated,
+/// final, initial, medial).
+fn shape_arabic(v: &mut [(char, f32, f32)]) {
+    // (letter, isolated form, dual-joining)
+    const T: &[(u32, u32, bool)] = &[
+        (0x0621, 0xFE80, false), (0x0622, 0xFE81, false), (0x0623, 0xFE83, false), (0x0624, 0xFE85, false), (0x0625, 0xFE87, false),
+        (0x0626, 0xFE89, true), (0x0627, 0xFE8D, false), (0x0628, 0xFE8F, true), (0x0629, 0xFE93, false), (0x062A, 0xFE95, true),
+        (0x062B, 0xFE99, true), (0x062C, 0xFE9D, true), (0x062D, 0xFEA1, true), (0x062E, 0xFEA5, true), (0x062F, 0xFEA9, false),
+        (0x0630, 0xFEAB, false), (0x0631, 0xFEAD, false), (0x0632, 0xFEAF, false), (0x0633, 0xFEB1, true), (0x0634, 0xFEB5, true),
+        (0x0635, 0xFEB9, true), (0x0636, 0xFEBD, true), (0x0637, 0xFEC1, true), (0x0638, 0xFEC5, true), (0x0639, 0xFEC9, true),
+        (0x063A, 0xFECD, true), (0x0641, 0xFED1, true), (0x0642, 0xFED5, true), (0x0643, 0xFED9, true), (0x0644, 0xFEDD, true),
+        (0x0645, 0xFEE1, true), (0x0646, 0xFEE5, true), (0x0647, 0xFEE9, true), (0x0648, 0xFEED, false), (0x0649, 0xFEEF, false),
+        (0x064A, 0xFEF1, true),
+    ];
+    let info = |c: char| T.iter().find(|t| t.0 == c as u32);
+    let transparent = |c: char| matches!(c as u32, 0x064B..=0x065F | 0x0670);
+    let joins_both = |c: char| info(c).is_some_and(|t| t.2) || c == '\u{0640}';
+    let joins_prev = |c: char| (info(c).is_some_and(|t| t.0 != 0x0621)) || c == '\u{0640}';
+    let chars: Vec<char> = v.iter().map(|g| g.0).collect();
+    for i in 0..chars.len() {
+        let Some(&(_, iso, dual)) = info(chars[i]) else { continue };
+        if chars[i] == '\u{0621}' {
+            v[i].0 = char::from_u32(iso).unwrap_or(chars[i]);
+            continue;
+        }
+        let prev = chars[..i].iter().rev().find(|c| !transparent(**c)).copied();
+        let next = chars[i + 1..].iter().find(|c| !transparent(**c)).copied();
+        let p = prev.is_some_and(joins_both);
+        let nx = dual && next.is_some_and(joins_prev);
+        let form = match (p, nx) {
+            (true, true) => iso + 3,
+            (true, false) => iso + 1,
+            (false, true) => iso + 2,
+            _ => iso,
+        };
+        v[i].0 = char::from_u32(form).unwrap_or(chars[i]);
     }
 }
 
@@ -2242,10 +2382,10 @@ pub fn prepare_glyphs(items: &[&DItem], texts: [&str; 2], cache: &mut GlyphCache
     let f = fonts();
     for it in items {
         match **it {
-            DItem::Text { start, end, src, face, size, .. } => {
-                for c in item_text(texts, src, start, end).chars() {
+            DItem::Text { start, end, src, face, size, sp, .. } => {
+                for (c, k, _) in visual_glyphs(item_text(texts, src, start, end), &sp) {
                     let a = f.adv(face, c);
-                    cache.ensure(f, a.face, c, size);
+                    cache.ensure(f, a.face, c, size * k);
                 }
             }
             DItem::Layer(ref l) => {
@@ -2292,8 +2432,8 @@ fn draw(s: &mut Surface, it: &DItem, texts: [&str; 2], f: &Fonts, cache: &GlyphC
         DItem::Shadow(d) => s.shadow(d),
         DItem::Image(d) => s.image(d),
         DItem::Gradient(d) => s.gradient(d),
-        DItem::Text { x, y, start, end, src, face, size, color } => {
-            s.text(item_text(texts, *src, *start, *end), *x, *y, *face, *size, *color, f, cache)
+        DItem::Text { x, y, start, end, src, face, size, color, sp } => {
+            s.text(item_text(texts, *src, *start, *end), *x, *y, *face, *size, *color, sp, f, cache)
         }
         DItem::Clip { x, y, w, h } => {
             let c = s.clip;

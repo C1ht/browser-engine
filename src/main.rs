@@ -791,7 +791,7 @@ impl Browser {
         }
         let (w, h) = (self.w, self.h);
         let mut s_ = paint::Surface::new(&mut self.buf, w, h, 0.0, 0.0);
-        s_.text(s, x, y, face, size, color, f, &self.glyphs);
+        s_.text(s, x, y, face, size, color, &paint::TextSp::default(), f, &self.glyphs);
     }
 
     fn fill(&mut self, x: f32, y: f32, w: f32, h: f32, c: u32) {

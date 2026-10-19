@@ -227,7 +227,7 @@ impl FontSpec {
         }
         let (names, generic) = crate::css::family_names(family);
         let f = crate::fonts::fonts();
-        let face = f.web_pick(&names, bold, italic).unwrap_or_else(|| {
+        let face = f.web_pick(&names, if bold { 700 } else { 400 }, italic).unwrap_or_else(|| {
             let fam = match generic {
                 crate::css::Kw::Monospace => crate::style::Family::Mono,
                 crate::css::Kw::Serif => crate::style::Family::Serif,

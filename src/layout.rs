@@ -49,7 +49,8 @@ pub enum Item {
 
 #[derive(Clone, Copy, Debug)]
 pub enum FragKind {
-    Text { start: u32, end: u32, node: NodeId, link: u32, bg: u32, w: f32 },
+    /// `extra`: width added after each space (justified lines).
+    Text { start: u32, end: u32, node: NodeId, link: u32, bg: u32, w: f32, extra: f32 },
     Atomic(u32),
     /// One line's piece of a decorated inline element (`first` / `last`
     /// pieces carry the left / right edges). `y` is the baseline.
@@ -1283,6 +1284,30 @@ impl<'a> Engine<'a> {
         }
     }
 
+    /// How far text of `node` sits below the line's baseline (negative:
+    /// raised), from vertical-align on it and its inline ancestors up to
+    /// the block.
+    fn text_shift(&self, node: NodeId, block: NodeId, cache: &mut crate::fx::FxHashMap<NodeId, f32>) -> f32 {
+        if node == block || node == crate::dom::NONE || self.doc.elem(node).is_none() && self.styles.get(node as usize).is_none() {
+            return 0.0;
+        }
+        if let Some(&v) = cache.get(&node) {
+            return v;
+        }
+        let parent = if self.is_pseudo(node) { self.styles[node as usize].owner } else { self.doc.parent(node) };
+        let up = if parent == crate::dom::NONE { 0.0 } else { self.text_shift(parent, block, cache) };
+        let st = &self.styles[node as usize];
+        let own = match st.valign {
+            VAlign::Sub => st.font_size * 0.25,
+            VAlign::Super => -st.font_size * 0.4,
+            VAlign::Shift(px) => -px,
+            _ => 0.0,
+        };
+        let v = up + own;
+        cache.insert(node, v);
+        v
+    }
+
     fn face_of(&self, st: &Style) -> u8 {
         self.f.pick_style(st)
     }
@@ -1484,8 +1509,10 @@ impl<'a> Engine<'a> {
     fn inline_intrinsic(&mut self, id: u32) -> (f32, f32) {
         let items = std::mem::take(&mut self.boxes[id as usize].items);
         let text = if self.ltext.is_empty() { Rc::from(self.text.as_str()) } else { self.ltext.clone() };
-        let (mut mn, mut mx, mut line) = (0.0f32, 0.0f32, 0.0f32);
-        let mut nowrap_run = 0.0f32;
+        // (The first line starts after text-indent.)
+        let indent = self.st(id).indent.fixed().unwrap_or(0.0).max(0.0);
+        let (mut mn, mut mx, mut line) = (0.0f32, 0.0f32, indent);
+        let mut nowrap_run = indent;
         for it in &items {
             match *it {
                 Item::Br => {
@@ -1512,7 +1539,8 @@ impl<'a> Engine<'a> {
                     let face = self.face_of(st);
                     let fs = st.font_size;
                     let wraps = st.ws.wraps();
-                    let space = self.f.measure(face, fs, " ");
+                    let (ls, wsp, caps) = (st.letter_sp, st.word_sp, st.caps);
+                    let space = self.f.measure_sp(face, fs, " ", ls, wsp, caps);
                     for (pi, seg) in text[start as usize..end as usize].split('\n').enumerate() {
                         if pi > 0 {
                             mx = mx.max(line);
@@ -1521,16 +1549,16 @@ impl<'a> Engine<'a> {
                         }
                         if wraps {
                             for word in seg.split(' ') {
-                                let w = self.f.measure(face, fs, word);
+                                let w = self.f.measure_sp(face, fs, word, ls, wsp, caps);
                                 // Min-content: the widest unbreakable piece.
                                 if st.wrap_anywhere {
                                     for (i, ch) in word.char_indices() {
-                                        mn = mn.max(self.f.measure(face, fs, &word[i..i + ch.len_utf8()]));
+                                        mn = mn.max(self.f.measure_sp(face, fs, &word[i..i + ch.len_utf8()], ls, wsp, caps));
                                     }
                                 } else {
                                     let mut s0 = 0;
                                     for cut in word_breaks(word, st.word_break).into_iter().chain([word.len()]) {
-                                        mn = mn.max(self.f.measure(face, fs, &word[s0..cut]));
+                                        mn = mn.max(self.f.measure_sp(face, fs, &word[s0..cut], ls, wsp, caps));
                                         s0 = cut;
                                     }
                                 }
@@ -1538,7 +1566,7 @@ impl<'a> Engine<'a> {
                             }
                             nowrap_run = 0.0;
                         } else {
-                            let w = self.f.measure(face, fs, seg);
+                            let w = self.f.measure_sp(face, fs, seg, ls, wsp, caps);
                             line += w;
                             nowrap_run += w;
                             mn = mn.max(nowrap_run);
@@ -1961,6 +1989,10 @@ impl<'a> Engine<'a> {
         lb.started = true;
         lb.left = 0.0;
         lb.width = w;
+        if lb.first {
+            lb.first = false;
+            lb.x += lb.indent;
+        }
         let Some(bf) = self.bfcs.last() else { return };
         if bf.floats.is_empty() {
             return;
@@ -2017,7 +2049,19 @@ impl<'a> Engine<'a> {
             baseline: None,
             line_bottoms: Vec::new(),
             open: Vec::new(),
+            text: text.clone(),
+            rtl: cst.rtl,
+            align_last: cst.align_last,
+            indent: cst.indent.px(w),
+            first: true,
+            last: false,
+            tops: Vec::new(),
+            atomic_w: Vec::new(),
         };
+        // Baseline shift (sub, super, lengths) of text in each element,
+        // accumulated up to this block.
+        let block_node = self.boxes[id as usize].node;
+        let mut shifts: crate::fx::FxHashMap<NodeId, f32> = Default::default();
         for it in &items {
             match *it {
                 Item::Br => {
@@ -2038,7 +2082,8 @@ impl<'a> Engine<'a> {
                     self.begin_line(&mut lb, w, cx, cy, 0.0);
                     lb.x += st.margin[3].px(w);
                     let idx = lb.frags.len();
-                    lb.frags.push(Frag { x: lb.x, y: 0.0, kind: FragKind::InlineBox { node: n, w: 0.0, first: true, last: false } });
+                    let shift = self.text_shift(n, block_node, &mut shifts);
+                    lb.frags.push(Frag { x: lb.x, y: shift, kind: FragKind::InlineBox { node: n, w: 0.0, first: true, last: false } });
                     lb.x += st.bw[3] + st.padding[3].px(w);
                     lb.open.push((n, idx));
                     lb.has_content = true;
@@ -2065,37 +2110,67 @@ impl<'a> Engine<'a> {
                     let ab = &self.boxes[a as usize];
                     let mw = ab.m[3] + ab.border_w() + ab.m[1];
                     let mh = ab.m[0] + ab.border_h() + ab.m[2];
-                    let asc = match ab.baseline {
+                    let base_asc = match ab.baseline {
                         Some(bl) if matches!(ab.kind, Kind::Block | Kind::Flex | Kind::Grid) => ab.m[0] + ab.b[0] + ab.p[0] + bl,
                         _ => mh,
                     };
                     let mleft = ab.m[3];
                     let mtop = ab.m[0];
+                    let bw_box = ab.border_w();
+                    let cfs = cst.font_size;
+                    let valign = if ab.anon { VAlign::Baseline } else { self.st(a).valign };
+                    let mut edge = None;
+                    let asc = match valign {
+                        // The middle on the parent's baseline + half its x-height.
+                        VAlign::Middle => mh / 2.0 + cfs * 0.25,
+                        VAlign::TextTop => ca * cfs,
+                        VAlign::TextBottom => mh - cd * cfs,
+                        VAlign::Sub => base_asc - cfs * 0.2,
+                        VAlign::Super => base_asc + cfs * 0.33,
+                        VAlign::Shift(px) => base_asc + px,
+                        VAlign::Top => {
+                            edge = Some(0u8);
+                            base_asc
+                        }
+                        VAlign::Bottom => {
+                            edge = Some(1u8);
+                            base_asc
+                        }
+                        VAlign::Baseline => base_asc,
+                    };
                     self.begin_line(&mut lb, w, cx, cy, mw);
                     if lb.has_content && lb.x + mw > lb.width + 0.01 {
                         self.end_line(id, &mut lb, false, w, cx, cy);
                         self.begin_line(&mut lb, w, cx, cy, mw);
                     }
+                    lb.atomic_w.push((lb.frags.len(), bw_box));
+                    if let Some(mode) = edge {
+                        // Placed once the line's height is known.
+                        lb.tops.push((lb.frags.len(), mode, mh, mtop));
+                    } else {
+                        lb.asc = lb.asc.max(asc);
+                        lb.desc = lb.desc.max(mh - asc);
+                    }
                     lb.frags.push(Frag { x: lb.x + mleft, y: asc - mtop, kind: FragKind::Atomic(a) });
                     lb.x += mw;
-                    lb.asc = lb.asc.max(asc);
-                    lb.desc = lb.desc.max(mh - asc);
                     lb.has_content = true;
                     lb.trailing_w = 0.0;
                     lb.trailing_bytes = 0;
                 }
                 Item::Text { start, end, node, link, bg } => {
+                    let shift = self.text_shift(node, block_node, &mut shifts);
                     let st = &self.styles[node as usize];
                     let face = self.face_of(st);
                     let fs = st.font_size;
                     let (a, d, l) = self.f.metrics(face);
                     let ilh = st.line_height_px(l);
                     let half = (ilh - (a + d) * fs) / 2.0;
-                    let asc = half + a * fs;
-                    let desc = ilh - asc;
+                    let asc = half + a * fs - shift;
+                    let desc = ilh - (half + a * fs) + shift;
                     let wraps = st.ws.wraps();
                     let collapsible = !st.ws.preserves();
-                    let space_w = self.f.adv(face, ' ').adv * fs;
+                    let (ls, wsp, caps) = (st.letter_sp, st.word_sp, st.caps);
+                    let space_w = self.f.adv(face, ' ').adv * fs + ls + wsp;
                     let t = &text[start as usize..end as usize];
                     let bytes = t.as_bytes();
                     let n = bytes.len();
@@ -2130,7 +2205,7 @@ impl<'a> Engine<'a> {
                             let last = ci + 1 == cuts.len();
                             let (sp_bytes, sp_w) = if last { (se - we, (se - we) as f32 * space_w) } else { (0, 0.0) };
                             let seg_end = if last { se } else { pe };
-                            let word_w = self.f.measure(face, fs, &t[ps..pe]);
+                            let word_w = self.f.measure_sp(face, fs, &t[ps..pe], ls, wsp, caps);
                             self.begin_line(&mut lb, w, cx, cy, word_w);
                             if wraps && lb.has_content && pe > ps && lb.x + word_w > lb.width + 0.01 {
                                 self.end_line(id, &mut lb, false, w, cx, cy);
@@ -2142,9 +2217,9 @@ impl<'a> Engine<'a> {
                                 let mut acc = 0.0;
                                 for (off, ch) in t[ps..pe].char_indices() {
                                     let at = ps + off;
-                                    let cw = self.f.measure(face, fs, &t[at..at + ch.len_utf8()]);
+                                    let cw = self.f.measure_sp(face, fs, &t[at..at + ch.len_utf8()], ls, wsp, caps);
                                     if acc + cw > lb.width - lb.x + 0.01 && at > cs {
-                                        lb.add_text(start + cs as u32, start + at as u32, acc, 0.0, 0, node, link, bg);
+                                        lb.add_text(start + cs as u32, start + at as u32, acc, 0.0, 0, node, link, bg, shift);
                                         lb.asc = lb.asc.max(asc);
                                         lb.desc = lb.desc.max(desc);
                                         self.end_line(id, &mut lb, false, w, cx, cy);
@@ -2154,9 +2229,9 @@ impl<'a> Engine<'a> {
                                     }
                                     acc += cw;
                                 }
-                                lb.add_text(start + cs as u32, start + seg_end as u32, acc, sp_w, sp_bytes as u32, node, link, bg);
+                                lb.add_text(start + cs as u32, start + seg_end as u32, acc, sp_w, sp_bytes as u32, node, link, bg, shift);
                             } else {
-                                lb.add_text(start + ps as u32, start + seg_end as u32, word_w, sp_w, sp_bytes as u32, node, link, bg);
+                                lb.add_text(start + ps as u32, start + seg_end as u32, word_w, sp_w, sp_bytes as u32, node, link, bg, shift);
                             }
                             lb.asc = lb.asc.max(asc);
                             lb.desc = lb.desc.max(desc);
@@ -2166,6 +2241,7 @@ impl<'a> Engine<'a> {
                 }
             }
         }
+        lb.last = true;
         self.end_line(id, &mut lb, false, w, cx, cy);
         for &(a, x, y) in &lb.atomics {
             let b = &mut self.boxes[a as usize];
@@ -3123,6 +3199,20 @@ struct LineBuilder {
     line_bottoms: Vec<f32>,
     /// Decorated inline elements open at this point: (node, frag index).
     open: Vec<(NodeId, usize)>,
+    /// The block's text (to count spaces when justifying).
+    text: Rc<str>,
+    rtl: bool,
+    align_last: Option<Align>,
+    /// text-indent, applied once to the first line.
+    indent: f32,
+    first: bool,
+    /// The line being finished is the block's last.
+    last: bool,
+    /// Atomic boxes aligned to the line's top (0) or bottom (1): (frag,
+    /// mode, margin-box height, top margin).
+    tops: Vec<(usize, u8, f32, f32)>,
+    /// Widths of atomic frags (for mirroring rtl lines).
+    atomic_w: Vec<(usize, f32)>,
 }
 
 fn is_cjk(c: char) -> bool {
@@ -3167,11 +3257,11 @@ fn word_breaks(word: &str, word_break: u8) -> Vec<usize> {
 impl LineBuilder {
     #[allow(clippy::too_many_arguments)]
     #[inline]
-    fn add_text(&mut self, s: u32, e: u32, word_w: f32, sp_w: f32, sp_bytes: u32, node: NodeId, link: u32, bg: u32) {
+    fn add_text(&mut self, s: u32, e: u32, word_w: f32, sp_w: f32, sp_bytes: u32, node: NodeId, link: u32, bg: u32, shift: f32) {
         let in_line = self.frags.len() > self.line_start;
         let extend = match self.frags.last_mut() {
-            Some(Frag { kind: FragKind::Text { end, node: n, link: l, bg: b, w, .. }, .. })
-                if in_line && *end == s && *n == node && *l == link && *b == bg =>
+            Some(Frag { kind: FragKind::Text { end, node: n, link: l, bg: b, w, .. }, y, .. })
+                if in_line && *end == s && *n == node && *l == link && *b == bg && *y == shift =>
             {
                 *end = e;
                 *w += word_w + sp_w;
@@ -3180,7 +3270,7 @@ impl LineBuilder {
             _ => false,
         };
         if !extend {
-            self.frags.push(Frag { x: self.x, y: 0.0, kind: FragKind::Text { start: s, end: e, node, link, bg, w: word_w + sp_w } });
+            self.frags.push(Frag { x: self.x, y: shift, kind: FragKind::Text { start: s, end: e, node, link, bg, w: word_w + sp_w, extra: 0.0 } });
         }
         self.x += word_w + sp_w;
         if word_w > 0.0 || e - s > sp_bytes {
@@ -3205,7 +3295,7 @@ impl LineBuilder {
             *end -= tb;
             *w -= self.trailing_w;
         }
-        let line_w = self.x - self.trailing_w;
+        let mut line_w = self.x - self.trailing_w;
         // Inline elements that continue on the next line end here.
         for &(_, idx) in &self.open {
             let x0 = self.frags[idx].x;
@@ -3213,25 +3303,80 @@ impl LineBuilder {
                 *w = (line_w - x0).max(0.0);
             }
         }
+        // The last line (or one ended by a forced break) uses
+        // text-align-last; a justified one aligns to the start.
+        let ends_paragraph = forced || self.last;
+        let align = if ends_paragraph {
+            self.align_last.unwrap_or(if self.align == Align::Justify { Align::Start } else { self.align })
+        } else {
+            self.align
+        };
+        let align = align.resolve(self.rtl);
+        if align == Align::Justify && line_w < self.width {
+            // Spread the free space over the line's word gaps.
+            let gaps: usize = self.frags[self.line_start..]
+                .iter()
+                .map(|f| match f.kind {
+                    FragKind::Text { start, end, .. } => self.text[start as usize..end as usize].bytes().filter(|&b| b == b' ').count(),
+                    _ => 0,
+                })
+                .sum();
+            if gaps > 0 {
+                let per = (self.width - line_w) / gaps as f32;
+                let mut shift = 0.0;
+                for f in &mut self.frags[self.line_start..] {
+                    f.x += shift;
+                    if let FragKind::Text { start, end, w, extra, .. } = &mut f.kind {
+                        let n = self.text[*start as usize..*end as usize].bytes().filter(|&b| b == b' ').count() as f32;
+                        *extra = per;
+                        *w += per * n;
+                        shift += per * n;
+                    }
+                }
+                line_w = self.width;
+            }
+        }
         let off = self.left
-            + match self.align {
-                Align::Left => 0.0,
+            + match align {
                 Align::Center => ((self.width - line_w) / 2.0).max(0.0),
                 Align::Right => (self.width - line_w).max(0.0),
+                _ => 0.0,
             };
+        // Line height: top / bottom aligned boxes must fit.
+        for &(_, _, h, _) in &self.tops {
+            if self.asc + self.desc < h {
+                self.desc = h - self.asc;
+            }
+        }
         let baseline = self.asc;
-        for f in &mut self.frags[self.line_start..] {
+        let line_h = self.asc + self.desc;
+        let tops = std::mem::take(&mut self.tops);
+        let n0 = self.line_start;
+        for (i, f) in self.frags[n0..].iter_mut().enumerate() {
             f.x += off;
+            // Right-to-left lines run from the right.
+            if self.rtl {
+                let fw = match f.kind {
+                    FragKind::Text { w, .. } | FragKind::InlineBox { w, .. } => w,
+                    FragKind::Atomic(_) => self.atomic_w.iter().find(|e| e.0 == n0 + i).map_or(0.0, |e| e.1),
+                };
+                f.x = 2.0 * off + line_w - (f.x + fw);
+            }
             match f.kind {
-                FragKind::Text { .. } | FragKind::InlineBox { .. } => f.y = self.y + baseline,
+                FragKind::Text { .. } | FragKind::InlineBox { .. } => f.y += self.y + baseline,
                 FragKind::Atomic(a) => {
                     // f.y holds the distance from the border-box top to the baseline.
-                    let top = self.y + baseline - f.y;
+                    let top = match tops.iter().find(|t| t.0 == n0 + i) {
+                        Some(&(_, 0, _, mtop)) => self.y + mtop,
+                        Some(&(_, _, h, mtop)) => self.y + line_h - h + mtop,
+                        None => self.y + baseline - f.y,
+                    };
                     f.y = top;
                     self.atomics.push((a, f.x, top));
                 }
             }
         }
+        self.atomic_w.clear();
         if self.baseline.is_none() {
             self.baseline = Some(self.y + baseline);
         }
